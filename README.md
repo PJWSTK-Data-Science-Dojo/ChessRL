@@ -183,6 +183,9 @@ The project uses two Docker containers:
    - X11 forwarding for display
    - Loads models from the shared volume
 
+## Datasets for pretraining:
+- https://huggingface.co/datasets/angeluriot/chess_games
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.

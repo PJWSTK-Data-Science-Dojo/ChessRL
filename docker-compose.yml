@@ -6,7 +6,6 @@ services:
     image: chessrl-train
     volumes:
       - ./models:/app/models
-      - uv-cache:/root/.cache/uv
     deploy:
       resources:
         reservations:
@@ -18,6 +17,7 @@ services:
       - CUDA_VISIBLE_DEVICES=0
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
+      - PYTHONDONTWRITEBYTECODE=1
     command: ["--iterations", "50", "--self-play-games", "100", "--parallel", "--mcts-simulations", "32"]
     gpus:
       - driver: nvidia
@@ -33,12 +33,12 @@ services:
     volumes:
       - ./models:/app/models
       - /tmp/.X11-unix:/tmp/.X11-unix
-      - uv-cache:/root/.cache/uv
     environment:
       - DISPLAY=${DISPLAY}
       - XAUTHORITY=${XAUTHORITY}
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
+      - PYTHONDONTWRITEBYTECODE=1
     network_mode: "host"  # Required for X11 forwarding
     depends_on:
       - train
@@ -52,13 +52,13 @@ services:
     volumes:
       - .:/app
       - ./models:/app/models
-      - uv-cache:/root/.cache/uv
       - /tmp/.X11-unix:/tmp/.X11-unix
     environment:
       - DISPLAY=${DISPLAY}
       - XAUTHORITY=${XAUTHORITY}
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
+      - PYTHONDONTWRITEBYTECODE=1
     network_mode: "host"
     entrypoint: ["/bin/bash"]
     stdin_open: true
@@ -73,6 +73,3 @@ services:
             - models/
         - action: rebuild
           path: ./pyproject.toml
-
-volumes:
-  uv-cache:

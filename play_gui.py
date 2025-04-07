@@ -12,7 +12,7 @@ import torch
 import numpy as np
 
 from ChessRL.config import Config
-from ChessRL.network import ChessNetwork
+from ChessRL.alpha_net import ChessNetwork
 from ChessRL.mcts import MCTS
 from ChessRL.encoding import encode_board, move_to_index
 
