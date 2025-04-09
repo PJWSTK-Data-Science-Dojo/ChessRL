@@ -10,3 +10,9 @@ __pycache__/
 # results dir
 /results
 /files
+/experiments
+
+# Virtual environ
+/.venv
+/venv
+/EZVenv

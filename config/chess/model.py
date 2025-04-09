@@ -172,6 +172,8 @@ class RepresentationNetwork(nn.Module):
         )
 
     def forward(self, x):
+        if x.dim() > 4:
+            x = x.view(-1, *x.shape[-3:])  # Flatten dimensions above 4d
         if self.downsample:
             x = self.downsample_net(x)
         else:

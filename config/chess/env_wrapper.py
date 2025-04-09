@@ -6,7 +6,7 @@ class ChessEnv:
     """Chess environment that follows gym interface"""
     def __init__(self):
         self.board = chess.Board()
-        self.action_space_size = 4672  # Maksymalna teoretyczna liczba ruchów w szachach
+        self.action_space = 4672  # Maksymalna teoretyczna liczba ruchów w szachach
         self.reset()
         
     def reset(self):
@@ -86,7 +86,7 @@ class ChessEnv:
 class ChessWrapper(Game):
     def __init__(self, env, discount: float, cvt_string=False):
         """Chess Wrapper"""
-        super().__init__(env, env.action_space_size, discount)
+        super().__init__(env, env.action_space, discount)
         self.cvt_string = cvt_string
 
     def legal_actions(self):
