@@ -2,6 +2,7 @@ import numpy as np
 import chess
 from core.game import Game
 
+
 class ChessEnv:
     """Chess environment that follows gym interface"""
     def __init__(self):
@@ -83,7 +84,9 @@ class ChessEnv:
         # Jeśli indeks jest poza zakresem, zwracamy pierwszy legalny ruch
         return legal_moves[0] if legal_moves else None
 
+
 class ChessWrapper(Game):
+
     def __init__(self, env, discount: float, cvt_string=False):
         """Chess Wrapper"""
         super().__init__(env, env.action_space, discount)

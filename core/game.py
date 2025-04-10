@@ -48,7 +48,7 @@ class GameHistory:
         self.stacked_observations = config.stacked_observations
         self.discount = config.discount
         self.action_space_size = config.action_space_size
-        self.zero_obs_shape = (config.obs_shape[-2], config.obs_shape[-1], config.image_channel)
+        self.zero_obs_shape = config.obs_shape  # Use same shape for the empty samples
 
         self.child_visits = []
         self.root_values = []

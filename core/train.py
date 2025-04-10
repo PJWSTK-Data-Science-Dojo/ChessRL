@@ -17,6 +17,8 @@ from core.storage import SharedStorage, QueueStorage
 from core.selfplay_worker import DataWorker
 from core.reanalyze_worker import BatchWorker_GPU, BatchWorker_CPU
 
+from tqdm import tqdm
+
 
 def consist_loss_func(f1, f2):
     """Consistency loss function: similarity loss
@@ -358,9 +360,14 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
         config.set_transforms()
 
     # wait until collecting enough data to start
+    progress_bar = tqdm(range(config.start_transitions), desc="Collecting", unit='moves', smoothing=0.5)
+    all_collected = 0
     while not (ray.get(replay_buffer.get_total_len.remote()) >= config.start_transitions):
         time.sleep(1)
+        progress_bar.update(ray.get(replay_buffer.get_total_len.remote()) - all_collected)
+        all_collected = ray.get(replay_buffer.get_total_len.remote())
         pass
+    progress_bar.close()
     print('Begin training...')
     # set signals for other workers
     shared_storage.set_start_signal.remote()
@@ -371,10 +378,16 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
     recent_weights = model.get_weights()
 
     # while loop
+    progress_bar = tqdm(range(config.training_steps + config.last_steps), desc="Training", unit='steps')
+    all_steps = 0
     while step_count < config.training_steps + config.last_steps:
         # remove data if the replay buffer is full. (more data settings)
         if step_count % 1000 == 0:
             replay_buffer.remove_to_fit.remote()
+
+        if step_count != all_steps:
+            progress_bar.update(step_count - all_steps)
+            all_steps = step_count
 
         # obtain a batch
         batch = batch_storage.pop()
@@ -418,6 +431,7 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
             model_path = os.path.join(config.model_dir, 'model_{}.p'.format(step_count))
             torch.save(model.state_dict(), model_path)
 
+    progress_bar.close()
     shared_storage.set_weights.remote(model.get_weights())
     time.sleep(30)
     return model.get_weights()

@@ -1,10 +1,48 @@
 import torch
+import os
+
 from core.config import BaseConfig
 from core.dataset import Transforms
 from .env_wrapper import ChessWrapper
 from .model import EfficientZeroNet
+from typing import List
+from dataclasses import dataclass, field
+
+
+@dataclass
+class DefaultSetupConfig:
+    # Required arguments
+    env: str = "EZEnvironment"
+    opr: str = "train"  # choices=['train', 'test']
+    amp_type: str = "none"  # choices=['torch_amp', 'none']
+    case: str = "atari"  # choices=['atari']
+    device: str = "cpu"
+    result_dir: str = os.path.join(os.getcwd(), 'results')
+    no_cuda: bool = True
+    debug: bool = True
+    render: bool = False
+    save_video: bool = False
+    force: bool = False
+    cpu_actor: int = 4
+    gpu_actor: int = 4
+    p_mcts_num: int = 4
+    seed: int = 0
+    num_gpus: int = 4
+    num_cpus: int = 4
+    revisit_policy_search_rate: float = 0.99
+    use_root_value: bool = False
+    use_priority: bool = False
+    use_max_priority: bool = False
+    test_episodes: int = 10
+    use_augmentation: bool = False
+    augmentation: List[str] = field(default_factory=lambda: ["shift", "intensity"])
+    info: str = "none"
+    load_model: bool = False
+    model_path: str = "./results/test_model.p"
+
 
 class ChessConfig(BaseConfig):
+
     def __init__(self):
         super(ChessConfig, self).__init__(
             training_steps=100000,
@@ -38,11 +76,11 @@ class ChessConfig(BaseConfig):
             lr_decay_rate=0.1,
             lr_decay_steps=100000,
             auto_td_steps_ratio=0.3,
-            start_transitions=8,
+            start_transitions=1,
             total_transitions=100 * 1000,
-            transition_num=1,
+            transition_num=25,
             frame_skip=1,  # W szachach nie ma koncepcji "frame skip"
-            stacked_observations=4,  # Ilość poprzednich stanów planszy
+            stacked_observations=1,  # Ilość poprzednich stanów planszy
             reward_loss_coeff=1,
             value_loss_coeff=0.25,
             policy_loss_coeff=1,
@@ -55,6 +93,9 @@ class ChessConfig(BaseConfig):
             pred_out=1024,
         )
 
+        self.env_name = "ChessEnv"
+        self.image_channel = 12  # 12 kanałów dla różnych typów figur
+        self.obs_shape = (self.image_channel, 8, 8)  # Plansza szachowa 8x8
         self.discount **= self.frame_skip
         self.max_moves //= self.frame_skip
         self.test_max_moves //= self.frame_skip
@@ -73,17 +114,14 @@ class ChessConfig(BaseConfig):
         self.downsample = False  # W szachach nie potrzebujemy downsamplingu
 
     def visit_softmax_temperature_fn(self, num_moves, trained_steps):
-        if trained_steps < 0.5 * (self.training_steps):
+        if trained_steps < 0.5 * self.training_steps:
             return 1.0
-        elif trained_steps < 0.75 * (self.training_steps):
+        elif trained_steps < 0.75 * self.training_steps:
             return 0.5
         else:
             return 0.25
 
     def set_game(self, save_video=False, save_path=None, video_callable=None):
-        self.env_name = "ChessEnv"
-        self.image_channel = 12  # 12 kanałów dla różnych typów figur
-        self.obs_shape = (self.image_channel, 8, 8)  # Plansza szachowa 8x8
         game = self.new_game()
         self.action_space_size = game.action_space_size
 
@@ -135,5 +173,6 @@ class ChessConfig(BaseConfig):
 
     def transform(self, images):
         return images
+
 
 game_config = ChessConfig()
