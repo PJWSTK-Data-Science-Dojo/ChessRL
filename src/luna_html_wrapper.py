@@ -2,7 +2,7 @@
     An Html wrapper for Luna
 """
 
-from flask import Flask, Response, request
+from flask import Flask, Response, request, render_template
 import chess.svg
 import base64
 from luna.luna import Luna
@@ -85,10 +85,11 @@ def make_move():
                 "fen": htmlWrap.board.fen()
             }
         
-        # Update board state for Luna
+        # Update board state for Luna - ensure we're sending the correct state
         state = LunaState(htmlWrap.board)
         
         # Have Luna respond with a move
+        # The Luna engine already knows which side to play based on board.turn
         htmlWrap.computer_move(state, htmlWrap.luna_eval)
         
         # Check if game is over after Luna's move
@@ -110,6 +111,7 @@ def make_move():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
 @app.route("/legal_moves", methods=["GET"])
 def get_legal_moves():
     """Return the legal moves for the current position"""
@@ -121,17 +123,20 @@ def get_legal_moves():
 def reset_game():
     """Reset the game to the starting position"""
     color = request.form.get("color", "white")
+    full_reset = request.form.get("full_reset", "false") == "true"
+    
     htmlWrap.board = chess.Board()
     htmlWrap.board_state = LunaState(htmlWrap.board)
     
     # If human plays as black, have Luna make the first move
-    if color == "black":
+    if color == "black" and not full_reset:
         state = htmlWrap.board_state
         htmlWrap.computer_move(state, htmlWrap.luna_eval)
     
     return {
         "status": "success",
-        "fen": htmlWrap.board.fen()
+        "fen": htmlWrap.board.fen(),
+        "full_reset": full_reset
     }
 
 @app.route("/luna_move", methods=["POST"])
@@ -181,18 +186,78 @@ def index():
 @app.route("/selfplay")
 def selfplay():
     """Self play page"""
-    # reset state
-    htmlWrap.board_state = LunaState()
-    
-    ret = '<html><head>'
-    # self play
-    while not htmlWrap.board.is_game_over():
-        htmlWrap.computer_move(htmlWrap.board_state, htmlWrap.luna_eval)
-        ret += '<img width=600 height=600 src="data:image/svg+xml;base64,%s"></img><br/>' % htmlWrap.board_to_svg(htmlWrap.board_state)
-        
-    if htmlWrap.verbose: print(f"[SELFPLAY] SELFPLAY OVER, RESULT: {htmlWrap.board.result()}")
+    # Reset the board state
+    htmlWrap.board = chess.Board()
+    htmlWrap.board_state = LunaState(htmlWrap.board)
+    html = open("src/selfplay.html").read()
+    return html
 
-    return ret 
+@app.route("/next_move", methods=["POST"])
+def next_move():
+    """Have Luna make the next move in self-play mode"""
+    if htmlWrap.board.is_game_over():
+        outcome = htmlWrap.board.outcome()
+        return {
+            "status": "gameover",
+            "message": get_game_result_message(outcome),
+            "fen": htmlWrap.board.fen()
+        }
+    
+    try:
+        # Have Luna make a move
+        state = LunaState(htmlWrap.board)
+        htmlWrap.computer_move(state, htmlWrap.luna_eval)
+        
+        # Check if game is over after Luna's move
+        if htmlWrap.board.is_game_over():
+            outcome = htmlWrap.board.outcome()
+            return {
+                "status": "gameover",
+                "message": get_game_result_message(outcome),
+                "fen": htmlWrap.board.fen(),
+                "move": str(htmlWrap.board.peek())
+            }
+            
+        return {
+            "status": "success",
+            "fen": htmlWrap.board.fen(),
+            "move": str(htmlWrap.board.peek())
+        }
+    except Exception as e:
+        return {
+            "status": "error", 
+            "message": str(e)
+        }
+
+@app.route("/next_selfplay_move", methods=["POST"])
+def next_selfplay_move():
+    """Make one move in self-play mode"""
+    # If game is over, return the result
+    if htmlWrap.board.is_game_over():
+        outcome = htmlWrap.board.outcome()
+        return {
+            "status": "gameover",
+            "message": get_game_result_message(outcome),
+            "fen": htmlWrap.board.fen()
+        }
+    
+    # Make a move with Luna
+    state = LunaState(htmlWrap.board)
+    try:
+        htmlWrap.computer_move(state, htmlWrap.luna_eval)
+        
+        # Return the updated state
+        return {
+            "status": "success",
+            "fen": htmlWrap.board.fen(),
+            "move": str(htmlWrap.board.peek()),
+            "is_game_over": htmlWrap.board.is_game_over()
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 # move given in algebraic notation
 @app.route("/move")

@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Luna Chess - Self Play Mode</title>
+  <link rel="stylesheet" href="/static/chessboard.min.css">
+  <script src="/static/jquery.min.js"></script>
+  <script src="/static/chessboard.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      margin: 20px;
+    }
+    #board {
+      width: 400px;
+      margin: 0 auto;
+    }
+    .button-container {
+      margin: 20px 0;
+    }
+    button {
+      padding: 10px 15px;
+      margin: 0 5px;
+      cursor: pointer;
+    }
+    #game-status {
+      margin: 15px 0;
+      font-weight: bold;
+    }
+    #move-history {
+      margin: 20px auto;
+      max-width: 400px;
+      max-height: 200px;
+      overflow-y: auto;
+      text-align: left;
+      border: 1px solid #ccc;
+      padding: 10px;
+    }
+    .move-item {
+      padding: 3px 0;
+    }
+    .back-link {
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Luna Chess - Self Play Mode</h1>
+  
+  <div id="board"></div>
+  
+  <div id="game-status">Game ready to start</div>
+  
+  <div class="button-container">
+    <button id="start-btn">Start Self Play</button>
+    <button id="stop-btn" disabled>Stop</button>
+    <button id="reset-btn">Reset Board</button>
+  </div>
+  
+  <div id="move-history">
+    <div class="move-item">Move history will appear here...</div>
+  </div>
+  
+  <div class="back-link">
+    <a href="/">Back to Main Game</a>
+  </div>
+  
+  <script>
+    var board = null;
+    var game = {
+      fen: function() { return currentFen; }
+    };
+    var currentFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'; // Starting position
+    var isPlaying = false;
+    var moveDelay = 1000; // Delay between moves (ms)
+    var moveTimer = null;
+    var moveCount = 0;
+    
+    // Initialize the board
+    function initBoard() {
+      var config = {
+        position: 'start',
+        draggable: false, // No dragging in self-play mode
+        pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png'
+      };
+      
+      board = ChessBoard('board', config);
+      updateStatus('Board initialized. Press "Start Self Play" to begin.');
+    }
+    
+    // Update the status display
+    function updateStatus(message) {
+      $('#game-status').text(message || 'Luna is thinking...');
+    }
+    
+    // Add a move to the move history
+    function addMoveToHistory(move, fenAfterMove) {
+      moveCount++;
+      var moveNumber = Math.ceil(moveCount / 2);
+      var color = moveCount % 2 === 1 ? 'White' : 'Black';
+      var moveText = moveNumber + '. ' + color + ': ' + move;
+      
+      $('#move-history').prepend('<div class="move-item">' + moveText + '</div>');
+    }
+    
+    // Request the next move from the server
+    function requestNextMove() {
+      if (!isPlaying) return;
+      
+      $.ajax({
+        url: '/next_move',
+        type: 'POST',
+        data: {},
+        success: function(data) {
+          if (data.status === 'gameover') {
+            // Game over
+            board.position(data.fen);
+            updateStatus(data.message);
+            isPlaying = false;
+            $('#start-btn').prop('disabled', false);
+            $('#stop-btn').prop('disabled', true);
+            return;
+          }
+          
+          if (data.status === 'success') {
+            // Move successfully made
+            currentFen = data.fen;
+            board.position(data.fen);
+            addMoveToHistory(data.move, data.fen);
+            
+            // Schedule the next move after delay
+            moveTimer = setTimeout(requestNextMove, moveDelay);
+          } else {
+            // Error
+            updateStatus('Error: ' + data.message);
+            isPlaying = false;
+            $('#start-btn').prop('disabled', false);
+            $('#stop-btn').prop('disabled', true);
+          }
+        },
+        error: function(xhr, status, error) {
+          updateStatus('Server error: ' + error);
+          isPlaying = false;
+          $('#start-btn').prop('disabled', false);
+          $('#stop-btn').prop('disabled', true);
+        }
+      });
+    }
+    
+    // Start self-play
+    function startSelfPlay() {
+      isPlaying = true;
+      moveCount = 0;
+      $('#start-btn').prop('disabled', true);
+      $('#stop-btn').prop('disabled', false);
+      $('#move-history').html('');
+      updateStatus('Self-play started. Luna is thinking...');
+      
+      // Request the first move
+      requestNextMove();
+    }
+    
+    // Stop self-play
+    function stopSelfPlay() {
+      isPlaying = false;
+      if (moveTimer) {
+        clearTimeout(moveTimer);
+        moveTimer = null;
+      }
+      $('#start-btn').prop('disabled', false);
+      $('#stop-btn').prop('disabled', true);
+      updateStatus('Self-play stopped.');
+    }
+    
+    // Reset the board
+    function resetBoard() {
+      stopSelfPlay();
+      board.position('start');
+      currentFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+      $('#move-history').html('<div class="move-item">Move history will appear here...</div>');
+      updateStatus('Board reset. Press "Start Self Play" to begin.');
+      
+      // Reset the server-side board state
+      $.ajax({
+        url: '/reset',
+        type: 'POST',
+        data: {
+          full_reset: 'true'
+        },
+        success: function() {
+          console.log('Server board reset');
+        }
+      });
+    }
+    
+    // Bind event handlers
+    $(document).ready(function() {
+      initBoard();
+      
+      $('#start-btn').on('click', startSelfPlay);
+      $('#stop-btn').on('click', stopSelfPlay);
+      $('#reset-btn').on('click', resetBoard);
+      
+      // Optional: Add keyboard shortcuts
+      $(document).keydown(function(e) {
+        if (e.which === 32) { // Space bar
+          if (isPlaying) {
+            stopSelfPlay();
+          } else {
+            startSelfPlay();
+          }
+        } else if (e.which === 82) { // R key
+          resetBoard();
+        }
+      });
+    });
+    
+    // Additional function that would be needed in some contexts
+    function onSnapEnd() {
+      // Update the board position after the piece snap
+      board.position(game.fen());
+      updateStatus();
+    }
+  </script>
+</body>
+</html>
