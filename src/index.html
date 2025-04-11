@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Luna Chess</title>
+    <link rel="stylesheet" href="/static/chessboard.min.css">
+    <script src="/static/jquery.min.js"></script>
+    <script src="/static/chessboard.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            margin: 20px;
+        }
+        .board-container {
+            width: 400px;
+            margin: 20px auto;
+            display: none; /* Initially hide the board */
+        }
+        .controls {
+            width: 400px;
+            margin: 10px auto;
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+        }
+        .selection {
+            width: 400px;
+            margin: 20px auto;
+            padding: 20px;
+            text-align: center;
+            background-color: #f5f5f5;
+            border-radius: 8px;
+        }
+        .status {
+            width: 400px;
+            margin: 10px auto;
+            text-align: center;
+            height: 30px;
+            color: #333;
+            font-weight: bold;
+        }
+        button {
+            padding: 10px 20px;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .game-over {
+            color: #d32f2f;
+            font-weight: bold;
+            margin-top: 15px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Luna Chess</h1>
+    
+    <div class="selection" id="colorSelection">
+        <h2>Choose Your Color</h2>
+        <div class="controls">
+            <button id="playWhite">Play as White</button>
+            <button id="playBlack">Play as Black</button>
+            <button id="watchSelfPlay">Watch Self-Play</button>
+        </div>
+    </div>
+    
+    <div class="board-container" id="boardContainer">
+        <div id="board"></div>
+        <div class="status" id="status"></div>
+        <div class="controls">
+            <button id="resetBtn">New Game</button>
+            <button id="backBtn">Back to Selection</button>
+        </div>
+    </div>
+    
+    <script>
+        var board = null;
+        var playerColor = 'white';
+        
+        $(document).ready(function() {
+            // Board is initialized only after color selection
+            
+            // Attach event handlers
+            $("#playWhite").on("click", function() {
+                startGame("white");
+            });
+            
+            $("#playBlack").on("click", function() {
+                startGame("black");
+            });
+            
+            $("#watchSelfPlay").on("click", function() {
+                $("#colorSelection").hide();
+                $("#boardContainer").show();
+                initializeSelfPlay();
+            });
+            
+            $("#resetBtn").on("click", function() {
+                resetGame();
+            });
+            
+            $("#backBtn").on("click", function() {
+                $("#boardContainer").hide();
+                $("#colorSelection").show();
+            });
+        });
+        
+        function initializeSelfPlay() {
+            // Initialize board for self-play
+            board = ChessBoard('board', {
+                position: 'start',
+                draggable: false,
+                pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png'
+            });
+            
+            $("#status").text("Luna is playing against itself");
+            window.location.href = "/selfplay";
+        }
+        
+        function startGame(color) {
+            playerColor = color;
+            $("#colorSelection").hide();
+            $("#boardContainer").show();
+            
+            $.ajax({
+                type: "POST",
+                url: '/reset',
+                data: { color: color },
+                success: function(data) {
+                    // Initialize the board with draggable pieces
+                    board = ChessBoard('board', {
+                        position: data.fen || 'start',
+                        draggable: true,
+                        onDrop: onDrop,
+                        pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png'
+                    });
+                    
+                    $("#status").text("You are playing as " + color);
+                    
+                    // If player is black, have Luna make the first move
+                    if (color === 'black') {
+                        makeComputerMove();
+                    }
+                },
+                error: function(xhr, status, error) {
+                    $("#status").text("Server error: " + error);
+                }
+            });
+        }
+        
+        function resetGame() {
+            $.ajax({
+                type: "POST",
+                url: '/reset',
+                data: { color: playerColor },
+                success: function(data) {
+                    // Re-initialize the board with draggable pieces
+                    board = ChessBoard('board', {
+                        position: data.fen || 'start',
+                        draggable: true,
+                        onDrop: onDrop,
+                        pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png'
+                    });
+                    
+                    $("#status").text("Game reset. You are playing as " + playerColor);
+                    
+                    // If player is black, have Luna make the first move after reset
+                    if (playerColor === 'black') {
+                        makeComputerMove();
+                    }
+                },
+                error: function(xhr, status, error) {
+                    $("#status").text("Server error: " + error);
+                }
+            });
+        }
+        
+        function onDrop(source, target, piece) {
+            // Create the move in UCI format
+            var move = source + target;
+            
+            // Add promotion to queen if it's a pawn move to the last rank
+            if ((piece === 'wP' && target.charAt(1) === '8') || 
+                (piece === 'bP' && target.charAt(1) === '1')) {
+                move += 'q';  // Always promote to queen
+            }
+            
+            // Send the move to the server
+            $.ajax({
+                type: "POST",
+                url: "/move",
+                data: { move: move },
+                success: function(data) {
+                    if (data.status === "success") {
+                        // Update the board with the new position after Luna's move
+                        board.position(data.fen);
+                        
+                        // Display Luna's move
+                        $("#status").text("Luna played: " + data.move);
+                    } else if (data.status === "gameover") {
+                        // Update the board with the final position
+                        board.position(data.fen);
+                        
+                        // Display game over message with special styling
+                        $("#status").html("<span class='game-over'>" + data.message + "</span>");
+                        
+                        // Disable board interactions
+                        board = ChessBoard('board', {
+                            position: data.fen,
+                            draggable: false,
+                            pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png'
+                        });
+                    } else {
+                        // Handle error - reset the piece
+                        $("#status").text("Error: " + data.message);
+                        return 'snapback';
+                    }
+                },
+                error: function(xhr, status, error) {
+                    $("#status").text("Server error: " + error);
+                    return 'snapback';
+                }
+            });
+        }
+        
+        function makeComputerMove() {
+            $.ajax({
+                type: "POST",
+                url: '/luna_move',
+                success: function(data) {
+                    if (data.status === "success") {
+                        board.position(data.fen);
+                        $("#status").text("Luna played: " + data.move);
+                    } else if (data.status === "gameover") {
+                        // Update the board with the final position
+                        board.position(data.fen);
+                        
+                        // Display game over message with special styling
+                        $("#status").html("<span class='game-over'>" + data.message + "</span>");
+                        
+                        // Disable board interactions
+                        board = ChessBoard('board', {
+                            position: data.fen,
+                            draggable: false,
+                            pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png'
+                        });
+                    } else {
+                        $("#status").text("Error: " + (data.message || "Unknown error"));
+                    }
+                },
+                error: function(xhr, status, error) {
+                    $("#status").text("Server error: " + error);
+                }
+            });
+        }
+    </script>
+</body>
+</html>
