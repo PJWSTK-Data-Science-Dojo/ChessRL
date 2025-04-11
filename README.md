@@ -52,13 +52,7 @@ During training, the network learns from examples of the form (s_t, π_t, z_t), 
 
 ## Requirements and Installation
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/your-username/luna-chess.git
-   cd luna-chess
-   ```
-
-2. Install dependencies:
+1. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
@@ -71,7 +65,7 @@ During training, the network learns from examples of the form (s_t, π_t, z_t), 
    - Flask (for web interface)
    - stockfish (optional, for comparison)
 
-3. (Optional) If you want to use GPU training, ensure you have CUDA installed and compatible with your PyTorch version.
+2. (Optional) If you want to use GPU training, ensure you have CUDA installed and compatible with your PyTorch version.
 
 ## How to Train the Model
 
