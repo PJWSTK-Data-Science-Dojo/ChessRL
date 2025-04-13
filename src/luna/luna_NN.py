@@ -100,7 +100,19 @@ class LunaNN(nn.Module):
         # output scalar
         self.fc5 = nn.Linear(512, 1)
 
-    def forward(self, boardsAndValids):
+    def init_weights(self):
+        torch.nn.init.kaiming_normal_(self.conv1.weight)
+        torch.nn.init.kaiming_normal_(self.conv2.weight)
+        torch.nn.init.kaiming_normal_(self.conv3.weight)
+        torch.nn.init.kaiming_normal_(self.conv4.weight)
+        torch.nn.init.kaiming_normal_(self.conv5.weight)
+        torch.nn.init.kaiming_normal_(self.fc1.weight)
+        torch.nn.init.kaiming_normal_(self.fc2.weight)
+        torch.nn.init.kaiming_normal_(self.fc3.weight)
+        torch.nn.init.xavier_normal_(self.fc4.weight)
+        torch.nn.init.xavier_normal_(self.fc5.weight)
+
+    def forward(self, boardsAndValids, use_logits: bool = False):
         """Forward prop"""
         x, valids = boardsAndValids
 
@@ -119,4 +131,4 @@ class LunaNN(nn.Module):
         v = self.fc5(x)
 
         pi -= (1 - valids) * 1000
-        return F.log_softmax(pi, dim=1), torch.tanh(v)
+        return F.log_softmax(pi, dim=1) if not use_logits else pi, torch.tanh(v)
