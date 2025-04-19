@@ -17,6 +17,7 @@ from .mcts import MCTS
 from .game.luna_game import ChessGame
 from .NNet import Luna_Network 
 from .utils import dotdict
+import wandb
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +108,8 @@ class Coach():
         It then pits the new neural network against the old one and accepts it
         only if it wins >= updateThreshold fraction of games.
         """
-
+        config = {**self.nnet.nnet.args}
+        run = wandb.init(entity="dsc-pjatk-warsaw", project="chess-rl", job_type="training", config=config)
         for i in range(1, self.args.numIters + 1):
             log.info(f'Starting Iter #{i} ...')
 
@@ -143,7 +145,7 @@ class Coach():
             self.pnet.load_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
 
             pmcts = MCTS(self.game, self.pnet, self.args)
-            self.nnet.train(trainExamples)
+            self.nnet.train(trainExamples, run)
             nmcts = MCTS(self.game, self.nnet, self.args)
 
             log.info('PITTING AGAINST PREVIOUS VERSION')
@@ -186,6 +188,11 @@ class Coach():
             pwins = oneWon
             nwins = twoWon
 
+            data = {
+                'arena/new_model_wins': nwins,
+                'arena/prev_model_wins': pwins,
+                'arena/draws': draws
+            }
             # Compare models
             log.info('NEW/PREV WINS : %d / %d ; DRAWS : %d' % (nwins, pwins, draws))
             if self.args.save_anyway:
@@ -197,10 +204,15 @@ class Coach():
                 if pwins + nwins == 0 or float(nwins) / (pwins + nwins) < self.args.updateThreshold:
                     log.info('REJECTING NEW MODEL')
                     self.nnet.load_checkpoint(folder=self.args.checkpoint, filename='temp.pth.tar')
+                    data.update({'arena/model_accepted': False})
                 else:
                     log.info('ACCEPTING NEW MODEL')
                     self.nnet.save_checkpoint(folder=self.args.checkpoint, filename=self.getCheckpointFile(i))
                     self.nnet.save_checkpoint(folder=self.args.checkpoint, filename='best.pth.tar')
+                    data.update({'arena/model_accepted': True})
+
+            run.log(data)
+            run.finish()
 
     def getCheckpointFile(self, iteration) -> str:
         """We save checkpoints based on an iteration"""

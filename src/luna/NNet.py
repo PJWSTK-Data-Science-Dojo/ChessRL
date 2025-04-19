@@ -49,7 +49,7 @@ class Luna_Network(object):
 
         self.nnet.cuda()
 
-    def train(self, examples) -> None:
+    def train(self, examples, run: 'wandb') -> None:
         """
             Train on `examples`
             
@@ -118,6 +118,11 @@ class Luna_Network(object):
                             tl=total_loss,
                             epoch=epoch+1
                             ))
+
+            run.log({
+                'loss_pi': pi_losses.avg,
+                'loss_v': v_losses.avg,
+            })
 
     def predict(self, boardAndValid) -> tuple:
         """

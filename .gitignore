@@ -5,7 +5,7 @@ processed/
 processed/*
 runs/*
 temp/*
-
+.idea/
 # should we import content(stockfish)?
 content/
 
