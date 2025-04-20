@@ -1,6 +1,7 @@
 """
     Util Classes/functions for luna
 """
+import os
 
 class AverageMeter(object):
     """From https://github.com/pytorch/examples/blob/master/imagenet/main.py"""
@@ -22,9 +23,19 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
-class dotdict(dict):
-    """DotDict implementation"""
+def find_project_root(marker_file="main.py"):
+    """Finds the project root directory by searching for a marker file."""
+    current_dir = os.path.abspath(os.path.dirname(__file__))
+    # Go up directories until the marker file is found or we hit the filesystem root
+    while True:
+        if os.path.exists(os.path.join(current_dir, marker_file)):
+            return current_dir
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir: # Reached filesystem root
+            raise FileNotFoundError(f"Project root marker '{marker_file}' not found.")
+        current_dir = parent_dir
 
-    def __getattr__(self, name):
-        """Make so we can acess values by using dict.key"""
-        return self[name]
+def get_absolute_path(relative_path: str, base_dir: str):
+    """Gets the absolute path by joining base_dir and relative_path."""
+    # Normalize the path to handle '..' etc.
+    return os.path.abspath(os.path.join(base_dir, relative_path))
