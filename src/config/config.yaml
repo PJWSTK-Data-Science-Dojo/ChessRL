@@ -1,0 +1,70 @@
+# src/config/config.yaml
+
+# --- General Settings ---
+run_name: luna_run_resnet_v1_feat_v3
+project_name: LunaChess
+checkpoint_dir: ./temp/
+pretrained_models_dir: ./pretrained_models/
+
+# --- Game Settings ---
+game:
+  history_len: 8 # Number of board states in history (current + 7 previous)
+
+# --- Training Settings (used by main.py and Coach) ---
+training:
+  numIters: 100          # Number of iterations of self-play and training
+  numEps: 25             # Number of self-play games per iteration
+  maxlenOfQueue: 120000  # Max number of game examples to keep in the training buffer
+  numItersForTrainExamplesHistory: 10 # How many recent iterations of examples to use
+  num_workers: 6         # Number of parallel workers for self-play and arena
+  epochs: 28            # Number of training epochs per iteration
+
+# --- MCTS Settings (used by Coach and MCTS) ---
+mcts:
+  numMCTSSims: 50       # Number of MCTS simulations per move
+  cpuct: 1.15           # Exploration constant
+  tempThreshold: 15     # Until which move number to use temperature > 0
+  dir_noise: True       # Use Dirichlet noise in self-play root
+  dirichlet_alpha: 0.3
+  dirichlet_epsilon: 0.25
+
+# --- Arena Settings (used by Coach and Arena) ---
+arena:
+  arenaCompare: 16      # Number of games to play in arena
+  updateThreshold: 0.55 # Win rate + 0.5*draws threshold for accepting new model
+  save_anyway: False    # Force saving the new model regardless of arena results
+
+# --- Model Architecture Settings (used by luna_NN and NNet) ---
+model:
+  nn_version: 'resnet_v1_feat_v4'
+  num_channels: 128
+  num_res_blocks: 8
+  dropout: 0.22
+
+# --- Optimizer and Scheduler Settings (used by NNet) ---
+optimizer:
+  lr: 0.0075
+  weight_decay: 0.0001 # Added weight decay as in the code
+  batch_size: 128
+  lr_decay_step_size: 2
+  lr_decay_gamma: 0.69
+
+# --- Loading Settings (used by main.py and NNet) ---
+loading:
+  load_model: True # Set to True to load a model for training or inference
+  load_examples: True
+  load_folder: ./src/temp/
+  load_examples_folder: ./src/temp/
+  load_file: best.pth.tar
+  skipFirstSelfPlay: True # If loading examples, usually skip the first self-play
+
+# --- Inference Settings (used by luna.py for the GUI) ---
+inference:
+  numMCTSSims: 50
+  cpuct: 1.0
+  dir_noise: false
+  dirichlet_alpha: 0.3 # Example values, adjust as needed
+  dirichlet_epsilon: 0.25 # Example values, adjust as needed
+  load_model: true         # <-- Set this to true to load a model for the GUI/Arena
+  load_folder: ./src/temp/ # <-- Folder for inference model
+  load_file: best.pth.tar # <-- Filename for inference model

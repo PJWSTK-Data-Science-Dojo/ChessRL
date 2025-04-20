@@ -61,183 +61,597 @@
     <script>
         // Global variables
         let board = null;
-        let game = null;
+        // let game = null; // This game object is not fully used, board is the main state
         let currentOrientation = 'white'; // Default orientation
-        
+        let currentBoardPosition = {}; // Store the current board state object (FEN string or object from board.position())
+
         // Initialize the board when the page loads
         $(document).ready(function() {
             // Set up event listeners for color selection
             $('#playAsWhiteBtn').on('click', function() {
                 playAsWhite();
             });
-            
+
             $('#playAsBlackBtn').on('click', function() {
                 playAsBlack();
             });
-            
+
             // Set up the New Game button handler
             $('#newGameBtn').on('click', function() {
                 // Send full_reset=true to indicate we want to go back to the start screen
-                fetch('/reset', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: 'full_reset=true'
-                })
-                .then(response => response.json())
-                .then(data => {
-                    // Return to the game options panel
-                    $('#gameOptions').show();
-                    $('#chessboard').hide();
-                    // Reset any other UI elements
-                    $('#status').text('');
-                });
-            });
-            
-            // Set up the Back button handler
-            $('#backBtn').on('click', function() {
+                // Also send player color info, as the server /reset expects it now
+                // We can default to white or just trigger the game options panel
+                // Let's make this button just return to options and rely on color selection buttons to reset server.
+                // This is simpler.
+                
+                // Dispose of the board instance
+                if (board) {
+                     board.destroy(); // Use the destroy method
+                     $('#board').html(''); // Ensure the container is clear
+                     board = null; // Null out the reference
+                }
+
+                // Return to the game options panel
                 $('#gameOptions').show();
                 $('#chessboard').hide();
+                
+                // Reset any other UI elements
+                $('#status').text('');
+                currentBoardPosition = {}; // Clear board state
+
+                // IMPORTANT: If you NEED 'New Game' to also force a *server* reset
+                // to the very initial state before color selection, you would uncomment
+                // and adjust the fetch() call that was here previously.
+                // For this updated logic, clicking 'New Game' simply returns you
+                // to the selection screen on the client, ready for a *new* game
+                // started via the 'Play as X' buttons which *do* trigger server reset.
+                console.log("Returning to game options screen.");
+
             });
+
+            // Set up the Back button handler
+            $('#backBtn').on('click', function() {
+                // Dispose of the board instance
+                if (board) {
+                    board.destroy(); // Use the destroy method
+                    $('#board').html(''); // Ensure the container is clear
+                    board = null; // Null out the reference
+                }
+
+                $('#gameOptions').show();
+                $('#chessboard').hide();
+
+                 // Clear status and board state representation on client
+                 $('#status').text('');
+                 currentBoardPosition = {}; // Clear board state
+
+                 console.log("Returning to game options screen.");
+            });
+
+             // Initialize the board once on page load, but keep it hidden initially
+             // This ensures the board div is processed by chessboard.js early,
+             // even though it's not shown. Re-initialization happens on color selection.
+             initChessboard('white', 'start'); // Initialize with default hidden state
+             $('#chessboard').hide(); // Ensure it starts hidden
+
+             // Attach the click handler to the board element *after* it's initialized
+             // Use event delegation on the board container for squares
+            $('#board').on('click', '.square-55d63', handleSquareClick);
         });
-        
+
+        // Function to initialize chessboard.js instance
+        function initChessboard(orientation, initialFen) {
+             // Dispose of previous instance if it exists and the container is not empty
+             // Check if board exists and is the correct type, or if the container looks like it has a board
+             if (board && typeof board.destroy === 'function') {
+                 board.destroy(); // Use the destroy method
+             } else if ($('#board').children().length > 0) {
+                  // If no destroy method found, manually clear the container as a fallback
+                  $('#board').html('');
+             }
+             board = null; // Ensure the reference is cleared before creating a new one
+
+             let config = {
+                 draggable: true, // Keep draggable for human player modes
+                 position: initialFen || 'start', // Use provided FEN or 'start'
+                 orientation: orientation,
+                 onDragStart: onDragStart,
+                 onDrop: onDrop,
+                 onSnapEnd: onSnapEnd,
+                 pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png' // Ensure piece theme is set
+             };
+
+             // Initialize the board
+             board = ChessBoard('board', config);
+             // Store the initial position as FEN string if available, otherwise use the object form
+             currentBoardPosition = initialFen || board.position();
+
+             // Clear highlights on initialization
+             $('.square-55d63').removeClass('highlight1-32417 highlight2-9c5d2'); // Manual removal based on class names
+             selectedSquare = null; // Clear any pending selection
+             legalMovesHighlight = []; // Clear legal move highlights array
+
+             // Re-attach click handler using event delegation
+             // This is safe because the event listener is attached to the parent #board div
+             // which exists even after board.destroy() or html().
+             // If you attach *directly* to .square-55d63 elements, you'd need to re-attach here.
+             // Your original code correctly uses delegation: $('#board').on('click', '.square-55d63', handleSquareClick);
+             // So, no change needed for click handler attachment itself here.
+        }
+
+
         // Function to play as white
         function playAsWhite() {
             currentOrientation = 'white';
-            
-            // Initialize the board with the starting position
-            let config = {
-                draggable: true,
-                position: 'start',
-                orientation: 'white',
-                onDragStart: onDragStart,
-                onDrop: onDrop,
-                onSnapEnd: onSnapEnd
-            };
-            
-            board = ChessBoard('board', config);
-            
-            // Reset the server-side board
+
+            // Reset the server-side board and get initial FEN
             fetch('/reset', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                 },
-                body: 'color=white'
+                body: 'color=white' // Tell the server the player is white
             })
             .then(response => response.json())
             .then(data => {
-                // Update the UI
-                board.position(data.fen);
-                $('#gameOptions').hide();
-                $('#chessboard').show();
-                $('#status').text('Your turn (White)');
+                if (data.status === 'success') {
+                    // Initialize and update the UI with the server's starting position (should be standard 'start')
+                    initChessboard(currentOrientation, data.fen);
+                    currentBoardPosition = data.fen; // Store the actual starting position as FEN
+                    $('#gameOptions').hide();
+                    $('#chessboard').show();
+                    updateStatus('Your turn (White)');
+                } else {
+                    updateStatus('Error starting game: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Error playing as white:', error);
+                updateStatus('Error starting game.');
             });
         }
-        
+
         // Function to play as black
         function playAsBlack() {
             currentOrientation = 'black';
-            
-            // Initialize the board with the starting position
-            let config = {
-                draggable: true,
-                position: 'start',
-                orientation: 'black',
-                onDragStart: onDragStart,
-                onDrop: onDrop,
-                onSnapEnd: onSnapEnd
-            };
-            
-            board = ChessBoard('board', config);
-            
-            // Reset the server-side board and request Luna's first move
+
+            // Reset the server-side board and request Luna's first move (since human is black)
             fetch('/reset', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                 },
-                body: 'color=black'
+                body: 'color=black' // Tell the server the player is black
             })
             .then(response => response.json())
             .then(data => {
-                // Update the UI
-                board.position(data.fen);
-                $('#gameOptions').hide();
-                $('#chessboard').show();
-                $('#status').text('Your turn (Black)');
+                 if (data.status === 'success') {
+                    // Initialize and update the UI with Luna's first move already applied
+                    initChessboard(currentOrientation, data.fen);
+                    currentBoardPosition = data.fen; // Store position after Luna's move as FEN
+                    $('#gameOptions').hide();
+                    $('#chessboard').show();
+
+                     // Highlight Luna's move squares (first move)
+                    if (data.move && data.move.length >= 4) {
+                         const lunaSource = data.move.substring(0, 2);
+                         const lunaTarget = data.move.substring(2, 4);
+                         highlightSquares(lunaSource, lunaTarget);
+                    }
+
+                    // Check game over after Luna's move (first move might end the game, though unlikely)
+                    if (data.is_game_over) { // Assuming server sends is_game_over flag
+                         handleGameOver(data); // Display game over message
+                    } else {
+                        updateStatus(`Luna played: ${data.move || '...'}. Your turn (Black).`);
+                    }
+
+                 } else {
+                    updateStatus('Error starting game: ' + data.message);
+                 }
+            })
+            .catch(error => {
+                console.error('Error playing as black:', error);
+                updateStatus('Error starting game.');
             });
         }
-        
+
+        // Helper function to update status text
+        function updateStatus(message) {
+            $('#status').text(message);
+        }
+
         // Function to handle drag start
-        function onDragStart(source, piece) {
-            // Only allow the current player to move their pieces
-            if ((currentOrientation === 'white' && piece.search(/^b/) !== -1) ||
-                (currentOrientation === 'black' && piece.search(/^w/) !== -1)) {
-                return false;
+        function onDragStart(source, piece, position, orientation) {
+            // Clear previous highlights (e.g., from AI's last move)
+             $('.square-55d63').removeClass('highlight1-32417 highlight2-9c5d2'); // Manual removal based on class names
+             selectedSquare = null; // Clear any pending click selection
+             legalMovesHighlight = []; // Clear legal move highlights array
+
+
+            // Get the current board state from the board instance
+            const currentBoardPosObject = board.position(); // This is the object representation
+            const pieceOnSource = currentBoardPosObject[source]; // Get the piece being dragged
+
+            // Determine whose turn it is from the *last known server state (FEN)*
+            // This is a client-side check for responsiveness, server will validate definitively.
+             const boardFenParts = typeof currentBoardPosition === 'string' ? currentBoardPosition.split(' ') : [];
+             const currentFenTurn = boardFenParts.length > 1 ? boardFenParts[1] : 'w'; // Default to 'w'
+             const isWhitesTurn = currentFenTurn === 'w';
+             const isBlacksTurn = currentFenTurn === 'b';
+
+
+            const isWhitePiece = pieceOnSource && pieceOnSource.search(/^w/) !== -1;
+            const isBlackPiece = pieceOnSource && pieceOnSource.search(/^b/) !== -1;
+
+            const humanIsWhite = currentOrientation === 'white';
+            const humanIsBlack = currentOrientation === 'black';
+
+            // Only allow dragging if it's the correct turn for the piece color
+            if ((humanIsWhite && !isWhitesTurn) || (humanIsBlack && !isBlacksTurn)) {
+                // updateStatus("It's not your turn."); // Avoid flooding status on every drag attempt
+                return false; // Not your turn
             }
-            
-            // Don't allow moves if the game is over
+
+             // Only allow dragging pieces of the human's color
+            if ((humanIsWhite && !isWhitePiece) || (humanIsBlack && !isBlackPiece)) {
+                // updateStatus("Drag your own pieces."); // Avoid flooding status on every drag attempt
+                return false; // Not your piece
+            }
+
+            // Don't allow dragging if the game is over
             if ($('#status').text().includes('Game over')) {
                 return false;
             }
+
+            // Optional: If piece is successfully picked up, highlight its square
+            // $('#board .square-' + source).addClass('highlight1-32417');
+
+
+            return true; // Allow drag
         }
-        
+
         // Function to handle piece drop (move)
-        function onDrop(source, target) {
-            // Check if the move is valid (client-side check)
-            if (source === target) return 'snapback';
-            
+        function onDrop(source, target, piece, newPos, oldPos, orientation) {
+            // Check if the drop is on the same square (not a move attempt)
+            if (source === target) {
+                 // Snap back if it's just a click or invalid drop
+                 return 'snapback';
+            }
+
+            // --- Promotion Handling ---
+            // newPos is the board object *after* the potential client-side move and capture
+            // oldPos is the board object *before* the client-side move
+            const pieceOnSource = oldPos[source]; // Get the piece being moved *before* the drop
+            const targetRank = target.charAt(1);
+
+            let isPromotion = false;
+            let promotionPiece = 'q'; // Default to queen for the 4096 action space
+            if (pieceOnSource && pieceOnSource.length === 2 && pieceOnSource.toLowerCase().charAt(1) === 'p') { // Check if it was a pawn
+                const pieceColor = pieceOnSource.charAt(0); // 'w' or 'b'
+                if ((pieceColor === 'w' && targetRank === '8') || (pieceColor === 'b' && targetRank === '1')) {
+                    isPromotion = true;
+                }
+            }
+            // --- End Promotion Handling ---
+
+
+            // Construct the move string (e.g., 'e2e4' or 'e7e8q')
+            let moveString = source + target;
+            if (isPromotion) {
+                moveString += promotionPiece; // Append 'q' for Queen promotion
+            }
+
+
             // Send the move to the server
+            updateStatus('Processing move...');
+
             fetch('/move', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                 },
-                body: `move=${source}${target}`
+                body: `move=${moveString}`
             })
             .then(response => response.json())
             .then(data => {
                 if (data.status === 'error') {
-                    // Invalid move
-                    $('#status').text(data.message);
-                    return 'snapback';
+                    // Invalid move according to server
+                    updateStatus(`Invalid move: ${data.message}`);
+                    // The piece already snapped back due to the 'snapback' return value.
+                    // No need to manually call board.position(oldPos) here.
+                    // Clear any highlights from drag start manually if they were applied
+                    $('.square-55d63').removeClass('highlight1-32417');
+
+
                 } else if (data.status === 'gameover') {
-                    // Game is over
-                    board.position(data.fen);
-                    handleGameOver(data);
+                    // Game is over after human move or Luna's response
+                    board.position(data.fen); // Update board to final state using the FEN from the server
+                    currentBoardPosition = data.fen; // Keep internal state synced as FEN
+                    handleGameOver(data); // Display game over message
+
+
                 } else {
-                    // Valid move, update board with computer's response move
-                    board.position(data.fen);
-                    $('#status').text(`Luna played: ${data.move}`);
+                    // Valid human move, update board with Luna's response move
+                    // The server response already includes Luna's move applied and the new FEN
+                    board.position(data.fen); // Update board with the new FEN
+                    currentBoardPosition = data.fen; // Keep internal state synced as FEN
+
+                    // Highlight Luna's move squares
+                    if (data.move && data.move.length >= 4) {
+                         const lunaSource = data.move.substring(0, 2);
+                         const lunaTarget = data.move.substring(2, 4);
+                         highlightSquares(lunaSource, lunaTarget);
+                    }
+
+                    // Check game over after Luna's move (redundant if status is 'gameover' already handled)
+                    if (data.is_game_over) { // Assuming server sends is_game_over flag
+                         handleGameOver(data);
+                    } else {
+                         updateStatus(`Luna played: ${data.move || '...'}. Your turn.`);
+                    }
                 }
             })
             .catch(error => {
-                console.error('Error:', error);
-                return 'snapback';
+                console.error('Error during move request:', error);
+                updateStatus('Error communicating with server.');
+                 // The piece already snapped back due to the 'snapback' return value.
+                 // Clear any highlights from drag start manually if they were applied
+                 $('.square-55d63').removeClass('highlight1-32417');
             });
+
+            // IMPORTANT: Always return 'snapback' here.
+            // The board position will be updated via board.position(data.fen) in the fetch callback.
+            return 'snapback';
         }
-        
-        function onSnapEnd() {
-            // This function is called when the piece snaps to its new position
-            // In this implementation, we don't need to update the board here
-            // because we update it in the response handler of the move request
-            
-            // However, we can use this to play a sound, update UI elements, etc.
-            
-            // The most important thing is that we DON'T reset the board orientation here
-            board.orientation(currentOrientation);
-        }
-        
+
         // Function to handle game over
         function handleGameOver(result) {
             // Display game over message
-            $('#status').text(result.message);
-            
+            $('#status').text(result.message || 'Game over!');
+
             // Maintain board orientation instead of resetting it
-            board.orientation(currentOrientation);
+            // board.orientation(currentOrientation); // Should already be correct
+
+             // Remove draggable capability when game is over
+             // This requires re-initializing the board with draggable: false
+             // or finding a way to update the config of the existing board instance.
+             // Let's just make the status message clear.
+             // For now, draggable is handled in onDragStart check.
         }
+
+        // Function to highlight squares (e.g., AI's move)
+        function highlightSquares(square1, square2) {
+            // Clear existing highlights first
+            $('.square-55d63').removeClass('highlight1-32417 highlight2-9c5d2'); // Remove classes directly
+
+            // Add highlight classes to the squares
+             $('#board .square-' + square1).addClass('highlight1-32417'); // Source highlight
+             $('#board .square-' + square2).addClass('highlight2-9c5d2'); // Target highlight
+
+             // Optional: Remove highlights after a delay
+             // setTimeout(function() {
+             //     $('#board .square-' + square1).removeClass('highlight1-32417 highlight2-9c5d2');
+             // }, 2000); // Highlight for 2 seconds
+        }
+
+        // Helper to determine whose turn it is from FEN string
+        // Note: This function might be redundant if we strictly rely on server state/messages
+        // but useful for client-side checks like in onDragStart or handleSquareClick.
+        function getTurnFromFen(fenString) {
+            if (typeof fenString !== 'string') return 'white'; // Default or handle error
+            const parts = fenString.split(' ');
+            return parts.length > 1 && parts[1] === 'w' ? 'white' : 'black';
+        }
+
+
+         // --- GUI Enhancement: Click-to-Move and Legal Move Highlighting ---
+        let selectedSquare = null; // Track the square of the piece currently selected for move
+        let legalMovesHighlight = []; // Store squares currently highlighted as legal targets
+
+         // The click handler is attached via event delegation in $(document).ready
+
+         function handleSquareClick(event) {
+             if ($('#status').text().includes('Game over')) {
+                return; // Do nothing if game is over
+             }
+
+             const square = $(event.currentTarget).attr('data-square'); // e.g., 'a1'
+             const currentBoardPosObject = board.position(); // Get current board position object
+             const piece = currentBoardPosObject[square]; // e.g., 'wR' or undefined
+
+             // Clear previous highlights BEFORE processing the click
+             // This clears highlights from previous selections or AI moves
+             $('.square-55d63').removeClass('highlight1-32417 highlight2-9c5d2');
+             legalMovesHighlight = []; // Clear stored legal moves
+
+             // If a piece was already selected (click 1 on a piece)
+             if (selectedSquare) {
+                 // Check if the clicked square is one of the highlighted legal targets
+                 if (legalMovesHighlight.includes(square)) {
+                     // This is a valid move by clicking a target square!
+                     const source = selectedSquare;
+                     const target = square;
+
+                     // Clear selection state immediately as move is attempted
+                     selectedSquare = null;
+                     legalMovesHighlight = [];
+
+                     // Construct the move string and handle promotion (similar to onDrop)
+                     const pieceOnSource = currentBoardPosObject[source];
+                     let moveString = source + target;
+                     const targetRank = target.charAt(1);
+
+                     let isPromotion = false;
+                     let promotionPiece = 'q'; // Default to queen
+                     if (pieceOnSource && pieceOnSource.length === 2 && pieceOnSource.toLowerCase().charAt(1) === 'p') {
+                         const pieceColor = pieceOnSource.charAt(0);
+                         if ((pieceColor === 'w' && targetRank === '8') || (pieceColor === 'b' && targetRank === '1')) {
+                             isPromotion = true;
+                         }
+                     }
+
+                     if (isPromotion) {
+                         moveString += promotionPiece;
+                         updateStatus('Promoting to Queen...');
+                     } else {
+                          updateStatus('Processing move...');
+                     }
+
+                     // Send the move to the server
+                      fetch('/move', {
+                          method: 'POST',
+                          headers: {
+                              'Content-Type': 'application/x-www-form-urlencoded',
+                          },
+                          body: `move=${moveString}`
+                      })
+                      .then(response => response.json())
+                      .then(data => {
+                          if (data.status === 'error') {
+                              updateStatus(`Invalid move: ${data.message}`);
+                               // Board wasn't updated client-side for this attempted move, so no need to revert.
+                               // Re-highlight previous AI move if needed, or just leave cleared.
+
+                          } else if (data.status === 'gameover') {
+                               board.position(data.fen);
+                               currentBoardPosition = data.fen;
+                               handleGameOver(data);
+
+                          } else {
+                               board.position(data.fen); // Update board with Luna's move
+                               currentBoardPosition = data.fen;
+                               // Highlight Luna's move
+                               if (data.move && data.move.length >= 4) {
+                                     const lunaSource = data.move.substring(0, 2);
+                                     const lunaTarget = data.move.substring(2, 4);
+                                     highlightSquares(lunaSource, lunaTarget);
+                                }
+                                // Check game over after Luna's move
+                                if (data.is_game_over) {
+                                     handleGameOver(data);
+                                } else {
+                                     updateStatus(`Luna played: ${data.move || '...'}. Your turn.`);
+                                }
+                          }
+                      })
+                      .catch(error => {
+                          console.error('Error during move request:', error);
+                          updateStatus('Error communicating with server.');
+                          // Clear selection/highlights on error
+                           selectedSquare = null;
+                           legalMovesHighlight = [];
+                      });
+
+
+                 } else {
+                      // Clicked somewhere that wasn't a legal target square after selecting a piece
+                      // Could be:
+                      // 1. The same piece again (unselect)
+                      // 2. A different piece (of either color)
+                      // 3. An empty square that wasn't a legal target
+                      // In all these cases, clear the current selection and start fresh IF a piece was clicked.
+                      if (piece) { // If a piece was clicked (either same or different)
+                           // Check if the clicked piece is the same color as the currently selected piece
+                           const selectedPiece = currentBoardPosObject[selectedSquare];
+                           if ((piece.charAt(0) === 'w' && selectedPiece.charAt(0) === 'w') ||
+                               (piece.charAt(0) === 'b' && selectedPiece.charAt(0) === 'b')) {
+                                // It's a piece of the same color. Treat as changing selection.
+                                // Clear current selection and proceed to select the new piece.
+                                selectedSquare = null; // This will cause the logic below to re-select
+                                legalMovesHighlight = []; // Clear old highlights
+
+                                // Now, let the logic below handle selecting the newly clicked piece.
+                                // We fall through to the "No piece was selected" block, but since 'piece' is true,
+                                // it will attempt to select this piece.
+
+                           } else {
+                                // Clicked a piece of the opposite color or an empty square that wasn't a target.
+                                // Clear selection and provide feedback.
+                                selectedSquare = null;
+                                updateStatus("Invalid move or selection.");
+                                // Highlights were already cleared at the start of the function.
+                           }
+
+                      } else {
+                           // Clicked an empty square that was not a legal target.
+                           // Clear selection and provide feedback.
+                           selectedSquare = null;
+                           updateStatus("Invalid move or selection.");
+                            // Highlights were already cleared at the start of the function.
+                      }
+                 }
+
+             } else {
+                 // No piece was selected. This click could be:
+                 // 1. Clicking a piece of the human's color (select piece, highlight legal moves)
+                 // 2. Clicking an empty square or opponent's piece (do nothing or provide feedback)
+
+                 // Check if there is a piece on the clicked square
+                 if (piece) {
+                      // Check if it's the human's turn based on the last known server state (FEN)
+                      const boardFenParts = typeof currentBoardPosition === 'string' ? currentBoardPosition.split(' ') : [];
+                      const currentFenTurn = boardFenParts.length > 1 ? boardFenParts[1] : 'w';
+                      const isWhitesTurn = currentFenTurn === 'w';
+                      const isBlacksTurn = currentFenTurn === 'b';
+
+                      const isWhitePiece = piece.search(/^w/) !== -1;
+                      const isBlackPiece = piece.search(/^b/) !== -1;
+
+                      const humanIsWhite = currentOrientation === 'white';
+                      const humanIsBlack = currentOrientation === 'black';
+
+                      let isCorrectPieceColorForTurn = false;
+                      if (humanIsWhite && isWhitesTurn && isWhitePiece) isCorrectPieceColorForTurn = true;
+                      if (humanIsBlack && isBlacksTurn && isBlackPiece) isCorrectPieceColorForTurn = true;
+
+                      if (isCorrectPieceColorForTurn) {
+                          // This is a valid piece selection!
+                         selectedSquare = square;
+                         $('#board .square-' + selectedSquare).addClass('highlight1-32417'); // Highlight selected piece
+
+                         updateStatus('Getting legal moves...');
+                         fetch(`/legal_moves_from?square=${square}`) // Request legal moves from the server
+                         .then(response => response.json())
+                         .then(data => {
+                             if (data.status === 'success') {
+                                 legalMovesHighlight = data.moves; // Store target squares
+                                 // Highlight legal target squares
+                                 legalMovesHighlight.forEach(targetSq => {
+                                     $('#board .square-' + targetSq).addClass('highlight2-9c5d2');
+                                 });
+                                 if (legalMovesHighlight.length > 0) {
+                                    updateStatus(`Selected ${square}. Click a highlighted square to move.`);
+                                 } else {
+                                    updateStatus(`Selected ${square}. No legal moves.`);
+                                    selectedSquare = null; // Clear selection if no legal moves
+                                 }
+                             } else {
+                                 updateStatus(`Error getting legal moves: ${data.message}`);
+                                 selectedSquare = null; // Clear selection on error
+                             }
+                         })
+                         .catch(error => {
+                             console.error('Error fetching legal moves:', error);
+                             updateStatus('Error communicating with server for legal moves.');
+                             selectedSquare = null; // Clear selection on error
+                         });
+
+                      } else {
+                         // Clicked an opponent's piece or wrong color for the turn
+                         updateStatus("Select your piece when it's your turn.");
+                      }
+
+                 } else {
+                     // Clicked an empty square when no piece was selected
+                     updateStatus("Click on a piece to move.");
+                 }
+             }
+         }
+
+         // --- End Click-to-Move Enhancement ---
+
+
     </script>
 </body>
 </html>

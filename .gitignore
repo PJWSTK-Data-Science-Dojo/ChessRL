@@ -5,6 +5,9 @@ processed/
 processed/*
 runs/*
 temp/*
+src/temp/*
+src/wandb/*
+wandb/*
 
 # should we import content(stockfish)?
 content/

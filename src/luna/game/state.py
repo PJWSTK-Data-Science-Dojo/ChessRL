@@ -15,7 +15,11 @@ class LunaState():
             self.board = board
 
     def key(self):
-        """State key"""
+        """State key for caching (used by MCTS)"""
+        # Note: MCTS.stringRepresentation provides a more detailed key including repetition info
+        # This key might be used in other contexts, keep it for compatibility if needed elsewhere.
+        # If only MCTS uses a key, you might consider if this method is still necessary.
+        # For now, keep it as it was in the original code.
         return (self.board.board_fen(), self.board.turn, self.board.castling_rights, self.board.ep_square)
 
     # There is an infinite room for improvement...
