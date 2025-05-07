@@ -3,7 +3,7 @@ from typing import Dict
 import abc
 
 
-class TransformLambda:
+class TransformLambda(metaclass=abc.ABCMeta):
     """
     Lambda takes a dictionary, which represents a single data point from the dataset
     and appends to this dictionary. It should change the already existing content of the
@@ -12,4 +12,4 @@ class TransformLambda:
 
     @abc.abstractmethod
     def __call__(self, sample: Dict) -> Dict:
-        pass
+        ...

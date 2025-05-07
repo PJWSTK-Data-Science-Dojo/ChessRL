@@ -1,48 +1,42 @@
-import math
-from typing import Optional, List, Callable, Dict, Iterator, Any
+from typing import Optional, List, Dict, Iterator, Any, Type
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import Dataset, DataLoader
 from pretrain.utils.preprocess import PreprocessingLambda
 from pretrain.utils.transforms import TransformLambda
+from pretrain.utils.dataset import DatasetChunk
 
-import pyarrow.parquet as pq
-import polars as pl
+import math
+import warnings
 import os
 
 
 class ChessDataset(Dataset):
     """
     Handles chess dataset loading for various dataset types.
-    The dataset is lazy loaded by default (initialisation does not load it)
     """
 
     def __init__(
         self,
         data_dir: str,
-        schema: pl.Schema,
-        lazy_load: bool = True,
+        dataset_class: Type[DatasetChunk],
         preprocessing: Optional[List[PreprocessingLambda]] = None,
         transforms: Optional[List[TransformLambda]] = None,
+        **dataset_kwargs,
     ):
         if not os.path.exists(data_dir):
             raise FileNotFoundError(f"Dataset not found under {data_dir}.")
-        self.data_dir = data_dir
-        self.schema = schema
-        self.dataset_df = None
-        self.data_len = pq.ParquetFile(data_dir).metadata.num_rows
+        self.dataset = dataset_class(data_dir, **dataset_kwargs)
         self.preprocessing = preprocessing
         self.transforms = transforms
-        if not lazy_load:
-            self.load()
 
     def __len__(self):
-        return self.data_len
+        return len(self.dataset)
 
     def load(self):
-        self.dataset_df = pl.scan_parquet(self.data_dir, schema=self.schema).collect(engine="in-memory")
+        self.dataset.load()
 
     def delete(self):
-        del self.dataset_df
+        self.dataset.delete()
 
     def __apply_preprocessing(self, sample: Dict):
         if self.preprocessing is None:
@@ -61,7 +55,7 @@ class ChessDataset(Dataset):
             return sample
 
     def __getitem__(self, idx: int):
-        sample = self.dataset_df.row(idx, named=True)
+        sample = self.dataset[idx]
         sample = self.__apply_preprocessing(sample)
         sample = self.__apply_transforms(sample)
         return sample
@@ -90,7 +84,7 @@ class ChessChunkedDataLoader(DataLoader):
         batch_size: int,
         chunks: List[str],
         num_workers: int = 0,
-        **dataset_kwargs
+        **dataset_init_kwargs
     ):
         """
         :param root_dir: Directory where parquet datasets are located.
@@ -101,15 +95,14 @@ class ChessChunkedDataLoader(DataLoader):
         """
         self.root_dir = root_dir
         self.files = []
-        self.total_size = 0
         for file in chunks:
             self.files.append(file)
-            self.total_size += pq.ParquetFile(file).metadata.num_rows
         self.batch_size = batch_size
-        self.batches = math.ceil(self.total_size / self.batch_size)
-        self.datasets = [ChessDataset(file, **dataset_kwargs) for file in self.files]
-        self.dataloaders = [DataLoader(dataset, batch_size=self.batch_size, num_workers=num_workers)
+        self.datasets = [ChessDataset(file, **dataset_init_kwargs) for file in self.files]
+        self.dataloaders = [DataLoader(dataset, batch_size=self.batch_size, num_workers=num_workers, pin_memory=True)
                             for dataset in self.datasets]
+        self.total_size = sum(len(dataset) for dataset in self.datasets)
+        self.num_of_batches = math.ceil(self.total_size / self.batch_size)
         super().__init__(DummyDataset(self.total_size))
 
     def __iter__(self) -> Iterator[Any]:
@@ -120,7 +113,7 @@ class ChessChunkedDataLoader(DataLoader):
             self.datasets[i].delete()
 
     def __len__(self) -> int:
-        return self.batches
+        return self.num_of_batches
 
 
 class ChessDataModule(LightningDataModule):
@@ -128,11 +121,16 @@ class ChessDataModule(LightningDataModule):
     Chess data module for loading static chess dataset.
     """
 
+    SUPPORTED_FILE_FORMATS = [".parquet", ".pt", ".pth", ".csv"]
+
     def __init__(
         self,
         data_dir: str,
         batch_size: int = 1024,
         num_workers: int = 0,
+        preprocessing: Optional[List[PreprocessingLambda]] = None,
+        transforms: Optional[List[TransformLambda]] = None,
+        dataset_class: Type[DatasetChunk] = None,
         **dataset_specific_kwargs
     ):
         """
@@ -150,15 +148,17 @@ class ChessDataModule(LightningDataModule):
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.preprocessing = preprocessing
+        self.transforms = transforms
+        self.dataset_class = dataset_class
         self.dataset_specific_kwargs = dataset_specific_kwargs
 
         self.train_chunks = []
         for i, file in enumerate(list(sorted(os.listdir(self.data_dir)))):
-            if file.endswith(".parquet"):
+            if any(file.endswith(file_format) for file_format in ChessDataModule.SUPPORTED_FILE_FORMATS):
                 self.train_chunks.append(os.path.join(data_dir, file))
-
-    def get_chunks_num(self):
-        return len(filter(lambda file: file.endswith(".parquet"), os.listdir(self.data_dir)))
+            elif os.path.isfile(file):
+                warnings.warn(f"In the dataset directory there is a file {file}, which is not supported. Only {ChessDataModule.SUPPORTED_FILE_FORMATS} are supported.")
 
     def train_dataloader(self):
         return ChessChunkedDataLoader(
@@ -166,5 +166,8 @@ class ChessDataModule(LightningDataModule):
             self.batch_size,
             self.train_chunks,
             self.num_workers,
+            preprocessing=self.preprocessing,
+            transforms=self.transforms,
+            dataset_class=self.dataset_class,
             **self.dataset_specific_kwargs
         )

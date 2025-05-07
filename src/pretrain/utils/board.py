@@ -77,7 +77,6 @@ WINNER_MAP = {
 UCI_TO_INT_MAP = generate_uci_move_map()
 UCI_TO_INT_MAP["Terminal"] = len(UCI_TO_INT_MAP)
 INT_TO_UCI_MAP = {val: key for key, val in UCI_TO_INT_MAP.items()}
-INT_TO_UCI_MAP[len(INT_TO_UCI_MAP)] = "Terminal"
 
 
 def board_to_tensor(
@@ -90,17 +89,51 @@ def board_to_tensor(
     - Empty square: 0
     - White pieces: PAWN=1, KNIGHT=2, BISHOP=3, ROOK=4, QUEEN=5, KING=6
     - Black pieces: PAWN=7, KNIGHT=8, BISHOP=9, ROOK=10, QUEEN=11, KING=12
-    """
-    tensor_board = torch.zeros((8, 8), dtype=dtype, device=device)
-    for square, piece in board.piece_map().items():
-        rank = 7 - chess.square_rank(square)  # Flip rank to match 0-12 representation
-        file = chess.square_file(square)
 
-        # Get piece value and add 6 if the piece is black
-        piece_value = PIECE_MAP[piece.piece_type]
-        if piece.color == chess.BLACK:
-            piece_value += 6
-        tensor_board[rank, file] = piece_value
+    Ultra-optimized implementation using native bitboards and maximum vectorization.
+    """
+    # Initialize tensor board
+    tensor_board = torch.zeros((8, 8), dtype=dtype, device=device)
+
+    # Process all pieces at once using bitboards
+    all_squares = []
+    all_values = []
+
+    # Loop through colors and piece types
+    for color, offset in [(chess.WHITE, 0), (chess.BLACK, 6)]:
+        for piece_type in range(1, 7):  # 1=PAWN, 2=KNIGHT, ..., 6=KING
+            # Get bitboard for this piece type and color
+            bitboard = board.pieces_mask(piece_type, color)
+
+            if bitboard:
+                # Convert bitboard to square indices (much faster than loop)
+                # This is a bitwise operation that extracts set bits from the bitboard
+                squares = []
+                bb = bitboard
+                while bb:
+                    square = bb.bit_length() - 1
+                    squares.append(square)
+                    bb &= ~(1 << square)  # Clear the processed bit
+
+                # Add to our collections
+                all_squares.extend(squares)
+                all_values.extend([piece_type + offset] * len(squares))
+
+    # If there are any pieces, process them
+    if all_squares:
+        # Convert all squares to tensor
+        squares_tensor = torch.tensor(all_squares, dtype=torch.long, device=device)
+
+        # Convert to ranks and files in one vectorized operation
+        ranks = 7 - (squares_tensor >> 3)  # bitshift is faster than division
+        files = squares_tensor & 7          # bitwise AND is faster than modulo
+
+        # Create values tensor
+        values = torch.tensor(all_values, dtype=dtype, device=device)
+
+        # Place all values at once with index_put_
+        tensor_board.index_put_((ranks, files), values)
+
     return tensor_board
 
 

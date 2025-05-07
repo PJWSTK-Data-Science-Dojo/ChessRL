@@ -1,14 +1,12 @@
 from typing import Dict
-from pretrain.utils.board import (INT_TO_UCI_MAP, uci_to_index, board_to_tensor,
-                                  move_to_tensor, create_legal_moves_tensor)
+from pretrain.utils.board import INT_TO_UCI_MAP, uci_to_index, board_to_tensor, create_legal_moves_tensor
 
-import polars as pl
 import chess
 import abc
 import torch
 
 
-class PreprocessingLambda:
+class PreprocessingLambda(metaclass=abc.ABCMeta):
     """
     Lambda takes a dictionary, which represents a single data point from the dataset
     and returns new dictionary representing the same point (possible with totally new data).
@@ -17,50 +15,12 @@ class PreprocessingLambda:
 
     @abc.abstractmethod
     def __call__(self, sample: Dict) -> Dict:
-        pass
+        ...
 
 
-class FenDataset(PreprocessingLambda):
+class PreprocessFenDataset(PreprocessingLambda):
     """
-    For preprocessing FEN datasets. Converts them into the standard
-    representation of the state, allowing for most possible encodings etc.
-
-    * Board is a chess.Board() object for the given state.
-    * Uci is an action in UCI notation action for the given state.
-    * Value is a value from perspective of current player (1 - win, 0 - draw, -1 - loss).
-    * Color is a color of current player (chess.WHITE or chess.BLACK)
-    """
-
-    Schema = pl.Schema({
-        "states": pl.Utf8,
-        "winner": pl.Int8,
-        "game": pl.UInt64,
-        "move_index": pl.Int16,
-        "actions": pl.Int16,
-    })
-
-    def __init__(self, use_weak_action_representation: bool = False):
-        self.use_weak_action_representation = use_weak_action_representation
-
-    def __call__(self, sample: Dict) -> Dict:
-        board = chess.Board(sample["states"])
-        uci = INT_TO_UCI_MAP[sample["actions"]]
-        color = sample["move_index"] % 2 == 0
-        if color == chess.BLACK:
-            value = -sample["winner"]
-        else:
-            value = sample["winner"]
-        return {
-            "board": board,
-            "uci": uci,
-            "value": value,
-            "color": color,
-        }
-
-
-class LunaPreprocessing(PreprocessingLambda):
-    """
-    Prepares dataset for Luna neural network model effectively encoding all the needed information.
+    Prepares dataset for neural network model effectively encoding all the needed information.
 
     * State is tensor of shape (6, 8, 8) where each piece has its integer representing it.
     * Value is a single value tensor of the value for the current player's move
@@ -76,7 +36,7 @@ class LunaPreprocessing(PreprocessingLambda):
         self.use_mask = use_mask
 
     @staticmethod
-    def __luna_one_hot_encoding(board: chess.Board, color: bool) -> torch.Tensor:
+    def one_hot_encoding(board: chess.Board, color: bool) -> torch.Tensor:
         state = board_to_tensor(board).to(torch.float32)
         if color == chess.WHITE:
             current_base = 1
@@ -92,14 +52,28 @@ class LunaPreprocessing(PreprocessingLambda):
         return new_state
 
     def __call__(self, sample: Dict) -> Dict:
-        state = LunaPreprocessing.__luna_one_hot_encoding(sample["board"], sample["color"])
+        board = chess.Board(sample["states"])
+        uci = INT_TO_UCI_MAP[sample["actions"]]
+        color = sample["move_index"] % 2 == 0
+        if color == chess.BLACK:
+            value = -sample["winner"]
+        else:
+            value = sample["winner"]
+        sample = {
+            "board": board,
+            "uci": uci,
+            "value": value,
+            "color": color,
+        }
+
+        state = PreprocessFenDataset.one_hot_encoding(sample["board"], sample["color"])
         if sample["uci"] != "Terminal":
             from_row, from_col, to_row, to_col = uci_to_index(sample["uci"])
             from_pos = from_row * 8 + from_col
             to_pos = to_row * 8 + to_col
             label = from_pos * 64 + to_pos
         else:
-            label = LunaPreprocessing.BAD_INDEX
+            label = PreprocessFenDataset.BAD_INDEX
         if self.use_mask:
             mask = create_legal_moves_tensor(sample["board"], sample["color"]).to(torch.int32).flatten()
         else:
@@ -109,4 +83,35 @@ class LunaPreprocessing(PreprocessingLambda):
             "value": torch.tensor(sample["value"], dtype=torch.float32),
             "mask": mask,
             "label": torch.tensor(label, dtype=torch.long),
+        }
+
+
+class PreprocessTensorDataset(PreprocessingLambda):
+    """
+    Prepares dataset for neural network model effectively encoding all the needed information.
+    Used for direct tensor dataset (where dataset is capable of being passed directly to a simple network or
+    with little effort to the network).
+    """
+
+    @staticmethod
+    def one_hot_encoding(sample: Dict) -> torch.Tensor:
+        state = torch.zeros((19, 8, 8), dtype=torch.float32)
+        state[12] = sample["clock"] % 2  # Who is to move
+        state[13] = sample["repetitions"]  # For three repetitions rule
+        state[14] = sample["castling_rights"][0]
+        state[15] = sample["castling_rights"][1]
+        state[16] = sample["castling_rights"][2]
+        state[17] = sample["castling_rights"][3]
+        state[18] = sample["clock"]  # for 50 moves rule
+        figures = torch.arange(12)
+        state[:12] = torch.eq(sample['state'], figures.reshape(12, 1, 1)).to(torch.float32)
+        return state
+
+
+    def __call__(self, sample: Dict) -> Dict:
+        return {
+            'mask': torch.ones(len(INT_TO_UCI_MAP), dtype=torch.int8),
+            'state': PreprocessTensorDataset.one_hot_encoding(sample),
+            'label': sample["action"],
+            'value': sample['value'].to(torch.float32),
         }
