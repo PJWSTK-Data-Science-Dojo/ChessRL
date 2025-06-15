@@ -8,7 +8,7 @@ pretrained_models_dir: ./pretrained_models/
 
 # --- Game Settings ---
 game:
-  history_len: 8 # Number of board states in history (current + 7 previous)
+  history_len: 1 # Number of board states in history (current + 7 previous)
 
 # --- Training Settings (used by main.py and Coach) ---
 training:
@@ -38,7 +38,7 @@ arena:
 model:
   nn_version: 'resnet_v1_feat_v4'
   num_channels: 128
-  num_res_blocks: 8
+  num_res_blocks: 14
   dropout: 0.22
 
 # --- Optimizer and Scheduler Settings (used by NNet) ---

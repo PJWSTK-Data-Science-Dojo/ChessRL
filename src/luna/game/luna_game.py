@@ -73,7 +73,7 @@ class ChessGame():
         super(ChessGame, self).__init__()
         # Update Number of Input Planes (remains 22 features per board state)
         self.num_feature_planes = 22
-        self.history_len = cfg.get('game', {}).get('history_len', 8) # Use .get with default dict
+        self.history_len = cfg.get('game', {}).get('history_len', 1) # Use .get with default dict
         # Total channels = features_per_state * history_frames
         self.num_input_channels = self.num_feature_planes * self.history_len
         log.info(f"ChessGame initialized with history_len={self.history_len}, num_input_channels={self.num_input_channels}")

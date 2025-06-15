@@ -180,3 +180,8 @@ cython_debug/
 tensorboard/
 runs/
 .DS_Store
+stockfish/
+src/checkpoints/
+src/wandb/
+src/temp/
+temp/

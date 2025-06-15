@@ -311,6 +311,13 @@
             return true; // Allow drag
         }
 
+        // Function to handle snap end (after piece animation completes)
+        function onSnapEnd() {
+            // This function is called after a piece finishes animating to its position
+            // You can add any cleanup or post-move processing here if needed
+            // For now, we'll keep it simple
+        }
+
         // Function to handle piece drop (move)
         function onDrop(source, target, piece, newPos, oldPos, orientation) {
             // Check if the drop is on the same square (not a move attempt)

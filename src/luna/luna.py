@@ -7,7 +7,7 @@ from omegaconf import OmegaConf, DictConfig
 import yaml
 from collections import deque
 from .NNet import Luna_Network
-from .game.luna_game import ChessGame, who, _flip_action_index
+from .game.luna_game import ChessGame, who, _flip_action_index, from_move
 from .mcts import MCTS
 
 log = logging.getLogger(__name__)
@@ -135,7 +135,7 @@ class Luna:
         # Translate canonical action index back to actual action index for the *current* board
         action_actual = action_canonical
         if current_player == -1: # If the actual board is Black's turn
-             action_actual = self.game._flip_action_index(action_canonical) # Use game helper
+             action_actual = _flip_action_index(action_canonical) # Use game helper
 
         # --- Determine the exact legal move corresponding to action_actual ---
         temp_board = self.board.copy()
@@ -145,7 +145,7 @@ class Luna:
             # that maps to the selected action_actual index.
             for legal_m in temp_board.legal_moves:
                  # Use game.from_move to get the 64*64 index
-                 if self.game.from_move(legal_m) == action_actual:
+                 if from_move(legal_m) == action_actual:
                       found_legal_move = legal_m
                       break
 

@@ -1,0 +1,40 @@
+# Dataset Rendering Configuration for Chess Training Data
+# Configuration for Chess Dataset Rendering Pipeline
+
+# --- Input/Output Settings ---
+input:
+  chunk_size: 200_000        # Number of games to load per chunk
+  max_games: null           # Maximum games to process (null = unlimited)
+  
+output:
+  max_batches: 99           # Stop after creating 10 batch files
+  batch_size: 8_000_000     # Number of transitions per output file
+  output_dir: "dataset"     # Output directory for processed files
+  compress_boards: true     # Use float16 for board tensors
+  compress_actions: true    # Use int16 for action tensors
+  compress_values: true     # Use float16 for value tensors
+
+# --- Game Processing Settings ---
+game:
+  history_len: 900          # Number of historical board states to include (should match main config). Allows handling up to N game in history.
+  validate_moves: true      # Validate UCI moves during processing
+  skip_invalid_games: true  # Skip games with invalid moves
+
+# --- Performance Settings ---
+performance:
+  # Multiprocessing settings
+  num_processes: 23          # Number of parallel processes (0 = auto-detect CPU cores)
+  chunk_split_factor: 23     # Split each chunk into this many sub-chunks for parallel processing
+
+# --- Logging Settings ---
+logging:
+  log_level: "INFO"         # DEBUG, INFO, WARNING, ERROR
+  progress_update_freq: 1000  # Log progress every N games
+  detailed_timing: false    # Log detailed timing information
+  
+# --- Validation Settings ---
+validation:
+  validate_during_processing: true  # Validate tensors during processing (slower but safer)
+  strict_validation: false  # Fail on any validation error (vs warning)
+  check_action_bounds: true # Verify action indices are in valid range
+  check_value_bounds: true  # Verify value tensors are in valid range 
