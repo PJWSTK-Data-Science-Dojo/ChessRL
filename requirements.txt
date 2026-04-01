@@ -1,8 +1,0 @@
-numpy
-torch
-python-chess
-flask
-coloredlogs
-tqdm
-wandb
-stockfish

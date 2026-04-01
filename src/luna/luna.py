@@ -1,81 +1,69 @@
-"""
-    Luna-Chess, main interface for the chess engine
-"""
+"""Luna-Chess: main inference interface for the chess engine."""
+
+from __future__ import annotations
+
+import logging
 
 import chess
 import numpy as np
-import torch
 
-from .NNet import Luna_Network
-from .game.luna_game import ChessGame, who
-from .mcts import MCTS
-from .utils import dotdict
+from .game.luna_game import ChessGame, player_from_turn
 from .game.state import LunaState
+from .mcts import MCTS
+from .network import LunaNetwork
+from .utils import dotdict
+
+log = logging.getLogger(__name__)
+
 
 class Luna:
-    """Main interface for Luna Chess Engine"""
-    
-    def __init__(self, verbose=False) -> None:
+    """Main interface for Luna Chess Engine (EZV2)."""
+
+    def __init__(self, verbose: bool = False) -> None:
         self.verbose = verbose
-        
-        # Game environment
         self.game = ChessGame()
-        
-        # Neural net
-        self.luna_eval = Luna_Network(self.game)
-        
-        # Model hyperparameters
-        self.args = dotdict({
-            'numMCTSSims': 100,  # Number of MCTS simulations per move
-            'cpuct': 1,          # Exploration constant
-            'dir_noise': False,  # No Dirichlet noise when playing
-            'dir_alpha': 1.4,    # Dirichlet alpha parameter
-        })
-        
-        # Load pre-trained model if available
+        self.luna_eval = LunaNetwork(self.game)
+
+        self.args = dotdict(
+            {
+                "numMCTSSims": 100,
+                "cpuct": 1.25,
+                "dir_noise": False,
+                "dir_alpha": 0.3,
+            }
+        )
+
         try:
-            self.luna_eval.load_checkpoint('./temp/', 'best.pth.tar')
-            if self.verbose: print("[LUNA] Loaded pre-trained model")
-        except:
-            if self.verbose: print("[LUNA] Failed to load model, using untrained network")
-        
-        # Initialize MCTS search
+            self.luna_eval.load_checkpoint("./temp/", "best.pth.tar")
+            if self.verbose:
+                log.info("Loaded pre-trained model")
+        except Exception:
+            if self.verbose:
+                log.warning("Failed to load model, using untrained network")
+
         self.mcts = MCTS(self.game, self.luna_eval, self.args)
-        
-        # Current state
         self.board = chess.Board()
         self.board_state = LunaState()
-    
-    def computer_move(self, state, model):
-        """Have Luna make a move"""
-        if self.verbose: print(f"[LUNA THINKS] Luna is thinking about position {state.board.fen()}")
-        
-        # Get current player based on the board's turn
-        current_player = who(state.board.turn)
-        
-        if self.verbose: print(f"[LUNA PLAYER] Current player is {'white' if current_player == 1 else 'black'}")
-        
-        # Get canonical form for current player's perspective
-        canonical_board = self.game.getCanonicalForm(state.board, current_player)
-        
-        # Run MCTS and get action probabilities
-        action_probs = self.mcts.getActionProb(canonical_board, temp=0)
-        
-        # Select best action
-        action = np.argmax(action_probs)
-        
-        # Convert action to move and make it
-        next_board, _ = self.game.getNextState(state.board, current_player, action)
-        
-        # Update the board state
+
+    def computer_move(self, state: LunaState, model: LunaNetwork | None = None) -> int:
+        """Have Luna make a move on *state.board*."""
+        if self.verbose:
+            log.info("Luna thinking about position %s", state.board.fen())
+
+        current_player = player_from_turn(state.board.turn)
+        canonical_board = self.game.get_canonical_form(state.board, current_player)
+
+        action_probs = self.mcts.get_action_prob(canonical_board, temp=0)
+        action = int(np.argmax(action_probs))
+
+        next_board, _ = self.game.get_next_state(state.board, current_player, action)
         state.board = next_board
-        self.board = next_board  # Make sure the main board state is updated too
-        
-        if self.verbose: print(f"[LUNA MOVES] Luna played {state.board.peek()}")
-        
+        self.board = next_board
+
+        if self.verbose:
+            log.info("Luna played %s", state.board.peek())
+
         return action
 
-    
-    def is_game_over(self):
-        """Check if the game is over"""
+    def is_game_over(self) -> bool:
         return self.board.is_game_over()

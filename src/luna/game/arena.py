@@ -1,115 +1,93 @@
-"""
-    Arena where 2 players fight against each other
-"""
+"""Arena where 2 players fight against each other."""
+
+from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING, Any, Callable
+
 from tqdm import tqdm
 
-# Luna
 from .luna_game import ChessGame
-from luna.NNet import Luna_Network
+
+if TYPE_CHECKING:
+    import chess
 
 log = logging.getLogger(__name__)
 
-class Arena():
-    """
-        An Arena class where any 2 agents can be pit against each other.
-    """
 
-    # Chess Env
+class Arena:
+    """An Arena class where any 2 agents can be pit against each other."""
+
     game: ChessGame
+    player1: Callable[..., Any]
+    player2: Callable[..., Any]
 
-    # Networks
-    player1: Luna_Network
-    player2: Luna_Network
-
-    def __init__(self, player1, player2, game, display=None):
-        """
-        Input:
-            player 1,2: two functions that takes board as input, return action
-            game: Game object
-            display: a function that takes board as input and prints it.
-                    Is necessary for verbose mode.
-        """
-        super(Arena, self).__init__()
-
+    def __init__(
+        self,
+        player1: Callable[..., Any],
+        player2: Callable[..., Any],
+        game: ChessGame,
+        display: Callable[[chess.Board], None] | None = None,
+    ) -> None:
         self.player1 = player1
         self.player2 = player2
         self.game = game
         self.display = display
 
-    def playGame(self, verbose=False):
-        """
-        Executes one episode of a game.
-
-        Returns:
-            either
-                winner: player who won the game (1 if player1, -1 if player2)
-            or
-                draw result returned from the game that is neither 1, -1, nor 0.
-        """
+    def play_game(self, verbose: bool = False) -> float:
+        """Execute one episode. Returns +1 if player1 wins, -1 if player2 wins, else draw value."""
         players = [self.player2, None, self.player1]
-        curPlayer = 1
-        board = self.game.getInitBoard()
-        it = 0
-        while self.game.getGameEnded(board, curPlayer) == 0:
-            it += 1
+        current_player = 1
+        board = self.game.get_init_board()
+        turn_count = 0
+        while self.game.get_game_ended(board, current_player) == 0:
+            turn_count += 1
             if verbose:
                 assert self.display
-                print("Turn ", str(it), "Player ", str(curPlayer))
+                print("Turn ", str(turn_count), "Player ", str(current_player))
                 self.display(board)
-            action = players[curPlayer + 1](self.game.getCanonicalForm(board, curPlayer))
+            canonical_board = self.game.get_canonical_form(board, current_player)
+            action = players[current_player + 1](canonical_board)
 
-            valids = self.game.getValidMoves(self.game.getCanonicalForm(board, curPlayer), 1)
+            valids = self.game.get_valid_moves(canonical_board, 1)
 
             if valids[action] == 0:
-                log.error(f'Action {action} is not valid!')
-                log.debug(f'valids = {valids}')
+                log.error("Action %d is not valid!", action)
+                log.debug("valids = %s", valids)
                 assert valids[action] > 0
-            board, curPlayer = self.game.getNextState(board, curPlayer, action)
+            board, current_player = self.game.get_next_state(board, current_player, action)
         if verbose:
             assert self.display
-            print("Game over: Turn ", str(it), "Result ", str(self.game.getGameEnded(board, 1)))
+            print("Game over: Turn ", str(turn_count), "Result ", str(self.game.get_game_ended(board, 1)))
             self.display(board)
-        return curPlayer * self.game.getGameEnded(board, curPlayer)
+        return current_player * self.game.get_game_ended(board, current_player)
 
-    def playGames(self, p1, p2, num, verbose=False):
-        """
-        Plays num games in which player1 starts num/2 games and player2 starts
-        num/2 games.
-
-        Returns:
-            oneWon: games won by player1
-            twoWon: games won by player2
-            draws:  games won by nobody
-        """
-
+    def play_games(self, num: int, verbose: bool = False) -> tuple[int, int, int]:
+        """Play num games, swapping colors halfway. Returns (p1_wins, p2_wins, draws)."""
         num = int(num / 2)
-        oneWon = 0
-        twoWon = 0
+        player_one_wins = 0
+        player_two_wins = 0
         draws = 0
-        for _ in tqdm(range(num), desc="Arena.playGames (1)"):
-            gameResult = self.playGame(verbose=verbose)
-            if gameResult == 1:
-                oneWon += 1
-            elif gameResult == -1:
-                twoWon += 1
+        for _ in tqdm(range(num), desc="Arena.play_games (1)"):
+            game_result = self.play_game(verbose=verbose)
+            if game_result == 1:
+                player_one_wins += 1
+            elif game_result == -1:
+                player_two_wins += 1
             else:
                 draws += 1
-            self.player_1 = p1
-            self.player_2 = p2
-
 
         self.player1, self.player2 = self.player2, self.player1
 
-        for _ in tqdm(range(num), desc="Arena.playGames (2)"):
-            gameResult = self.playGame(verbose=verbose)
-            if gameResult == -1:
-                oneWon += 1
-            elif gameResult == 1:
-                twoWon += 1
+        for _ in tqdm(range(num), desc="Arena.play_games (2)"):
+            game_result = self.play_game(verbose=verbose)
+            if game_result == -1:
+                player_one_wins += 1
+            elif game_result == 1:
+                player_two_wins += 1
             else:
                 draws += 1
-            self.player1 = p2
-            self.player2 = p1
-        return oneWon, twoWon, draws
+
+        self.player1, self.player2 = self.player2, self.player1
+        return player_one_wins, player_two_wins, draws
+

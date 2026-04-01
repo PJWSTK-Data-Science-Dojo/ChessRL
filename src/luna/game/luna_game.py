@@ -1,129 +1,101 @@
-"""
-    python-chess luna wrapper
-"""
+"""python-chess luna wrapper."""
 
-from __future__ import print_function
-import numpy as np
+from __future__ import annotations
+
 import chess
+import numpy as np
 
-# Helper Functions
-def to_np(board: chess.Board):
-    a = [0] * (8*8*6)
-    for sq, pc in board.piece_map().items():
-        a[sq * 6 + pc.piece_type - 1] = 1 if pc.color else -1
-    return np.array(a)
 
-def from_move(move: chess.Move):
-    return move.from_square*64+move.to_square
+def board_to_numpy(board: chess.Board) -> np.ndarray:
+    encoded_board = [0] * (8 * 8 * 6)
+    for square_index, piece in board.piece_map().items():
+        encoded_board[square_index * 6 + piece.piece_type - 1] = 1 if piece.color else -1
+    return np.array(encoded_board, dtype=np.float32)
 
-def to_move(action):
+
+def move_to_action(move: chess.Move) -> int:
+    return move.from_square * 64 + move.to_square
+
+
+def action_to_move(action: int) -> chess.Move:
     to_sq = action % 64
     from_sq = int(action / 64)
     return chess.Move(from_sq, to_sq)
 
-def who(turn: bool):
-  """Who is playing, 1 for white -1 for black"""
-  # return int(turn)
-  return 1 if turn else -1
 
-def mirror_move(move: chess.Move):
-  return chess.Move(chess.square_mirror(move.from_square), chess.square_mirror(move.to_square))
+def player_from_turn(turn: bool) -> int:
+    """1 for white, -1 for black."""
+    return 1 if turn else -1
 
-# Game Outcomes
-CHECKMATE = 1
-STALEMATE = 2
-INSUFFICIENT_MATERIAL = 3
-SEVENTYFIVE_MOVES = 4
-FIVEFOLD_REPETITION = 5
-FIFTY_MOVES = 6
-THREEFOLD_REPETITION = 7
 
-class ChessGame():
-    """python-chess wrapper"""
+def mirror_move(move: chess.Move) -> chess.Move:
+    return chess.Move(chess.square_mirror(move.from_square), chess.square_mirror(move.to_square))
 
-    def __init__(self):
-        super(ChessGame, self).__init__()
 
-    def getInitBoard(self):
-        """Initial Board State example"""
+ACTION_SIZE = 64 * 64
+
+
+class ChessGame:
+    """python-chess wrapper."""
+
+    def __init__(self) -> None:
+        pass
+
+    def get_init_board(self) -> chess.Board:
         return chess.Board()
 
-    def getBoardSize(self):
-        """Board Dimensions"""
-        # (a,b) tuple
-        # 6 piece type
+    def get_board_size(self) -> tuple[int, int, int]:
         return (8, 8, 6)
 
-    def toArray(self, board):
-        """Serialized board"""
-        return to_np(board)
+    def to_array(self, board: chess.Board) -> np.ndarray:
+        return board_to_numpy(board)
 
-    def getActionSize(self):
-        """Number of actions possible"""
-        return 64*64
-        # return self.n*self.n*16+1
+    def get_action_size(self) -> int:
+        return ACTION_SIZE
 
-    def getNextState(self, board: chess.Board, player: chess.Color, action):
-        """Get next state given board and action"""
-        # if player takes action on board, return next (board,player)
-        # action must be a valid move
-        
-        assert(who(board.turn) == player)
-        move = to_move(action)
+    def get_next_state(self, board: chess.Board, player: int, action: int) -> tuple[chess.Board, int]:
+        assert player_from_turn(board.turn) == player
+        move = action_to_move(action)
         if not board.turn:
-            # assume the move comes from the canonical board...
             move = mirror_move(move)
         if move not in board.legal_moves:
-            # could be a pawn promotion, which has an extra letter in UCI format
-            move = chess.Move.from_uci(move.uci()+'q') # assume promotion to queen
+            move = chess.Move.from_uci(move.uci() + "q")
             if move not in board.legal_moves:
-                assert False, "%s not in %s" % (str(move), str(list(board.legal_moves)))
+                raise ValueError(f"{move} not in {list(board.legal_moves)}")
         board = board.copy()
         board.push(move)
-        return (board, who(board.turn))
+        return (board, player_from_turn(board.turn))
 
-    def getValidMoves(self, board: chess.Board, player: chess.Color):
-        """Fixed size binary vector"""
-        assert(who(board.turn) == player)
-        
-        acts = [0] * self.getActionSize()
+    def get_valid_moves(self, board: chess.Board, player: int) -> np.ndarray:
+        assert player_from_turn(board.turn) == player
+        acts = np.zeros(self.get_action_size(), dtype=np.float32)
         for move in board.legal_moves:
-          acts[from_move(move)] = 1
-        
-        return np.array(acts)
+            acts[move_to_action(move)] = 1.0
+        return acts
 
-    def getGameEnded(self, board: chess.Board, player: chess.Color) -> float:
-        """return 0 if not ended, 1 if player 1 won, -1 if player 1 lost"""
-        
+    def get_game_ended(self, board: chess.Board, player: int) -> float:
+        """Return 0 if not ended. Otherwise return reward from *player*'s perspective."""
         outcome = board.outcome()
-        reward = 0.0
-        if outcome is not None:
-            if outcome.winner is None:
-                # draw, very little negative reward value
-                reward = 1e-4
-            else:
-                if outcome.winner == board.turn:
-                    reward = 1.0
-                else:
-                    reward = -1.0
-        
-        return reward
+        if outcome is None:
+            return 0.0
+        if outcome.winner is None:
+            return 1e-4
+        winner_int = player_from_turn(outcome.winner)
+        return 1.0 if winner_int == player else -1.0
 
-    def getCanonicalForm(self, board: chess.Board, player: chess.Color):
-        """return state if player==1, else return -state if player==-1"""
-        assert(who(board.turn) == player)
-
+    def get_canonical_form(self, board: chess.Board, player: int) -> chess.Board:
+        assert player_from_turn(board.turn) == player
         if board.turn:
             return board
         else:
             return board.mirror()
 
-    def getSymmetries(self, board, pi):
-        return [(board,pi)]
+    def get_symmetries(self, board: chess.Board, pi: list | np.ndarray) -> list[tuple]:
+        return [(board, pi)]
 
-    def stringRepresentation(self, board: chess.Board):
+    def string_representation(self, board: chess.Board) -> str:
         return board.fen()
 
     @staticmethod
-    def display(board):
+    def display(board: chess.Board) -> None:
         print(board)

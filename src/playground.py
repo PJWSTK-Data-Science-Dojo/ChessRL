@@ -1,70 +1,80 @@
-"""
-    Debug/playground script
-"""
+"""Debug/playground script."""
 
-import sys
+from __future__ import annotations
+
 import logging
+import sys
+
 import coloredlogs
+import numpy as np
+
 from luna.coach import Coach
 from luna.game import ChessGame as Game
-from luna.NNet import Luna_Network as nn
-from luna.utils import *
 from luna.game.arena import Arena
 from luna.mcts import MCTS
-from luna.game.player import HumanChessPlayer
-import numpy as np
-import chess
+from luna.network import LunaNetwork
+from luna.utils import dotdict
 
 log = logging.getLogger(__name__)
-coloredlogs.install(level='INFO')
+coloredlogs.install(level="INFO")
 
-args = dotdict({
-    'numIters': 1000,
-    'numEps': 100,                # (100)Number of complete self-play games to simulate during a new iteration.
-    'tempThreshold': 10,        #
-    'updateThreshold': 0.6,     # During arena playoff, new neural net will be accepted if threshold or more of games are won.
-    'maxlenOfQueue': 200000,    # Number of game examples to train the neural networks.
-    'numMCTSSims': 100,         # Number of games moves for MCTS to simulate.
-    'arenaCompare': 20,         # Number of games to play during arena play to determine if new net will be accepted.
-    'cpuct': 1,
-    'checkpoint': './temp/',
-    'load_model': False,
-    'load_examples': False,
-    'load_folder_file': ('./pretrained_models/','best.pth.tar'),
-    'numItersForTrainExamplesHistory': 20,
-    'dir_noise': True,
-    'dir_alpha': 1.4,
-    'save_anyway': False        # Always save model, shouldnt be used
-})
+args = dotdict(
+    {
+        "numIters": 1,
+        "numEps": 2,
+        "tempThreshold": 10,
+        "updateThreshold": 0.6,
+        "arenaCompare": 2,
+        "numMCTSSims": 10,
+        "cpuct": 1.25,
+        "dir_noise": False,
+        "dir_alpha": 0.3,
+        "unroll_steps": 3,
+        "td_steps": 5,
+        "discount": 0.997,
+        "batch_size": 8,
+        "train_steps_per_iter": 10,
+        "support_size": 10,
+        "replay_capacity": 10000,
+        "per_alpha": 0.6,
+        "per_beta": 0.4,
+        "checkpoint": "./temp/",
+        "load_model": False,
+        "load_folder_file": ("./pretrained_models/", "best.pth.tar"),
+        "save_anyway": False,
+    }
+)
+
 
 def main() -> int:
-    log.info('Loading %s...', Game.__name__)
+    log.info("Loading %s...", Game.__name__)
     g = Game()
 
-    log.info('Loading %s...', nn.__name__)
-    nnet = nn(g)
+    log.info("Loading %s...", LunaNetwork.__name__)
+    nnet = LunaNetwork(g)
 
-    log.info('Loading checkpoint "%s/"...', args.load_folder_file)
-    nnet.load_checkpoint(args.checkpoint, args.load_folder_file[1])
-
-    log.info('Loading the Coach...')
-    c = Coach(g, nnet, args)
-
-    log.info("Loading 'trainExamples' from file...")
-    c.loadTrainExamples()
+    try:
+        nnet.load_checkpoint(args["checkpoint"], "best.pth.tar")
+        log.info("Loaded checkpoint")
+    except FileNotFoundError:
+        log.warning("No checkpoint found, using untrained network")
 
     nmcts = MCTS(g, nnet, args)
     nmcts2 = MCTS(g, nnet, args)
 
-    def _print(x):
+    def _print(x: object) -> None:
         print(x)
 
-    arena = Arena(lambda x: np.argmax(nmcts.getActionProb(x, temp=0)),
-                  lambda x: np.argmax(nmcts2.getActionProb(x, temp=0)), g, display=_print)
+    arena = Arena(
+        lambda x: int(np.argmax(nmcts.get_action_prob(x, temp=0))),
+        lambda x: int(np.argmax(nmcts2.get_action_prob(x, temp=0))),
+        g,
+        display=_print,
+    )
 
-    arena.playGame(verbose=True)
-
+    arena.play_game(verbose=True)
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

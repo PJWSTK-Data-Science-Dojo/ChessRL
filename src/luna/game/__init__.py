@@ -1,9 +1,14 @@
-"""
-    Chess based logic package
-"""
+"""Chess-based game logic package."""
 
-# All python files for module
-from .luna_game import *
-from .player import *
-from .arena import *
-from .state import LunaState 
+from .arena import Arena
+from .luna_game import ChessGame
+from .player import HumanChessPlayer, RandomPlayer
+from .state import LunaState
+
+__all__ = [
+    "Arena",
+    "ChessGame",
+    "HumanChessPlayer",
+    "LunaState",
+    "RandomPlayer",
+]

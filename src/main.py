@@ -1,77 +1,82 @@
-"""
-    Luna-Chess, a chess engine rated around X
+"""Luna-Chess EfficientZeroV2 training entry point."""
 
-    Project Architecture    
-    Wrapper(either html or anything else) ->
-        Luna ->
-            Luna_Utils ->
-            Luna_State ->
-            Luna_Eval ->
-                Luna_NN ->
-                Luna_dataset ->
+from __future__ import annotations
 
-    by lipeeeee
-"""
-import sys
+import gc
 import logging
+import sys
+
 import coloredlogs
+import torch
+
 from luna.coach import Coach
 from luna.game import ChessGame as Game
-from luna.NNet import Luna_Network as nn
-from luna.utils import *
-import gc
-import torch
+from luna.network import LunaNetwork
+from luna.utils import dotdict
+
 gc.enable()
 
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
 log = logging.getLogger(__name__)
-coloredlogs.install(level='INFO')  # Change this to DEBUG to see more info.
+coloredlogs.install(level="INFO")
 
-args = dotdict({
-    'numIters': 5, #1000,
-    'numEps': 10,                # (100)Number of complete self-play games to simulate during a new iteration.
-    'tempThreshold': 10,        #
-    'updateThreshold': 0.6,     # During arena playoff, new neural net will be accepted if threshold or more of games are won.
-    'maxlenOfQueue': 20000, #200000,    # Number of game examples to train the neural networks.
-    'numMCTSSims': 10, #100,         # Number of games moves for MCTS to simulate.
-    'arenaCompare': 10, #20,         # Number of games to play during arena play to determine if new net will be accepted.
-    'cpuct': 1,
-    'checkpoint': './temp/',
-    'load_model': False,
-    'load_examples': True,     # False recommended, so it doesnt overfit net
-    'load_folder_file': ('./pretrained_models/','best.pth.tar'),
-    'numItersForTrainExamplesHistory': 5, #20,
-    'dir_noise': True,
-    'dir_alpha': 1.4,
-    'save_anyway': True        # Always save model, shouldnt be used
-})
+args = dotdict(
+    {
+        # ---- iteration control ----
+        "numIters": 5,
+        "numEps": 10,
+        "tempThreshold": 10,
+        "updateThreshold": 0.6,
+        "arenaCompare": 10,
+        # ---- MCTS ----
+        "numMCTSSims": 50,
+        "cpuct": 1.25,
+        "dir_noise": True,
+        "dir_alpha": 0.3,
+        # ---- EZV2 training ----
+        "unroll_steps": 5,
+        "td_steps": 10,
+        "discount": 0.997,
+        "batch_size": 64,
+        "train_steps_per_iter": 200,
+        "support_size": 10,
+        # ---- replay ----
+        "replay_capacity": 100_000,
+        "per_alpha": 0.6,
+        "per_beta": 0.4,
+        "reanalyze_ratio": 0.0,
+        # ---- checkpoints ----
+        "checkpoint": "./temp/",
+        "load_model": False,
+        "load_folder_file": ("./pretrained_models/", "best.pth.tar"),
+        "save_anyway": True,
+    }
+)
+
 
 def main() -> int:
-    log.info('Loading %s...', Game.__name__)
-    g = Game()
+    log.info("Loading %s...", Game.__name__)
+    game = Game()
 
-    log.info('Loading %s...', nn.__name__)
-    nnet = nn(g)
+    log.info("Loading %s...", LunaNetwork.__name__)
+    nnet = LunaNetwork(game)
 
     if args.load_model:
         log.info('Loading checkpoint "%s/"...', args.load_folder_file)
         nnet.load_checkpoint(args.load_folder_file[0], args.load_folder_file[1])
     else:
-        log.warning('Not loading a checkpoint!')
+        log.warning("Not loading a checkpoint!")
 
-    log.info('Loading the Coach...')
-    c = Coach(g, nnet, args)
+    log.info("Loading the Coach...")
+    c = Coach(game, nnet, args)
 
-    if args.load_examples:
-        log.info("Loading 'trainExamples' from file...")
-        c.loadTrainExamples()
-
-    log.info('Starting the learning process')
+    log.info("Starting EfficientZeroV2 learning process")
     c.learn()
 
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

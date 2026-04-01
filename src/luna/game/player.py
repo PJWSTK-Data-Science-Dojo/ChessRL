@@ -1,105 +1,78 @@
-"""
-    Chess Players
+"""Chess Players."""
 
-    TODO: Make players Inherit from parent class `Player`
-"""
+from __future__ import annotations
+
+import random
 
 import chess
-import random
 import numpy as np
-from .luna_game import ChessGame, who, from_move, mirror_move
-from stockfish import Stockfish
+
+from .luna_game import ChessGame, mirror_move, move_to_action, player_from_turn
+
 
 def move_from_uci(board: chess.Board, uci: str) -> chess.Move | None:
-    """Checks if valid move"""
     try:
         move = chess.Move.from_uci(uci)
     except ValueError:
-        print('expected an UCI move')
+        print("expected an UCI move")
         return None
     if move not in board.legal_moves:
-        print('expected a valid move')
+        print("expected a valid move")
         return None
     return move
 
-class RandomPlayer(object):
-    """Random player, always plays random moves"""
-    # Environment
-    game: ChessGame
-    
+
+class RandomPlayer:
+    """Always plays random legal moves."""
+
     def __init__(self, game: ChessGame) -> None:
-        super(RandomPlayer, self).__init__()
         self.game = game
 
-    def play(self, board) -> chess.Move:
-        """Play random moves"""
-        valids = self.game.getValidMoves(board, who(board.turn))
+    def play(self, board: chess.Board) -> int:
+        valids = self.game.get_valid_moves(board, player_from_turn(board.turn))
         moves = np.argwhere(valids == 1)
-        return random.choice(moves)[0]
+        return int(random.choice(moves)[0])
 
-class HumanChessPlayer(object):
-    """Human Player"""
 
-    def __init__(self) -> None:
-        super(HumanChessPlayer, self).__init__()
+class HumanChessPlayer:
+    """Interactive human player via stdin."""
 
-    def play(self, board) -> chess.Move:
-        """Ask for Input and return move"""
+    def play(self, board: chess.Board) -> int:
         mboard = board
         if board.turn:
             mboard = board.mirror()
-        
-        print('Valid Moves', end=':')
+
+        print("Valid Moves", end=":")
         for move in mboard.legal_moves:
-            print(move.uci(), end=',')
-        
-        # Input
+            print(move.uci(), end=",")
+
         print()
         human_move = input()
-        
-        # Check Move
+
         move = move_from_uci(mboard, human_move.strip())
         if move is None:
-            print('try again, e.g., %s' % random.choice(list(mboard.legal_moves)).uci())
+            print("try again, e.g., %s" % random.choice(list(mboard.legal_moves)).uci())
             return self.play(board)
-        
+
         if board.turn:
             move = mirror_move(move)
-        return from_move(move)
+        return move_to_action(move)
 
-class StockFishPlayer(object):
-    """Stockfish"""
-    
-    # Actual Engine
-    stockfish: Stockfish
 
-    # Engine Elo
-    elo: int
-    
-    # SkillLevel param (0-20)
-    skill_level: int
+class StockFishPlayer:
+    """Stockfish wrapper (requires `stockfish` package and binary)."""
 
-    # Search Depth
-    depth: int
-
-    # Max think time
-    think_time: int
-
-    def __init__(self, elo=1000, skill_level=10, depth=10, think_time=30):
-        """
-            elo does not matter
-            only skilllevel, depth is the main factor affect winrate
-        """
-        super(StockFishPlayer, self).__init__()
+    def __init__(self, elo: int = 1000, skill_level: int = 10, depth: int = 10, think_time: int = 30) -> None:
+        from stockfish import Stockfish
 
         self.stockfish = Stockfish(parameters={"Threads": 2, "Minimum Thinking Time": think_time})
         self.stockfish.set_elo_rating(elo)
         self.stockfish.set_skill_level(skill_level)
         self.stockfish.set_depth(depth)
 
-    def play(self, board) -> int:
-        """Get move from stockfish given board"""
+    def play(self, board: chess.Board) -> int:
         self.stockfish.set_fen_position(board.fen())
         uci_move = self.stockfish.get_best_move()
         move = move_from_uci(board, uci_move.strip())
-        return from_move(move)
+        assert move is not None
+        return move_to_action(move)

@@ -1,0 +1,63 @@
+[project]
+name = "chessrl"
+version = "0.1.0"
+description = "EfficientZeroV2-based chess engine trained via self-play"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "python-chess",
+    "flask",
+    "coloredlogs",
+    "tqdm",
+    "wandb",
+    "stockfish",
+    "tensorboard",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+    "pytest",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B905",   # zip strict
+    "SIM108", # ternary operator
+    "UP007",  # X | Y union syntax (keep Optional for clarity)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["luna"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+check_untyped_defs = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/luna"]
