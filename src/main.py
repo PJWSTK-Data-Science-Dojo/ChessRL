@@ -2,77 +2,60 @@
 
 from __future__ import annotations
 
-import gc
-import logging
 import sys
 
-import coloredlogs
-import torch
+import tyro
+from loguru import logger
 
 from luna.coach import Coach
+from luna.config import TrainCliConfig
 from luna.game import ChessGame as Game
 from luna.network import LunaNetwork
-from luna.utils import dotdict
-
-gc.enable()
-
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-
-log = logging.getLogger(__name__)
-coloredlogs.install(level="INFO")
-
-args = dotdict(
-    {
-        # ---- iteration control ----
-        "numIters": 5,
-        "numEps": 10,
-        "tempThreshold": 10,
-        "updateThreshold": 0.6,
-        "arenaCompare": 10,
-        # ---- MCTS ----
-        "numMCTSSims": 50,
-        "cpuct": 1.25,
-        "dir_noise": True,
-        "dir_alpha": 0.3,
-        # ---- EZV2 training ----
-        "unroll_steps": 5,
-        "td_steps": 10,
-        "discount": 0.997,
-        "batch_size": 64,
-        "train_steps_per_iter": 200,
-        "support_size": 10,
-        # ---- replay ----
-        "replay_capacity": 100_000,
-        "per_alpha": 0.6,
-        "per_beta": 0.4,
-        "reanalyze_ratio": 0.0,
-        # ---- checkpoints ----
-        "checkpoint": "./temp/",
-        "load_model": False,
-        "load_folder_file": ("./pretrained_models/", "best.pth.tar"),
-        "save_anyway": True,
-    }
-)
 
 
 def main() -> int:
-    log.info("Loading %s...", Game.__name__)
+    cfg = tyro.cli(TrainCliConfig)
+
+    logger.remove()
+    logger.add(sys.stderr, level=cfg.log_level.upper())
+
+    logger.info("Loading {}...", Game.__name__)
     game = Game()
 
-    log.info("Loading %s...", LunaNetwork.__name__)
-    nnet = LunaNetwork(game)
+    learner = cfg.to_learner_config()
+    logger.info("Loading {}...", LunaNetwork.__name__)
+    nnet = LunaNetwork(game, learner)
+    nnet.log_model_summary()
 
-    if args.load_model:
-        log.info('Loading checkpoint "%s/"...', args.load_folder_file)
-        nnet.load_checkpoint(args.load_folder_file[0], args.load_folder_file[1])
+    if cfg.load_model:
+        logger.info(
+            'Loading checkpoint "{}" / "{}"...',
+            cfg.load_checkpoint_dir,
+            cfg.load_checkpoint_file,
+        )
+        nnet.load_checkpoint(cfg.load_checkpoint_dir, cfg.load_checkpoint_file)
     else:
-        log.warning("Not loading a checkpoint!")
+        logger.warning("Not loading a checkpoint!")
 
-    log.info("Loading the Coach...")
-    c = Coach(game, nnet, args)
+    run_cfg = cfg.to_training_run()
+    if run_cfg.profile:
+        logger.info(
+            "Profiling on: phase timings each iter; Kineto on iter {} ({} steps) -> chrome in {} | TensorBoard logdir={}",
+            run_cfg.profile_torch_iter,
+            run_cfg.profile_torch_steps,
+            run_cfg.profile_dir,
+            run_cfg.profile_tensorboard_logdir,
+        )
+        logger.info(
+            "Kineto traces are *.pt.trace.json under your TensorBoard logdir (no scalars). "
+            "Run: uv run tensorboard --logdir <that-dir>  then open the PYTORCH_PROFILER tab "
+            "(needs torch-tb-profiler, listed in pyproject). Or load the same .json in chrome://tracing.",
+        )
 
-    log.info("Starting EfficientZeroV2 learning process")
+    logger.info("Loading the Coach...")
+    c = Coach(game, nnet, run_cfg)
+
+    logger.info("Starting EfficientZeroV2 learning process")
     c.learn()
 
     return 0

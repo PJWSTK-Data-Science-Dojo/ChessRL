@@ -6,18 +6,19 @@ import random
 
 import chess
 import numpy as np
+from loguru import logger
 
-from .luna_game import ChessGame, mirror_move, move_to_action, player_from_turn
+from .chess_game import ChessGame, mirror_move, move_to_action, player_from_turn
 
 
 def move_from_uci(board: chess.Board, uci: str) -> chess.Move | None:
     try:
         move = chess.Move.from_uci(uci)
     except ValueError:
-        print("expected an UCI move")
+        logger.warning("expected an UCI move")
         return None
     if move not in board.legal_moves:
-        print("expected a valid move")
+        logger.warning("expected a valid move")
         return None
     return move
 
@@ -39,22 +40,21 @@ class HumanChessPlayer:
 
     def play(self, board: chess.Board) -> int:
         mboard = board
-        if board.turn:
+        if not board.turn:
             mboard = board.mirror()
 
-        print("Valid Moves", end=":")
-        for move in mboard.legal_moves:
-            print(move.uci(), end=",")
-
-        print()
+        legal_uci = ", ".join(m.uci() for m in mboard.legal_moves)
+        logger.info("Valid moves: {}", legal_uci)
         human_move = input()
 
-        move = move_from_uci(mboard, human_move.strip())
-        if move is None:
-            print("try again, e.g., %s" % random.choice(list(mboard.legal_moves)).uci())
+        parsed = move_from_uci(mboard, human_move.strip())
+        if parsed is None:
+            ex = random.choice(list(mboard.legal_moves)).uci()
+            logger.info("try again, e.g., {}", ex)
             return self.play(board)
 
-        if board.turn:
+        move = parsed
+        if not board.turn:
             move = mirror_move(move)
         return move_to_action(move)
 
@@ -73,6 +73,13 @@ class StockFishPlayer:
     def play(self, board: chess.Board) -> int:
         self.stockfish.set_fen_position(board.fen())
         uci_move = self.stockfish.get_best_move()
+        if uci_move is None:
+            legal = list(board.legal_moves)
+            if not legal:
+                raise RuntimeError("Stockfish returned None and no legal moves exist")
+            logger.warning("Stockfish returned None, falling back to first legal move")
+            return move_to_action(legal[0])
         move = move_from_uci(board, uci_move.strip())
-        assert move is not None
+        if move is None:
+            raise ValueError(f"Stockfish suggested illegal move {uci_move} in position {board.fen()}")
         return move_to_action(move)

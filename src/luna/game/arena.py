@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, Any, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
+from loguru import logger
 from tqdm import tqdm
 
-from .luna_game import ChessGame
+from .chess_game import ChessGame
 
 if TYPE_CHECKING:
     import chess
 
-log = logging.getLogger(__name__)
+_WIN_THRESHOLD = 0.5
+_DRAW_THRESHOLD = 1e-8
 
 
 class Arena:
@@ -32,62 +34,81 @@ class Arena:
         self.player1 = player1
         self.player2 = player2
         self.game = game
-        self.display = display
+        self.display: Callable[[chess.Board], None] | None = display
 
-    def play_game(self, verbose: bool = False) -> float:
-        """Execute one episode. Returns +1 if player1 wins, -1 if player2 wins, else draw value."""
-        players = [self.player2, None, self.player1]
+    def play_game(self, verbose: bool = False, max_ply: int | None = None) -> float:
+        """Execute one episode. Returns +1 if player1 wins, -1 if player2 wins, else small draw value.
+
+        If ``max_ply`` is set and reached without a terminal outcome, returns ``0.0`` (draw).
+        """
+        players = {1: self.player1, -1: self.player2}
         current_player = 1
         board = self.game.get_init_board()
         turn_count = 0
-        while self.game.get_game_ended(board, current_player) == 0:
+        while abs(self.game.get_game_ended(board, current_player)) < _DRAW_THRESHOLD:
+            if max_ply is not None and turn_count >= max_ply:
+                return 0.0
             turn_count += 1
             if verbose:
-                assert self.display
-                print("Turn ", str(turn_count), "Player ", str(current_player))
+                if self.display is None:
+                    raise ValueError("display callback required for verbose mode")
+                logger.info("Turn {} Player {}", turn_count, current_player)
                 self.display(board)
             canonical_board = self.game.get_canonical_form(board, current_player)
-            action = players[current_player + 1](canonical_board)
+            action = players[current_player](canonical_board)
 
             valids = self.game.get_valid_moves(canonical_board, 1)
 
             if valids[action] == 0:
-                log.error("Action %d is not valid!", action)
-                log.debug("valids = %s", valids)
-                assert valids[action] > 0
+                logger.error("Action {} is not valid!", action)
+                logger.debug("valids = {}", valids)
+                raise ValueError(f"Action {action} is not valid")
             board, current_player = self.game.get_next_state(board, current_player, action)
         if verbose:
-            assert self.display
-            print("Game over: Turn ", str(turn_count), "Result ", str(self.game.get_game_ended(board, 1)))
+            if self.display is None:
+                raise ValueError("display callback required for verbose mode")
+            logger.info(
+                "Game over: Turn {} Result {}",
+                turn_count,
+                self.game.get_game_ended(board, 1),
+            )
             self.display(board)
         return current_player * self.game.get_game_ended(board, current_player)
 
+    @staticmethod
+    def _classify_result(result: float) -> int:
+        """Classify game result: +1 for p1 win, -1 for p2 win, 0 for draw."""
+        if result > _WIN_THRESHOLD:
+            return 1
+        if result < -_WIN_THRESHOLD:
+            return -1
+        return 0
+
     def play_games(self, num: int, verbose: bool = False) -> tuple[int, int, int]:
         """Play num games, swapping colors halfway. Returns (p1_wins, p2_wins, draws)."""
-        num = int(num / 2)
+        half = num // 2
         player_one_wins = 0
         player_two_wins = 0
         draws = 0
-        for _ in tqdm(range(num), desc="Arena.play_games (1)"):
-            game_result = self.play_game(verbose=verbose)
-            if game_result == 1:
+        for _ in tqdm(range(half), desc="Arena.play_games (1)"):
+            classification = self._classify_result(self.play_game(verbose=verbose))
+            if classification == 1:
                 player_one_wins += 1
-            elif game_result == -1:
+            elif classification == -1:
                 player_two_wins += 1
             else:
                 draws += 1
 
         self.player1, self.player2 = self.player2, self.player1
 
-        for _ in tqdm(range(num), desc="Arena.play_games (2)"):
-            game_result = self.play_game(verbose=verbose)
-            if game_result == -1:
+        for _ in tqdm(range(num - half), desc="Arena.play_games (2)"):
+            classification = self._classify_result(self.play_game(verbose=verbose))
+            if classification == -1:
                 player_one_wins += 1
-            elif game_result == 1:
+            elif classification == 1:
                 player_two_wins += 1
             else:
                 draws += 1
 
         self.player1, self.player2 = self.player2, self.player1
         return player_one_wins, player_two_wins, draws
-

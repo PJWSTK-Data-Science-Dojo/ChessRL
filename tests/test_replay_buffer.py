@@ -3,24 +3,35 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
-import sys
-import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-
+from luna.game.chess_game import ACTION_SIZE, OBS_PLANES
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 
 
-def _make_trajectory(length: int = 10, action_size: int = 4096) -> Trajectory:
+def _make_trajectory(length: int = 10, action_size: int = ACTION_SIZE) -> Trajectory:
     return Trajectory(
-        observations=[np.random.randn(8 * 8 * 6).astype(np.float32) for _ in range(length)],
+        observations=[np.random.randn(8, 8, OBS_PLANES).astype(np.float32) for _ in range(length)],
         actions=[np.random.randint(0, action_size) for _ in range(length)],
         rewards=[(-1.0) ** i * 0.5 for i in range(length)],
         root_policies=[np.random.dirichlet(np.ones(action_size)).astype(np.float32) for _ in range(length)],
         root_values=[np.random.uniform(-1, 1) for _ in range(length)],
         valids=[np.random.randint(0, 2, size=action_size).astype(np.float32) for _ in range(length)],
     )
+
+
+class TestTrajectoryContiguous:
+    def test_arrays_are_contiguous(self) -> None:
+        traj = _make_trajectory(length=5)
+        assert traj.observations.flags["C_CONTIGUOUS"]
+        assert traj.actions.dtype == np.int64
+        assert traj.rewards.dtype == np.float32
+        assert traj.root_policies.flags["C_CONTIGUOUS"]
+        assert traj.game_length == 5
+
+    def test_indexing_works(self) -> None:
+        traj = _make_trajectory(length=8)
+        assert traj.observations[3].shape == (8, 8, OBS_PLANES)
+        assert traj.root_policies[0].shape == (ACTION_SIZE,)
 
 
 class TestPrioritizedReplayBuffer:

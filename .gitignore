@@ -5,6 +5,7 @@ processed/
 processed/*
 runs/*
 temp/*
+profiles/
 
 # should we import content(stockfish)?
 content/

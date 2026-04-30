@@ -1,30 +1,23 @@
 """
-    Util Classes/functions for luna
+Util Classes/functions for luna
 """
 
-class AverageMeter(object):
+
+class AverageMeter:
     """From https://github.com/pytorch/examples/blob/master/imagenet/main.py"""
 
-    def __init__(self):
-        super(AverageMeter, self).__init__()
-
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
+    def __init__(self) -> None:
+        self.val = 0.0
+        self.avg = 0.0
+        self.sum = 0.0
         self.count = 0
 
-    def __repr__(self):
-        return f'{self.avg:.2e}'
+    def __repr__(self) -> str:
+        return f"{self.avg:.2e}"
 
-    def update(self, val, n=1):
+    def update(self, val: float, n: int = 1) -> None:
         self.val = val
         self.sum += val * n
         self.count += n
-        self.avg = self.sum / self.count
-
-class dotdict(dict):
-    """DotDict implementation"""
-
-    def __getattr__(self, name):
-        """Make so we can acess values by using dict.key"""
-        return self[name]
+        if self.count > 0:
+            self.avg = self.sum / self.count

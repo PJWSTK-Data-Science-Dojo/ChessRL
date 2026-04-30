@@ -1,18 +1,20 @@
 [project]
 name = "chessrl"
-version = "0.1.0"
+version = "0.2.0"
 description = "EfficientZeroV2-based chess engine trained via self-play"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "numpy",
-    "torch",
+    "torch>=2.4,<2.6",
     "python-chess",
     "flask",
-    "coloredlogs",
+    "loguru",
+    "tyro",
     "tqdm",
     "wandb",
     "stockfish",
     "tensorboard",
+    "torch-tb-profiler>=0.4.3",
 ]
 
 [project.optional-dependencies]
@@ -21,9 +23,12 @@ dev = [
     "mypy",
     "pytest",
 ]
+perf = [
+    "numba",
+]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 line-length = 120
 src = ["src"]
 
@@ -48,8 +53,14 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = ["luna"]
 
+[tool.ruff.lint.per-file-ignores]
+"src/luna/__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import logging
-
 import chess
 import numpy as np
+from loguru import logger
 
-from .game.luna_game import ChessGame, player_from_turn
+from .config import MCTSParams
+from .game.chess_game import ChessGame, player_from_turn
 from .game.state import LunaState
 from .mcts import MCTS
 from .network import LunaNetwork
-from .utils import dotdict
-
-log = logging.getLogger(__name__)
 
 
 class Luna:
@@ -24,31 +21,23 @@ class Luna:
         self.game = ChessGame()
         self.luna_eval = LunaNetwork(self.game)
 
-        self.args = dotdict(
-            {
-                "numMCTSSims": 100,
-                "cpuct": 1.25,
-                "dir_noise": False,
-                "dir_alpha": 0.3,
-            }
-        )
+        self.mcts_params = MCTSParams(num_mcts_sims=100, cpuct=1.25, dir_noise=False, dir_alpha=0.3)
 
         try:
             self.luna_eval.load_checkpoint("./temp/", "best.pth.tar")
             if self.verbose:
-                log.info("Loaded pre-trained model")
-        except Exception:
+                logger.info("Loaded pre-trained model")
+        except (FileNotFoundError, RuntimeError, KeyError) as exc:
             if self.verbose:
-                log.warning("Failed to load model, using untrained network")
+                logger.warning("Failed to load model ({}), using untrained network", exc)
 
-        self.mcts = MCTS(self.game, self.luna_eval, self.args)
+        self.mcts = MCTS(self.game, self.luna_eval, self.mcts_params)
         self.board = chess.Board()
-        self.board_state = LunaState()
 
-    def computer_move(self, state: LunaState, model: LunaNetwork | None = None) -> int:
+    def computer_move(self, state: LunaState) -> int:
         """Have Luna make a move on *state.board*."""
         if self.verbose:
-            log.info("Luna thinking about position %s", state.board.fen())
+            logger.info("Luna thinking about position {}", state.board.fen())
 
         current_player = player_from_turn(state.board.turn)
         canonical_board = self.game.get_canonical_form(state.board, current_player)
@@ -61,7 +50,7 @@ class Luna:
         self.board = next_board
 
         if self.verbose:
-            log.info("Luna played %s", state.board.peek())
+            logger.info("Luna played {}", state.board.peek())
 
         return action
 
