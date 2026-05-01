@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Luna Chess - Self-Play Mode</title>
+    <link rel="stylesheet" href="/static/chessboard.min.css">
+    <script src="/static/jquery.min.js"></script>
+    <script src="/static/chessboard.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 30px;
+            text-align: center;
+        }
+
+        header h1 {
+            font-size: 28px;
+            font-weight: 600;
+        }
+
+        .content {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 30px;
+            padding: 30px;
+        }
+
+        #board-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+        }
+
+        #board {
+            width: 500px;
+            height: 500px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            border-radius: 4px;
+        }
+
+        #game-status {
+            font-size: 18px;
+            font-weight: 600;
+            color: #667eea;
+            padding: 15px 25px;
+            background: #f7f9fc;
+            border-radius: 6px;
+            width: 100%;
+            text-align: center;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            cursor: pointer;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn:hover:not(:disabled) {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            background: #c82333;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: #5a6268;
+        }
+
+        .sidebar {
+            background: #f7f9fc;
+            border-radius: 8px;
+            padding: 20px;
+            max-height: 700px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .sidebar h3 {
+            margin-bottom: 15px;
+            color: #667eea;
+            font-size: 18px;
+        }
+
+        #move-history {
+            flex: 1;
+            overflow-y: auto;
+            background: white;
+            border-radius: 6px;
+            padding: 10px;
+            min-height: 300px;
+        }
+
+        .move-pair {
+            display: grid;
+            grid-template-columns: 40px 1fr 1fr;
+            gap: 10px;
+            padding: 8px;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .move-pair:nth-child(odd) {
+            background: #f8f9fa;
+        }
+
+        .move-number {
+            font-weight: 600;
+            color: #667eea;
+        }
+
+        .move {
+            padding: 4px 8px;
+            border-radius: 4px;
+            background: white;
+        }
+
+        .stats {
+            margin-top: 15px;
+            padding: 15px;
+            background: white;
+            border-radius: 6px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .stat-row:last-child {
+            border-bottom: none;
+        }
+
+        .stat-label {
+            font-weight: 600;
+            color: #666;
+        }
+
+        .stat-value {
+            color: #333;
+            font-weight: 500;
+        }
+
+        .speed-control {
+            margin-top: 15px;
+            padding: 15px;
+            background: white;
+            border-radius: 6px;
+        }
+
+        .speed-control label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #666;
+        }
+
+        .speed-control input[type="range"] {
+            width: 100%;
+        }
+
+        .speed-display {
+            text-align: center;
+            margin-top: 5px;
+            color: #667eea;
+            font-weight: 500;
+        }
+
+        .back-link {
+            margin-top: 20px;
+            text-align: center;
+        }
+
+        .back-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .back-link a:hover {
+            text-decoration: underline;
+        }
+
+        @media (max-width: 900px) {
+            .content {
+                grid-template-columns: 1fr;
+            }
+
+            #board {
+                width: 90vw;
+                max-width: 500px;
+                height: auto;
+            }
+        }
+
+        /* Custom scrollbar */
+        #move-history::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        #move-history::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 4px;
+        }
+
+        #move-history::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🌙 Luna Chess - Self-Play Mode</h1>
+            <p>Watch Luna play against itself</p>
+        </header>
+
+        <div class="content">
+            <div id="board-container">
+                <div id="board"></div>
+                <div id="game-status">Ready to start</div>
+                <div class="controls">
+                    <button id="start-btn" class="btn">▶️ Start</button>
+                    <button id="pause-btn" class="btn btn-secondary" disabled>⏸️ Pause</button>
+                    <button id="stop-btn" class="btn btn-danger" disabled>⏹️ Stop</button>
+                    <button id="reset-btn" class="btn btn-secondary">🔄 Reset</button>
+                </div>
+                <div class="back-link">
+                    <a href="/">← Back to Main Game</a>
+                </div>
+            </div>
+
+            <div class="sidebar">
+                <h3>📜 Move History</h3>
+                <div id="move-history">
+                    <div style="text-align: center; color: #999; padding: 20px;">
+                        No moves yet
+                    </div>
+                </div>
+
+                <div class="stats">
+                    <div class="stat-row">
+                        <span class="stat-label">Total Moves:</span>
+                        <span class="stat-value" id="moveCount">0</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Avg Think Time:</span>
+                        <span class="stat-value" id="avgThinkTime">-</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Game Duration:</span>
+                        <span class="stat-value" id="gameDuration">0s</span>
+                    </div>
+                </div>
+
+                <div class="speed-control">
+                    <label for="speedSlider">Playback Speed</label>
+                    <input type="range" id="speedSlider" min="100" max="3000" value="1000" step="100">
+                    <div class="speed-display" id="speedDisplay">1.0s per move</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let board = null;
+        let isPlaying = false;
+        let isPaused = false;
+        let moveDelay = 1000;
+        let moveTimer = null;
+        let moveCount = 0;
+        let moveHistory = [];
+        let thinkTimes = [];
+        let gameStartTime = null;
+        let gameDurationInterval = null;
+
+        $(document).ready(function() {
+            initBoard();
+            setupEventListeners();
+        });
+
+        function initBoard() {
+            const config = {
+                position: 'start',
+                draggable: false,
+                pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png'
+            };
+            board = ChessBoard('board', config);
+            updateStatus('Ready to start self-play');
+        }
+
+        function setupEventListeners() {
+            $('#start-btn').on('click', startSelfPlay);
+            $('#pause-btn').on('click', togglePause);
+            $('#stop-btn').on('click', stopSelfPlay);
+            $('#reset-btn').on('click', resetBoard);
+
+            $('#speedSlider').on('input', function() {
+                moveDelay = parseInt($(this).val());
+                $('#speedDisplay').text((moveDelay / 1000).toFixed(1) + 's per move');
+            });
+
+            // Keyboard shortcuts
+            $(document).keydown(function(e) {
+                switch(e.key) {
+                    case ' ':
+                        e.preventDefault();
+                        if (isPlaying && !isPaused) {
+                            togglePause();
+                        } else if (!isPlaying) {
+                            startSelfPlay();
+                        } else {
+                            togglePause();
+                        }
+                        break;
+                    case 'r':
+                    case 'R':
+                        e.preventDefault();
+                        resetBoard();
+                        break;
+                }
+            });
+        }
+
+        function updateStatus(message) {
+            $('#game-status').text(message);
+        }
+
+        function startSelfPlay() {
+            isPlaying = true;
+            isPaused = false;
+            moveCount = 0;
+            moveHistory = [];
+            thinkTimes = [];
+            gameStartTime = Date.now();
+
+            $('#start-btn').prop('disabled', true);
+            $('#pause-btn').prop('disabled', false);
+            $('#stop-btn').prop('disabled', false);
+            $('#move-history').html('');
+
+            updateStatus('Self-play in progress...');
+            startGameDurationTimer();
+            requestNextMove();
+        }
+
+        function togglePause() {
+            isPaused = !isPaused;
+
+            if (isPaused) {
+                $('#pause-btn').text('▶️ Resume');
+                updateStatus('Paused');
+                if (moveTimer) {
+                    clearTimeout(moveTimer);
+                    moveTimer = null;
+                }
+            } else {
+                $('#pause-btn').text('⏸️ Pause');
+                updateStatus('Self-play in progress...');
+                requestNextMove();
+            }
+        }
+
+        function stopSelfPlay() {
+            isPlaying = false;
+            isPaused = false;
+            if (moveTimer) {
+                clearTimeout(moveTimer);
+                moveTimer = null;
+            }
+            stopGameDurationTimer();
+
+            $('#start-btn').prop('disabled', false);
+            $('#pause-btn').prop('disabled', true).text('⏸️ Pause');
+            $('#stop-btn').prop('disabled', true);
+
+            updateStatus('Self-play stopped');
+        }
+
+        function resetBoard() {
+            stopSelfPlay();
+            board.position('start');
+            moveCount = 0;
+            moveHistory = [];
+            thinkTimes = [];
+
+            $('#move-history').html('<div style="text-align: center; color: #999; padding: 20px;">No moves yet</div>');
+            updateStats();
+            updateStatus('Board reset');
+
+            $.ajax({
+                url: '/reset',
+                type: 'POST',
+                data: { full_reset: 'true' }
+            });
+        }
+
+        function requestNextMove() {
+            if (!isPlaying || isPaused) return;
+
+            const startTime = Date.now();
+
+            $.ajax({
+                url: '/next_selfplay_move',
+                type: 'POST',
+                success: function(data) {
+                    const thinkTime = Date.now() - startTime;
+                    thinkTimes.push(thinkTime);
+
+                    if (data.status === 'gameover' || data.is_game_over) {
+                        board.position(data.fen);
+                        updateStatus(data.message || 'Game Over!');
+                        stopSelfPlay();
+                        return;
+                    }
+
+                    if (data.status === 'success') {
+                        board.position(data.fen);
+                        addMoveToHistory(data.move);
+                        updateStats();
+                        moveTimer = setTimeout(requestNextMove, moveDelay);
+                    } else {
+                        updateStatus('Error: ' + (data.message || 'Unknown error'));
+                        stopSelfPlay();
+                    }
+                },
+                error: function(xhr, status, error) {
+                    updateStatus('Server error: ' + error);
+                    stopSelfPlay();
+                }
+            });
+        }
+
+        function addMoveToHistory(move) {
+            moveCount++;
+            const moveNum = Math.ceil(moveCount / 2);
+            const color = moveCount % 2 === 1 ? 'white' : 'black';
+
+            if (color === 'white') {
+                moveHistory.push({ number: moveNum, white: move, black: '' });
+            } else {
+                moveHistory[moveHistory.length - 1].black = move;
+            }
+
+            renderMoveHistory();
+        }
+
+        function renderMoveHistory() {
+            const html = moveHistory.map(pair => `
+                <div class="move-pair">
+                    <span class="move-number">${pair.number}.</span>
+                    <span class="move">${pair.white}</span>
+                    <span class="move">${pair.black || ''}</span>
+                </div>
+            `).join('');
+
+            $('#move-history').html(html || '<div style="text-align: center; color: #999; padding: 20px;">No moves yet</div>');
+
+            const historyEl = document.getElementById('move-history');
+            historyEl.scrollTop = historyEl.scrollHeight;
+        }
+
+        function updateStats() {
+            $('#moveCount').text(moveCount);
+
+            if (thinkTimes.length > 0) {
+                const avgTime = thinkTimes.reduce((a, b) => a + b, 0) / thinkTimes.length;
+                $('#avgThinkTime').text((avgTime / 1000).toFixed(2) + 's');
+            } else {
+                $('#avgThinkTime').text('-');
+            }
+        }
+
+        function startGameDurationTimer() {
+            gameDurationInterval = setInterval(() => {
+                if (gameStartTime && isPlaying && !isPaused) {
+                    const duration = Math.floor((Date.now() - gameStartTime) / 1000);
+                    $('#gameDuration').text(formatDuration(duration));
+                }
+            }, 1000);
+        }
+
+        function stopGameDurationTimer() {
+            if (gameDurationInterval) {
+                clearInterval(gameDurationInterval);
+                gameDurationInterval = null;
+            }
+        }
+
+        function formatDuration(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = seconds % 60;
+            return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+        }
+    </script>
+</body>
+</html>

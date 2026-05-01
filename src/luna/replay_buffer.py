@@ -4,8 +4,6 @@ Trajectories are stored as contiguous numpy arrays for cache-friendly access
 and zero-copy slicing during training.
 """
 
-from __future__ import annotations
-
 import numpy as np
 
 
@@ -81,7 +79,7 @@ class _SumTree:
 class PrioritizedReplayBuffer:
     """Stores full game trajectories with per-position priority."""
 
-    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, beta_increment: float = 1e-4) -> None:
+    def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, beta_increment: float = 6e-6) -> None:
         self.capacity = capacity
         self.alpha = alpha
         self.beta = beta

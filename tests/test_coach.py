@@ -1,26 +1,19 @@
 """Tests for Coach self-play (e.g. max ply truncation, batched self-play)."""
 
-from __future__ import annotations
-
 import numpy as np
 
 from luna.coach import Coach
-from luna.config import EzV2LearnerConfig, TrainingRunConfig
+from luna.config import TrainingRunConfig
 from luna.game.arena import Arena
-from luna.game.chess_game import DRAW_VALUE, ChessGame
+from luna.game.chess_game import DRAW_VALUE
 from luna.network import LunaNetwork
 
 
-def _small_learner() -> EzV2LearnerConfig:
-    return EzV2LearnerConfig(num_channels=32, repr_blocks=2, dyn_blocks=1, proj_dim=64)
-
-
 class TestMaxPlyTruncation:
-    def test_execute_episode_stops_at_max_ply_with_draw_reward(self, monkeypatch) -> None:
-        game = ChessGame()
-        monkeypatch.setattr(game, "get_game_ended", lambda board, player: 0.0)
+    def test_execute_episode_stops_at_max_ply_with_draw_reward(self, chess_game, small_learner_config, monkeypatch):
+        monkeypatch.setattr(chess_game, "get_game_ended", lambda board, player: 0.0)
 
-        nnet = LunaNetwork(game, _small_learner())
+        nnet = LunaNetwork(chess_game, small_learner_config)
         run = TrainingRunConfig(
             num_mcts_sims=2,
             max_ply=5,
@@ -28,7 +21,7 @@ class TestMaxPlyTruncation:
             temp_threshold=1,
             recurrent_policy_topk=None,
         )
-        coach = Coach(game, nnet, run)
+        coach = Coach(chess_game, nnet, run)
         traj = coach.execute_episode()
 
         assert len(traj.actions) == 5
@@ -38,9 +31,8 @@ class TestMaxPlyTruncation:
 
 
 class TestBatchedSelfPlay:
-    def test_execute_episodes_batched_returns_trajectories(self) -> None:
-        game = ChessGame()
-        nnet = LunaNetwork(game, _small_learner())
+    def test_execute_episodes_batched_returns_trajectories(self, chess_game, small_learner_config):
+        nnet = LunaNetwork(chess_game, small_learner_config)
         run = TrainingRunConfig(
             num_mcts_sims=2,
             max_ply=5,
@@ -49,7 +41,7 @@ class TestBatchedSelfPlay:
             parallel_games=2,
             recurrent_policy_topk=None,
         )
-        coach = Coach(game, nnet, run)
+        coach = Coach(chess_game, nnet, run)
         trajs = coach.execute_episodes_batched(num_episodes=3)
 
         assert len(trajs) == 3
@@ -60,16 +52,15 @@ class TestBatchedSelfPlay:
 
 
 class TestArenaBatched:
-    def test_play_arena_games_batched_returns_expected_count(self) -> None:
-        game = ChessGame()
-        nnet = LunaNetwork(game, _small_learner())
+    def test_play_arena_games_batched_returns_expected_count(self, chess_game, small_learner_config):
+        nnet = LunaNetwork(chess_game, small_learner_config)
         run = TrainingRunConfig(
             num_mcts_sims=2,
             max_ply=6,
             dir_noise=False,
             arena_num_mcts_sims=2,
         )
-        coach = Coach(game, nnet, run)
+        coach = Coach(chess_game, nnet, run)
         params = Coach._arena_mcts_params(run)
         assert params.num_mcts_sims == 2
         assert params.dir_noise is False
@@ -80,13 +71,11 @@ class TestArenaBatched:
 
 
 class TestArenaMaxPly:
-    def test_play_game_returns_draw_when_max_ply_reached(self) -> None:
-        game = ChessGame()
-
+    def test_play_game_returns_draw_when_max_ply_reached(self, chess_game):
         def pick_first(canonical_board):
-            valids = game.get_valid_moves(canonical_board, 1)
+            valids = chess_game.get_valid_moves(canonical_board, 1)
             return int(np.argmax(valids))
 
-        arena = Arena(pick_first, pick_first, game)
+        arena = Arena(pick_first, pick_first, chess_game)
         result = arena.play_game(verbose=False, max_ply=3)
         assert result == 0.0

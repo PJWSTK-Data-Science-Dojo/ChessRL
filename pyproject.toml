@@ -2,18 +2,18 @@
 name = "chessrl"
 version = "0.2.0"
 description = "EfficientZeroV2-based chess engine trained via self-play"
-requires-python = ">=3.12"
+requires-python = ">=3.11,<3.13"
 dependencies = [
-    "numpy",
-    "torch>=2.4,<2.6",
-    "python-chess",
-    "flask",
-    "loguru",
-    "tyro",
-    "tqdm",
-    "wandb",
-    "stockfish",
-    "tensorboard",
+    "numpy>=1.24,<3.0",
+    "torch>=2.0,<2.6",
+    "python-chess>=1.9.0",
+    "flask>=3.0.0",
+    "loguru>=0.7.0",
+    "tyro>=0.8.0",
+    "tqdm>=4.66.0",
+    "wandb>=0.16.0",
+    "stockfish>=3.28.0",
+    "tensorboard>=2.14.0",
     "torch-tb-profiler>=0.4.3",
 ]
 

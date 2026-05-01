@@ -1,7 +1,5 @@
 """Luna-Chess EfficientZeroV2 training entry point."""
 
-from __future__ import annotations
-
 import sys
 
 import tyro
@@ -53,7 +51,7 @@ def main() -> int:
         )
 
     logger.info("Loading the Coach...")
-    c = Coach(game, nnet, run_cfg)
+    c = Coach(game, nnet, run_cfg, wandb_project=cfg.wandb_project)
 
     logger.info("Starting EfficientZeroV2 learning process")
     c.learn()

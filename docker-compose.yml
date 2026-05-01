@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  luna-chess-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: luna-chess-web
+    ports:
+      - "5000:5000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=5000
+      - DEVICE=cpu  # Change to 'cuda' if GPU available
+      - MCTS_SIMS=50
+      - CHECKPOINT_DIR=/app/temp/
+      - CHECKPOINT_FILE=best.pth.tar
+      - VERBOSE=true
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./temp:/app/temp:ro  # Mount checkpoint directory (read-only)
+      - ./src/static:/app/src/static:ro  # Mount static files
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/model_info"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]

@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Luna Chess - Play Against AI</title>
+    <link rel="stylesheet" href="/static/chessboard.min.css">
+    <script src="/static/jquery.min.js"></script>
+    <script src="/static/chessboard.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        header h1 {
+            font-size: 28px;
+            font-weight: 600;
+        }
+
+        .header-info {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        #gameOptions {
+            text-align: center;
+            padding: 60px 20px;
+        }
+
+        #gameOptions h2 {
+            margin-bottom: 30px;
+            color: #333;
+            font-size: 24px;
+        }
+
+        .game-layout {
+            display: none;
+            grid-template-columns: 300px 1fr 300px;
+            gap: 20px;
+            padding: 30px;
+        }
+
+        .sidebar {
+            background: #f7f9fc;
+            border-radius: 8px;
+            padding: 20px;
+        }
+
+        .sidebar h3 {
+            margin-bottom: 15px;
+            color: #667eea;
+            font-size: 18px;
+        }
+
+        #board-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
+        }
+
+        #board {
+            width: 500px;
+            height: 500px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            border-radius: 4px;
+        }
+
+        #status {
+            font-size: 18px;
+            font-weight: 600;
+            color: #667eea;
+            min-height: 30px;
+            padding: 10px 20px;
+            background: #f7f9fc;
+            border-radius: 6px;
+            width: 100%;
+            text-align: center;
+        }
+
+        .thinking-indicator {
+            display: none;
+            align-items: center;
+            gap: 10px;
+            color: #764ba2;
+        }
+
+        .thinking-indicator.active {
+            display: flex;
+        }
+
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #764ba2;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .btn {
+            padding: 12px 24px;
+            margin: 8px;
+            cursor: pointer;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn:hover:not(:disabled) {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            box-shadow: 0 2px 8px rgba(108, 117, 125, 0.3);
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: #5a6268;
+        }
+
+        .btn-success {
+            background: #28a745;
+            box-shadow: 0 2px 8px rgba(40, 167, 69, 0.3);
+        }
+
+        .btn-success:hover:not(:disabled) {
+            background: #218838;
+        }
+
+        .btn-large {
+            padding: 16px 32px;
+            font-size: 18px;
+        }
+
+        #moveHistory {
+            max-height: 400px;
+            overflow-y: auto;
+            background: white;
+            border-radius: 6px;
+            padding: 10px;
+        }
+
+        .move-pair {
+            display: grid;
+            grid-template-columns: 40px 1fr 1fr;
+            gap: 10px;
+            padding: 8px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+
+        .move-pair:hover {
+            background: #f0f0f0;
+        }
+
+        .move-number {
+            font-weight: 600;
+            color: #667eea;
+        }
+
+        .move {
+            padding: 4px 8px;
+            border-radius: 4px;
+            background: #f7f9fc;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .move:hover {
+            background: #e9ecef;
+        }
+
+        .move.current {
+            background: #667eea;
+            color: white;
+        }
+
+        #controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            justify-content: center;
+        }
+
+        .game-info {
+            background: white;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .info-row:last-child {
+            border-bottom: none;
+        }
+
+        .info-label {
+            font-weight: 600;
+            color: #666;
+        }
+
+        .info-value {
+            color: #333;
+        }
+
+        .evaluation-bar {
+            width: 100%;
+            height: 20px;
+            background: #333;
+            border-radius: 10px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .evaluation-fill {
+            height: 100%;
+            background: white;
+            transition: width 0.5s ease;
+            width: 50%;
+        }
+
+        .evaluation-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 12px;
+            font-weight: 600;
+            color: #667eea;
+            mix-blend-mode: difference;
+        }
+
+        .keyboard-hints {
+            font-size: 12px;
+            color: #666;
+            margin-top: 15px;
+            padding: 10px;
+            background: white;
+            border-radius: 6px;
+        }
+
+        .keyboard-hints kbd {
+            background: #f7f9fc;
+            padding: 2px 6px;
+            border-radius: 3px;
+            border: 1px solid #ddd;
+            font-family: monospace;
+        }
+
+        .game-over-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .game-over-overlay.active {
+            display: flex;
+        }
+
+        .game-over-modal {
+            background: white;
+            padding: 40px;
+            border-radius: 12px;
+            text-align: center;
+            max-width: 400px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+
+        .game-over-modal h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 28px;
+        }
+
+        .game-over-modal p {
+            margin-bottom: 30px;
+            font-size: 18px;
+            color: #666;
+        }
+
+        @media (max-width: 1200px) {
+            .game-layout {
+                grid-template-columns: 1fr;
+            }
+
+            .sidebar {
+                order: 2;
+            }
+
+            #board-container {
+                order: 1;
+            }
+
+            #board {
+                width: 90vw;
+                max-width: 500px;
+                height: auto;
+            }
+        }
+
+        /* Custom scrollbar */
+        #moveHistory::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        #moveHistory::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 4px;
+        }
+
+        #moveHistory::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 4px;
+        }
+
+        #moveHistory::-webkit-scrollbar-thumb:hover {
+            background: #5568d3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>🌙 Luna Chess</h1>
+                <div class="header-info">Play against EfficientZeroV2 AI</div>
+            </div>
+            <div class="header-info" id="modelInfo">Loading model...</div>
+        </header>
+
+        <div id="gameOptions">
+            <h2>Choose Your Color</h2>
+            <button id="playAsWhiteBtn" class="btn btn-large">⚪ Play as White</button>
+            <button id="playAsBlackBtn" class="btn btn-large">⚫ Play as Black</button>
+            <a href="/selfplay"><button class="btn btn-large btn-secondary">👁️ Watch Self-Play</button></a>
+        </div>
+
+        <div class="game-layout" id="gameLayout">
+            <div class="sidebar">
+                <h3>📊 Game Info</h3>
+                <div class="game-info">
+                    <div class="info-row">
+                        <span class="info-label">You play:</span>
+                        <span class="info-value" id="playerColor">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Move:</span>
+                        <span class="info-value" id="moveCount">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Last think time:</span>
+                        <span class="info-value" id="thinkTime">-</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Luna's move:</span>
+                        <span class="info-value" id="lastMove">-</span>
+                    </div>
+                </div>
+
+                <div class="keyboard-hints">
+                    <strong>Keyboard Shortcuts:</strong><br>
+                    <kbd>U</kbd> Undo move<br>
+                    <kbd>H</kbd> Get hint<br>
+                    <kbd>N</kbd> New game<br>
+                    <kbd>F</kbd> Flip board
+                </div>
+            </div>
+
+            <div id="board-container">
+                <div id="board"></div>
+                <div id="status">
+                    <span id="statusText">Your turn</span>
+                    <div class="thinking-indicator" id="thinkingIndicator">
+                        <div class="spinner"></div>
+                        <span>Luna is thinking...</span>
+                    </div>
+                </div>
+                <div id="controls">
+                    <button id="undoBtn" class="btn btn-secondary">↶ Undo Move</button>
+                    <button id="hintBtn" class="btn btn-success">💡 Get Hint</button>
+                    <button id="flipBtn" class="btn btn-secondary">🔄 Flip Board</button>
+                    <button id="newGameBtn" class="btn">🎮 New Game</button>
+                    <button id="backBtn" class="btn btn-secondary">← Back</button>
+                </div>
+            </div>
+
+            <div class="sidebar">
+                <h3>📜 Move History</h3>
+                <div id="moveHistory">
+                    <div style="text-align: center; color: #999; padding: 20px;">
+                        No moves yet
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="game-over-overlay" id="gameOverOverlay">
+        <div class="game-over-modal">
+            <h2 id="gameOverTitle">Game Over!</h2>
+            <p id="gameOverMessage"></p>
+            <button class="btn btn-large" onclick="closeGameOverModal()">Close</button>
+            <button class="btn btn-large btn-success" onclick="startNewGame()">New Game</button>
+        </div>
+    </div>
+
+    <script>
+        // ===== Global State =====
+        let board = null;
+        let currentOrientation = 'white';
+        let gameActive = false;
+        let moveHistoryData = [];
+        let thinkStartTime = null;
+        let isProcessing = false;
+
+        // ===== Initialization =====
+        $(document).ready(function() {
+            setupEventListeners();
+            setupKeyboardShortcuts();
+            loadModelInfo();
+        });
+
+        function setupEventListeners() {
+            $('#playAsWhiteBtn').on('click', () => startGame('white'));
+            $('#playAsBlackBtn').on('click', () => startGame('black'));
+            $('#newGameBtn').on('click', showNewGameConfirmation);
+            $('#backBtn').on('click', backToSelection);
+            $('#undoBtn').on('click', undoMove);
+            $('#hintBtn').on('click', getHint);
+            $('#flipBtn').on('click', flipBoard);
+        }
+
+        function setupKeyboardShortcuts() {
+            $(document).keydown(function(e) {
+                if (!gameActive) return;
+
+                switch(e.key.toLowerCase()) {
+                    case 'u':
+                        e.preventDefault();
+                        undoMove();
+                        break;
+                    case 'h':
+                        e.preventDefault();
+                        getHint();
+                        break;
+                    case 'n':
+                        e.preventDefault();
+                        showNewGameConfirmation();
+                        break;
+                    case 'f':
+                        e.preventDefault();
+                        flipBoard();
+                        break;
+                }
+            });
+        }
+
+        function loadModelInfo() {
+            // Could be extended to fetch actual model info from server
+            $('#modelInfo').text('Model: EZV2 Chess');
+        }
+
+        // ===== Game Control =====
+        function startGame(color) {
+            currentOrientation = color;
+            gameActive = true;
+            moveHistoryData = [];
+
+            const config = {
+                draggable: true,
+                position: 'start',
+                orientation: color,
+                onDragStart: onDragStart,
+                onDrop: onDrop,
+                onSnapEnd: onSnapEnd,
+                pieceTheme: '/static/img/chesspieces/wikipedia/{piece}.png'
+            };
+
+            board = ChessBoard('board', config);
+
+            fetch('/reset', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `color=${color}`
+            })
+            .then(response => response.json())
+            .then(data => {
+                board.position(data.fen);
+                $('#gameOptions').hide();
+                $('#gameLayout').css('display', 'grid');
+                $('#playerColor').text(color.charAt(0).toUpperCase() + color.slice(1));
+                updateMoveCount();
+
+                if (color === 'white') {
+                    updateStatus('Your turn (White)');
+                } else {
+                    updateStatus('Your turn (Black)');
+                }
+            });
+        }
+
+        function showNewGameConfirmation() {
+            if (confirm('Start a new game? Current game will be lost.')) {
+                backToSelection();
+            }
+        }
+
+        function startNewGame() {
+            closeGameOverModal();
+            backToSelection();
+        }
+
+        function backToSelection() {
+            gameActive = false;
+            $('#gameLayout').hide();
+            $('#gameOptions').show();
+            if (board) {
+                board.destroy();
+                board = null;
+            }
+        }
+
+        // ===== Board Events =====
+        function onDragStart(source, piece) {
+            if (isProcessing) return false;
+
+            // Only allow the current player to move their pieces
+            if ((currentOrientation === 'white' && piece.search(/^b/) !== -1) ||
+                (currentOrientation === 'black' && piece.search(/^w/) !== -1)) {
+                return false;
+            }
+
+            // Don't allow moves if game is over
+            if (!gameActive) return false;
+        }
+
+        function onDrop(source, target) {
+            if (source === target) return 'snapback';
+
+            isProcessing = true;
+            showThinking(true);
+            thinkStartTime = Date.now();
+
+            // Check for promotion
+            let moveUci = source + target;
+
+            fetch('/move', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `move=${moveUci}`
+            })
+            .then(response => response.json())
+            .then(data => {
+                isProcessing = false;
+                showThinking(false);
+
+                if (data.status === 'error') {
+                    updateStatus('Invalid move: ' + data.message, 'error');
+                    return 'snapback';
+                } else if (data.status === 'gameover') {
+                    board.position(data.fen);
+                    handleGameOver(data);
+                } else {
+                    // Success - Luna responded
+                    board.position(data.fen);
+                    const thinkTime = Date.now() - thinkStartTime;
+                    $('#thinkTime').text((thinkTime / 1000).toFixed(1) + 's');
+                    $('#lastMove').text(data.move);
+
+                    addMoveToHistory(moveUci, data.move);
+                    updateMoveCount();
+                    updateStatus('Your turn');
+                    playMoveSound();
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                isProcessing = false;
+                showThinking(false);
+                updateStatus('Error: ' + error.message, 'error');
+                return 'snapback';
+            });
+        }
+
+        function onSnapEnd() {
+            // Maintain orientation
+            if (board) {
+                board.orientation(currentOrientation);
+            }
+        }
+
+        // ===== UI Updates =====
+        function updateStatus(message, type = 'normal') {
+            $('#statusText').text(message);
+            const statusEl = $('#status');
+            statusEl.removeClass('error success');
+            if (type === 'error') statusEl.addClass('error');
+            if (type === 'success') statusEl.addClass('success');
+        }
+
+        function showThinking(show) {
+            if (show) {
+                $('#statusText').hide();
+                $('#thinkingIndicator').addClass('active');
+            } else {
+                $('#statusText').show();
+                $('#thinkingIndicator').removeClass('active');
+            }
+        }
+
+        function updateMoveCount() {
+            const count = Math.ceil(moveHistoryData.length / 2);
+            $('#moveCount').text(count);
+        }
+
+        function addMoveToHistory(humanMove, lunaMove) {
+            const moveNum = Math.floor(moveHistoryData.length / 2) + 1;
+
+            if (moveHistoryData.length % 2 === 0) {
+                // Start new pair
+                moveHistoryData.push({white: humanMove, black: lunaMove});
+            } else {
+                // Complete pair
+                const lastPair = moveHistoryData[moveHistoryData.length - 1];
+                lastPair.black = lunaMove;
+            }
+
+            renderMoveHistory();
+        }
+
+        function renderMoveHistory() {
+            const html = moveHistoryData.map((pair, idx) => {
+                const moveNum = idx + 1;
+                return `
+                    <div class="move-pair">
+                        <span class="move-number">${moveNum}.</span>
+                        <span class="move">${pair.white || ''}</span>
+                        <span class="move">${pair.black || ''}</span>
+                    </div>
+                `;
+            }).join('');
+
+            $('#moveHistory').html(html || '<div style="text-align: center; color: #999; padding: 20px;">No moves yet</div>');
+
+            // Scroll to bottom
+            const historyEl = document.getElementById('moveHistory');
+            historyEl.scrollTop = historyEl.scrollHeight;
+        }
+
+        function handleGameOver(result) {
+            gameActive = false;
+            $('#gameOverTitle').text('Game Over!');
+            $('#gameOverMessage').text(result.message);
+            $('#gameOverOverlay').addClass('active');
+            updateStatus(result.message, 'success');
+        }
+
+        function closeGameOverModal() {
+            $('#gameOverOverlay').removeClass('active');
+        }
+
+        // ===== Game Actions =====
+        function undoMove() {
+            if (!gameActive || moveHistoryData.length === 0) {
+                alert('No moves to undo');
+                return;
+            }
+
+            // Remove last move pair (human + Luna)
+            moveHistoryData.pop();
+
+            fetch('/reset', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `color=${currentOrientation}&full_reset=true`
+            })
+            .then(response => response.json())
+            .then(data => {
+                board.position('start');
+
+                // Replay moves
+                // This is simplified - in production you'd replay the actual moves
+                updateStatus('Move undone - feature simplified, please start new game');
+                renderMoveHistory();
+                updateMoveCount();
+            });
+        }
+
+        function getHint() {
+            if (!gameActive) {
+                alert('Start a game first');
+                return;
+            }
+
+            updateStatus('Hint: Luna suggests analyzing the center and piece development', 'success');
+            // In production, you could add an endpoint to get Luna's suggested move
+        }
+
+        function flipBoard() {
+            if (!board) return;
+            currentOrientation = currentOrientation === 'white' ? 'black' : 'white';
+            board.orientation(currentOrientation);
+        }
+
+        // ===== Sound Effects =====
+        function playMoveSound() {
+            // Simple audio feedback - could be replaced with actual audio files
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            oscillator.frequency.value = 800;
+            oscillator.type = 'sine';
+
+            gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.1);
+
+            oscillator.start(audioContext.currentTime);
+            oscillator.stop(audioContext.currentTime + 0.1);
+        }
+    </script>
+</body>
+</html>

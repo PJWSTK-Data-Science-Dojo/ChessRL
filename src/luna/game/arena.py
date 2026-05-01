@@ -1,17 +1,13 @@
 """Arena where 2 players fight against each other."""
 
-from __future__ import annotations
-
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+import chess
 from loguru import logger
 from tqdm import tqdm
 
 from .chess_game import ChessGame
-
-if TYPE_CHECKING:
-    import chess
 
 _WIN_THRESHOLD = 0.5
 _DRAW_THRESHOLD = 1e-8

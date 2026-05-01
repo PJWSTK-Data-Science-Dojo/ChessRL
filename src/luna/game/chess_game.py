@@ -8,7 +8,7 @@ Action encoding (4288 total):
 Queen promotions share the base 0..4095 range (default promotion type).
 """
 
-from __future__ import annotations
+import random
 
 import chess
 import numpy as np
@@ -98,7 +98,7 @@ class ChessGame:
     """python-chess wrapper."""
 
     def __init__(self) -> None:
-        pass
+        self._illegal_move_fallback_count = 0
 
     def get_init_board(self) -> chess.Board:
         return chess.Board()
@@ -120,18 +120,49 @@ class ChessGame:
     def get_action_size(self) -> int:
         return ACTION_SIZE
 
+    def get_illegal_move_count(self) -> int:
+        """Return the number of times illegal moves were handled with fallback."""
+        return self._illegal_move_fallback_count
+
+    def reset_illegal_move_count(self) -> None:
+        """Reset the illegal move fallback counter."""
+        self._illegal_move_fallback_count = 0
+
     def get_next_state(self, board: chess.Board, player: int, action: int) -> tuple[chess.Board, int]:
+        """Execute action and return next (board, player).
+
+        If the action is illegal, tries promotion fallback, then picks a random legal move
+        as a last resort to prevent crashes during self-play.
+        """
         assert player_from_turn(board.turn) == player
         move = action_to_move(action)
         if not board.turn:
             move = mirror_move(move)
+
+        # Try to execute the move
         if move not in board.legal_moves:
+            # Fallback 1: Try queen promotion if it's a pawn-to-back-rank move
             if move.promotion is None:
                 promo_move = chess.Move(move.from_square, move.to_square, promotion=chess.QUEEN)
                 if promo_move in board.legal_moves:
                     move = promo_move
+
+            # Fallback 2: If still illegal, pick a random legal move as last resort
             if move not in board.legal_moves:
-                raise ValueError(f"{move} not in {list(board.legal_moves)}")
+                legal_move_list = list(board.legal_moves)
+                if len(legal_move_list) > 0:
+                    self._illegal_move_fallback_count += 1
+                    move = random.choice(legal_move_list)
+                    logger.warning(
+                        "Illegal action {} selected. Falling back to random legal move: {} (total fallbacks: {})",
+                        action,
+                        move,
+                        self._illegal_move_fallback_count,
+                    )
+                else:
+                    # No legal moves - should never happen in valid chess positions
+                    raise ValueError(f"No legal moves available. Position: {board.fen()}")
+
         board = board.copy()
         board.push(move)
         return (board, player_from_turn(board.turn))

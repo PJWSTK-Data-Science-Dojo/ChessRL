@@ -7,6 +7,15 @@ runs/*
 temp/*
 profiles/
 
+# Logs
+logs/
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+
 # should we import content(stockfish)?
 content/
 

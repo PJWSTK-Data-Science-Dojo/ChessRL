@@ -1,7 +1,5 @@
 """Neural Network Wrapper -- EfficientZeroV2 learner with unroll training."""
 
-from __future__ import annotations
-
 import math
 import os
 import random
@@ -17,6 +15,11 @@ import torch.optim as optim
 from loguru import logger
 from torch.amp import GradScaler, autocast
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
+
+try:
+    import wandb
+except ImportError:
+    wandb = None  # type: ignore
 
 from .config import EzV2LearnerConfig, MCTSParams
 from .ezv2_networks import (
@@ -54,51 +57,95 @@ def _pinned_h2d_float32(arr: np.ndarray, device: torch.device) -> torch.Tensor:
     return pin.to(device, non_blocking=True)
 
 
-def _get_device(preferred_index: int | None = None) -> torch.device:
-    """Pick a CUDA device that can actually run this Torch build.
+def _get_device(device_type: str = "cuda", cuda_device_index: int | None = None) -> torch.device:
+    """Select compute device: CUDA GPU, Apple Silicon MPS, or CPU.
 
-    Never falls back to CPU: if no compatible GPU is available, raises an error
-    with actionable guidance.
+    Args:
+        device_type: One of "cuda", "mps", or "cpu"
+        cuda_device_index: Specific CUDA device index (only used if device_type="cuda")
+
+    Returns:
+        torch.device configured for the requested backend
+
+    Raises:
+        RuntimeError: If requested device is unavailable or incompatible
     """
-    if not torch.cuda.is_available():
+    device_type = device_type.lower()
+
+    # CPU fallback - always available
+    if device_type == "cpu":
+        logger.info("Using CPU backend (slow, recommended only for testing/inference)")
+        return torch.device("cpu")
+
+    # Apple Metal Performance Shaders (M1/M2/M3 Macs)
+    if device_type == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError(
+                "MPS backend requested but not available. "
+                "MPS requires macOS 12.3+ and PyTorch 1.12+ on Apple Silicon. "
+                "Fall back to CPU with --learner.device cpu"
+            )
+        if not torch.backends.mps.is_built():
+            raise RuntimeError(
+                "MPS backend not built into this PyTorch installation. "
+                "Install a PyTorch build with MPS support or use --learner.device cpu"
+            )
+        logger.info("Using MPS backend (Apple Silicon GPU)")
+        return torch.device("mps")
+
+    # CUDA GPU (NVIDIA)
+    if device_type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA backend requested but not available. "
+                "Ensure NVIDIA driver is installed and PyTorch was built with CUDA support. "
+                "For CPU-only testing, use --learner.device cpu"
+            )
+
+        def _is_cuda_device_compatible(idx: int) -> bool:
+            """Test if CUDA device can run basic operations."""
+            try:
+                with torch.cuda.device(idx):
+                    probe = torch.zeros(1, device=f"cuda:{idx}")
+                    _ = probe + 1
+                return True
+            except RuntimeError:
+                return False
+
+        device_count = torch.cuda.device_count()
+        if device_count <= 0:
+            raise RuntimeError("CUDA available but no devices found.")
+
+        # Try requested device index, or scan all devices
+        indices_to_try = (
+            [cuda_device_index] if cuda_device_index is not None else list(range(device_count))
+        )
+        for idx in indices_to_try:
+            if idx is None or idx < 0 or idx >= device_count:
+                continue
+            if _is_cuda_device_compatible(idx):
+                device_name = torch.cuda.get_device_name(idx)
+                logger.info(f"Using CUDA device {idx}: {device_name}")
+                return torch.device(f"cuda:{idx}")
+
+        # No compatible device found
+        device_names = [torch.cuda.get_device_name(i) for i in range(device_count)]
+        devices_str = ", ".join(f"{i}:{name}" for i, name in enumerate(device_names))
+        if cuda_device_index is not None:
+            raise RuntimeError(
+                f"CUDA device {cuda_device_index} unavailable or incompatible. "
+                f"Available devices: {devices_str}. "
+                "Try a different --learner.cuda-device index or use CPU/MPS."
+            )
         raise RuntimeError(
-            "CUDA is not available to PyTorch. This project requires a GPU; "
-            "install a CUDA-enabled torch build and verify the NVIDIA driver."
+            f"No compatible CUDA devices found. Available: {devices_str}. "
+            "Install a PyTorch build matching your GPU architecture or use --learner.device cpu"
         )
 
-    def _is_compatible(idx: int) -> bool:
-        try:
-            with torch.cuda.device(idx):
-                probe = torch.zeros(1, device=f"cuda:{idx}")
-                _ = probe + 1
-            return True
-        except RuntimeError:
-            return False
-
-    device_count = torch.cuda.device_count()
-    if device_count <= 0:
-        raise RuntimeError("No CUDA devices found.")
-
-    indices = [preferred_index] if preferred_index is not None else list(range(device_count))
-    for idx in indices:
-        if idx is None or idx < 0 or idx >= device_count:
-            continue
-        if _is_compatible(idx):
-            return torch.device(f"cuda:{idx}")
-
-    names = [torch.cuda.get_device_name(i) for i in range(device_count)]
-    details = ", ".join(f"{i}:{name}" for i, name in enumerate(names))
-    if preferred_index is not None:
-        raise RuntimeError(
-            f"Requested CUDA device {preferred_index} is unavailable or incompatible with this PyTorch build. "
-            f"Visible devices: {details}. "
-            "Pick another index with --cuda-device or install a torch build that supports this GPU."
-        )
-    raise RuntimeError(
-        "No compatible CUDA GPU found for this PyTorch build. "
-        f"Visible devices: {details}. "
-        "Install a torch build matching your GPU architecture, or restrict visibility to a compatible GPU "
-        "(for example via CUDA_VISIBLE_DEVICES or --cuda-device)."
+    # Unknown device type
+    raise ValueError(
+        f"Unknown device type '{device_type}'. "
+        "Valid options: 'cuda' (NVIDIA GPU), 'mps' (Apple Silicon), 'cpu'"
     )
 
 
@@ -110,13 +157,12 @@ class LunaNetwork:
     def __init__(self, game: ChessGame, learner: EzV2LearnerConfig | None = None) -> None:
         self._learner = learner or EzV2LearnerConfig()
         self._game = game
-        self.device = _get_device(self._learner.cuda_device)
+        self.device = _get_device(self._learner.device, self._learner.cuda_device)
         self.board_x, self.board_y, self.board_z = game.get_board_size()
         self.action_size = game.get_action_size()
 
         if self.device.type == "cuda":
             torch.backends.cudnn.benchmark = True
-            logger.info("Using CUDA device {}", self.device)
 
         self.nnet = EZV2Networks(game, self._learner).to(self.device)
 
@@ -125,10 +171,12 @@ class LunaNetwork:
             lr=self._learner.lr,
             weight_decay=self._learner.weight_decay,
         )
-        self.scaler = GradScaler(
-            "cuda",
-            enabled=self._learner.mixed_precision and self.device.type == "cuda",
-        )
+
+        # GradScaler only supports CUDA, disable for MPS/CPU
+        scaler_backend = "cuda" if self.device.type == "cuda" else "cpu"
+        scaler_enabled = self._learner.mixed_precision and self.device.type == "cuda"
+        self.scaler = GradScaler(scaler_backend, enabled=scaler_enabled)
+
         self._global_step = 0
         self._mcts_inference_compiled = False
         self._training_compiled = False
@@ -184,6 +232,15 @@ class LunaNetwork:
     def _lr_schedule(self, step_in_run: int, total_steps: int) -> float:
         """Cosine annealing from lr to lr_min over the full training run."""
         L = self._learner
+        """Cosine annealing learning rate schedule.
+
+        Args:
+            step: Current training step.
+            total_steps: Total steps for full annealing cycle.
+
+        Returns:
+            Learning rate interpolated between lr_max and lr_min via cosine.
+        """
         progress = step_in_run / max(total_steps, 1)
         return L.lr_min + 0.5 * (L.lr - L.lr_min) * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
@@ -201,7 +258,24 @@ class LunaNetwork:
         td: int,
         mcts_base: MCTSParams,
     ) -> tuple[dict[int, float] | None, dict[int, np.ndarray] | None]:
-        """Batched latent MCTS from replayed positions for search-based value / policy targets."""
+        """Compute fresh MCTS search-based value/policy for reanalysis.
+
+        Runs MCTS with the current network on a sample's root observation to generate
+        improved value/policy targets, replacing stale bootstrapped values. See EfficientZero V2
+        Section 4.4 "Search-Based Value" for algorithm details.
+
+        Args:
+            game: Chess game environment.
+            traj: Training trajectory containing game history.
+            pos_idx: Starting position index in trajectory.
+            unroll: Number of recurrent unroll steps (K).
+            td: Bootstrap horizon for value targets (n).
+            mcts_base: Base MCTS parameters to customize for reanalysis.
+
+        Returns:
+            Tuple of (root_value_overrides, policy_overrides) where each is a dict mapping
+            position index to fresh target, or None if no reanalysis was performed.
+        """
         L = self._learner
         actions = traj.actions
         game_len = traj.game_length
@@ -259,7 +333,24 @@ class LunaNetwork:
         training_step: int,
         mcts_for_reanalyze: MCTSParams | None,
     ) -> tuple[dict[str, np.ndarray], np.ndarray, list[int]]:
-        """Sample from replay and build collated targets (may run on a background thread)."""
+        """Prepare training batch from replay samples with optional reanalysis.
+
+        Converts numpy samples to torch tensors, optionally runs fresh MCTS to override
+        stale targets, and builds K-step unroll targets for representation/dynamics/prediction
+        training.
+
+        Args:
+            replay: Prioritized replay buffer to sample from.
+            bs: Batch size.
+            unroll: Number of recurrent unroll steps (K).
+            td: Bootstrap horizon for value targets (n).
+            discount: Discount factor for n-step returns.
+            training_step: Current global training step for warmup logic.
+            mcts_for_reanalyze: MCTS parameters for search-based value (None = disabled).
+
+        Returns:
+            Tuple of (collated_batch_dict, importance_weights, tree_indices) ready for GPU training.
+        """
         L = self._learner
         game = self._game
         batch, is_weights, tree_indices = replay.sample(bs, unroll)
@@ -298,6 +389,30 @@ class LunaNetwork:
         collated = collate_batch(batch_targets)
         return collated, is_weights, tree_indices
 
+    def _validate_training_inputs(
+        self,
+        replay: PrioritizedReplayBuffer,
+        steps: int,
+        bs: int,
+        unroll: int,
+        td: int,
+    ) -> None:
+        """Validate training parameters before starting.
+
+        Raises:
+            ValueError: If any parameter is invalid or replay buffer is empty.
+        """
+        if steps <= 0:
+            raise ValueError(f"steps must be positive, got {steps}")
+        if bs <= 0:
+            raise ValueError(f"batch_size must be positive, got {bs}")
+        if unroll < 0:
+            raise ValueError(f"unroll_steps cannot be negative, got {unroll}")
+        if td < 0:
+            raise ValueError(f"td_steps cannot be negative, got {td}")
+        if replay.size == 0:
+            raise ValueError("Cannot train on empty replay buffer")
+
     def train_ezv2(
         self,
         replay: PrioritizedReplayBuffer,
@@ -330,6 +445,15 @@ class LunaNetwork:
 
         ``with_stack=True`` adds Python stacks to ops (heavier, best for short runs).
         """
+        # Validate inputs before training
+        self._validate_training_inputs(
+            replay,
+            steps,
+            self._learner.batch_size,
+            self._learner.unroll_steps,
+            self._learner.td_steps,
+        )
+
         self.nnet.train()
 
         trace_path: str | None = None
@@ -534,8 +658,27 @@ class LunaNetwork:
                     all_td_errors.append(total.detach().cpu().numpy())
                     all_tree_indices.append(tree_indices)
 
+                # Check for NaN/Inf in accumulated losses (training divergence detection)
+                if not torch.isfinite(accum_weighted).all():
+                    logger.error(
+                        "Non-finite loss detected at step {}/{}! "
+                        "total={:.4f} pi={:.4f} v={:.4f} r={:.4f} consist={:.4f}",
+                        step,
+                        steps,
+                        accum_weighted.item(),
+                        accum_pi_acc.item(),
+                        accum_v_acc.item(),
+                        accum_r_acc.item(),
+                        accum_c_acc.item(),
+                    )
+                    raise RuntimeError(
+                        f"Training diverged at step {step}/{steps}: loss is NaN or Inf. "
+                        "Try lowering learning rate, increasing gradient clipping, or checking data preprocessing."
+                    )
+
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.nnet.parameters(), 5.0)
+                # Capture gradient norm before clipping for monitoring
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.nnet.parameters(), 5.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -564,6 +707,20 @@ class LunaNetwork:
                         r_loss_m.avg,
                         consist_loss_m.avg,
                     )
+
+                    # Log training metrics to WandB
+                    if wandb is not None and wandb.run is not None:
+                        wandb.log({
+                            "train/loss_total": total_loss_m.avg,
+                            "train/loss_policy": pi_loss_m.avg,
+                            "train/loss_value": v_loss_m.avg,
+                            "train/loss_reward": r_loss_m.avg,
+                            "train/loss_consistency": consist_loss_m.avg,
+                            "train/lr": new_lr,
+                            "train/grad_norm": float(grad_norm),
+                            "train/step_time": step_time_m.avg,
+                            "global_step": self._global_step,
+                        })
 
                 if prof is not None:
                     prof.step()
@@ -608,9 +765,19 @@ class LunaNetwork:
         latents: torch.Tensor,
         actions: list[int],
         *,
+        valid_masks: list[np.ndarray | None] | None = None,
         policy_topk: int | None = None,
     ) -> RecurrentBatchResult:
         """Batched recurrent inference for parallel MCTS leaf expansion.
+
+        Args:
+            latents: Batch of hidden states (B, C, H, W)
+            actions: List of action indices
+            valid_masks: Optional list of legal move masks per position
+            policy_topk: If set, return only top-K policy entries
+
+        Returns:
+            RecurrentBatchResult with policies, values, rewards, and next latents
 
         When ``policy_topk`` is set and smaller than the action dimension, only the top-K
         log-probability indices and renormalized probabilities are copied to the host
@@ -619,9 +786,25 @@ class LunaNetwork:
         action_t = torch.as_tensor(actions, dtype=torch.long, device=self.device)
         act_planes = action_index_to_planes(action_t, self.device)
 
+        # Convert valid_masks to tensor if provided
+        valid_mask_tensor = None
+        if valid_masks is not None and len(valid_masks) > 0:
+            # Stack valid masks, using all-ones for None entries
+            batch_size = len(valid_masks)
+            action_size = self.action_size
+            valid_mask_np = np.ones((batch_size, action_size), dtype=np.float32)
+            for i, mask in enumerate(valid_masks):
+                if mask is not None:
+                    valid_mask_np[i] = mask
+            valid_mask_tensor = torch.as_tensor(
+                valid_mask_np, dtype=torch.float32, device=self.device
+            )
+
         self.nnet.eval()
         with torch.inference_mode():
-            next_latent, reward, log_pi, v = self.nnet.recurrent_inference(latents, act_planes)
+            next_latent, reward, log_pi, v = self.nnet.recurrent_inference(
+                latents, act_planes, valid_mask_tensor
+            )
 
         a_dim = int(log_pi.shape[1])
         k_limit = policy_topk if policy_topk is not None else a_dim
@@ -657,11 +840,36 @@ class LunaNetwork:
 
         return torch.exp(log_pi).data.cpu().numpy()[0], float(v.item()), latent
 
-    def recurrent_predict(self, latent: torch.Tensor, action: int) -> tuple[np.ndarray, float, float, torch.Tensor]:
+    def recurrent_predict(
+        self,
+        latent: torch.Tensor,
+        action: int,
+        valid_mask: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, float, float, torch.Tensor]:
+        """Recurrent inference in latent space with optional legal move masking.
+
+        Args:
+            latent: Hidden state representation
+            action: Action index to take from this state
+            valid_mask: Optional legal move mask (1.0 for legal, 0.0 for illegal)
+
+        Returns:
+            Tuple of (policy_probs, value, reward, next_latent)
+        """
         act_planes = action_int_to_planes(action, self.device)
+
+        # Convert valid_mask to tensor if provided
+        valid_mask_tensor = None
+        if valid_mask is not None:
+            valid_mask_tensor = torch.as_tensor(
+                valid_mask, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)  # Add batch dimension
+
         self.nnet.eval()
         with torch.inference_mode():
-            next_latent, reward, log_pi, v = self.nnet.recurrent_inference(latent, act_planes)
+            next_latent, reward, log_pi, v = self.nnet.recurrent_inference(
+                latent, act_planes, valid_mask_tensor
+            )
         return (
             torch.exp(log_pi).data.cpu().numpy()[0],
             float(v.item()),

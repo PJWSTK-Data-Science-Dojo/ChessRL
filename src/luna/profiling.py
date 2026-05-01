@@ -7,8 +7,6 @@ Use this to choose optimizations: top-K policy H2D helps recurrent + expand; Num
 if ``selection`` grows with wide trees.
 """
 
-from __future__ import annotations
-
 import json
 import os
 from dataclasses import asdict, dataclass

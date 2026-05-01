@@ -1,7 +1,5 @@
 """Typed configuration for MCTS, training loops, EZV2 learner, and the training CLI."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field, fields
 
 
@@ -19,11 +17,30 @@ class MCTSParams:
     lower ``arena_compare`` to shorten evaluation.
     """
 
+    # Number of MCTS simulations per move during self-play
+    # AlphaZero used 800, but 50-200 is practical for training runs
+    # Higher = stronger tactical play but slower iteration time
     num_mcts_sims: int = 50
+
+    # PUCT exploration constant (Silver et al. 2016, AlphaZero)
+    # Controls exploration/exploitation tradeoff in tree search
+    # 1.25 is empirically tuned for chess; typical range [1.0, 2.5]
     cpuct: float = 1.25
+
     dir_noise: bool = True
+
+    # Dirichlet noise alpha for root exploration (AlphaZero)
+    # Lower values = more concentrated noise
+    # 0.3 is appropriate for chess (~35 legal moves average)
+    # Formula from paper: alpha = 10/n where n is typical branching factor
     dir_alpha: float = 0.3
+
+    # Discount factor for n-step TD returns
+    # 0.997^40 ≈ 0.88 (minimal discounting over typical 40-move game)
+    # Chess is deterministic, so high gamma preserves long-term planning
+    # Consider 0.95 for shorter horizon if games become too long
     discount: float = 0.997
+
     recurrent_policy_topk: int | None = 512
 
 
@@ -88,7 +105,8 @@ class EzV2LearnerConfig:
     value_loss_weight: float = 0.25
     reward_loss_weight: float = 1.0
     consistency_loss_weight: float = 2.0
-    cuda_device: int | None = None
+    device: str = "cuda"  # "cuda", "mps", or "cpu"
+    cuda_device: int | None = None  # Specific CUDA device index (only used if device="cuda")
     compile_inference: bool = False
     compile_training: bool = False
     grad_accum_steps: int = 1
@@ -112,6 +130,7 @@ class TrainCliConfig:
     load_model: bool = False
     load_checkpoint_dir: str = "./pretrained_models/"
     load_checkpoint_file: str = "best.pth.tar"
+    wandb_project: str | None = None  # Optional WandB project name for experiment tracking
     run: TrainingRunConfig = field(default_factory=TrainingRunConfig)
     learner: EzV2LearnerConfig = field(default_factory=EzV2LearnerConfig)
 

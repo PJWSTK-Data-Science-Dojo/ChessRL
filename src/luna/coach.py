@@ -5,15 +5,19 @@ Self-play uses a sliding pool of up to ``parallel_games`` episodes with
 stays batched. Arena pits batch up to ``arena_parallel_games`` games per ply.
 """
 
-from __future__ import annotations
-
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 from loguru import logger
 from tqdm import tqdm
+
+try:
+    import wandb
+except ImportError:
+    wandb = None  # type: ignore
 
 from .config import MCTSParams, TrainingRunConfig
 from .game.chess_game import DRAW_VALUE, ChessGame
@@ -32,7 +36,13 @@ class Coach:
     run: TrainingRunConfig
     replay: PrioritizedReplayBuffer
 
-    def __init__(self, game: ChessGame, nnet: LunaNetwork, run: TrainingRunConfig) -> None:
+    def __init__(
+        self,
+        game: ChessGame,
+        nnet: LunaNetwork,
+        run: TrainingRunConfig,
+        wandb_project: str | None = None,
+    ) -> None:
         self.game = game
         self.nnet = nnet
         self.pnet = nnet.__class__(game, nnet._learner)
@@ -51,6 +61,17 @@ class Coach:
         self.nnet._learner.discount = self.run.discount
         self._profile_mcts_timings: SelfPlayMCTSTimings | None = None
         self._profile_sp_env_s: float = 0.0
+
+        # Initialize WandB if project name provided
+        if wandb_project and wandb is not None:
+            wandb.init(
+                project=wandb_project,
+                config=asdict(run),
+                tags=["chess", "ezv2"],
+            )
+            logger.info("WandB initialized for project: {}", wandb_project)
+        elif wandb_project and wandb is None:
+            logger.warning("WandB project specified but wandb not installed. Install with: uv add wandb")
 
     # ------------------------------------------------------------------
     # Single-game self-play (fallback / arena)
@@ -123,7 +144,20 @@ class Coach:
             return self._run_self_play_pool(num_episodes, pool_size, pbar)
 
     def _run_self_play_pool(self, num_episodes: int, pool_size: int, pbar: tqdm) -> list[Trajectory]:
-        """Collect ``num_episodes`` trajectories with ``pool_size`` games in flight."""
+        """Execute self-play with sliding game pool for batched MCTS inference.
+
+        Maintains a pool of up to pool_size active episodes, refilling finished games
+        immediately to keep GPU batches full. Uses BatchedMCTS to amortize network overhead
+        across parallel positions.
+
+        Args:
+            num_episodes: Total episodes to generate.
+            pool_size: Max concurrent games in the pool.
+            pbar: Progress bar for tracking completion.
+
+        Returns:
+            List of completed game trajectories with (obs, policy, reward) per timestep.
+        """
         mcts_timings = self._profile_mcts_timings if self.run.profile else None
         bmcts = BatchedMCTS(self.game, self.nnet, self.run, timings=mcts_timings)
         p = pool_size
@@ -266,7 +300,20 @@ class Coach:
         mcts_params: MCTSParams,
         num_games: int,
     ) -> list[float]:
-        """Play ``num_games`` pit games in parallel (same clock for each ply). Returns results like :meth:`Arena.play_game`."""
+        """Pit current vs previous model with parallel game execution.
+
+        Runs num_games head-to-head matches with batched inference for speed.
+        Each model plays both colors to reduce variance.
+
+        Args:
+            white: Network playing white pieces.
+            black: Network playing black pieces.
+            mcts_params: MCTS search parameters for both players.
+            num_games: Number of parallel games to play.
+
+        Returns:
+            List of game results from white's perspective (1.0 = win, 0.0 = loss, 0.5 = draw).
+        """
         game = self.game
         max_ply = self.run.max_ply
         white_bm = BatchedMCTS(game, white, mcts_params)
@@ -313,7 +360,9 @@ class Coach:
     ) -> Trajectory:
         game_len = len(actions)
         rewards = [0.0] * game_len
-        rewards[-1] = -float(terminal_r)
+        # Terminal reward is already from the correct player's perspective
+        # (ChessGame.get_terminal_r returns +1 for winner, -1 for loser)
+        rewards[-1] = float(terminal_r)
         return Trajectory(
             observations=observations,
             actions=actions,
@@ -460,6 +509,20 @@ class Coach:
             stats.arena_s = time.perf_counter() - t_arena0
 
             logger.info("NEW/PREV WINS: {} / {} ; DRAWS: {}", nwins, pwins, draws)
+
+            # Log iteration metrics to WandB
+            if wandb is not None and wandb.run is not None:
+                total_games = nwins + pwins + draws
+                win_rate = nwins / total_games if total_games > 0 else 0.0
+                wandb.log({
+                    "arena/new_wins": nwins,
+                    "arena/prev_wins": pwins,
+                    "arena/draws": draws,
+                    "arena/win_rate": win_rate,
+                    "arena/total_games": total_games,
+                    "iteration": i,
+                    "replay_buffer_size": self.replay.size,
+                })
 
             t0 = time.perf_counter()
             if self.run.save_anyway:

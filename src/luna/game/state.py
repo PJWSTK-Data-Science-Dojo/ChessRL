@@ -1,7 +1,5 @@
 """Luna-chess board state."""
 
-from __future__ import annotations
-
 import chess
 
 

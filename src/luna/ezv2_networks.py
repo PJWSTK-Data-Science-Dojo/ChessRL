@@ -9,8 +9,6 @@ Key design choices:
 - Mean/std latent normalisation for smoother gradients (replaces min-max).
 """
 
-from __future__ import annotations
-
 from typing import cast
 
 import torch

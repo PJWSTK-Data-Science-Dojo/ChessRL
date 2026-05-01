@@ -92,9 +92,22 @@ def _puct_best_action(cpuct: float, node: _LatentNode) -> int:
 
 
 class _LatentNode:
-    """A node in the latent MCTS tree."""
+    """A node in the latent MCTS tree.
+
+    Attributes:
+        board: Chess board position at this node (None for unexpanded nodes)
+        latent: Hidden state representation
+        children: Child nodes indexed by action
+        expanded: Whether node has been expanded
+        prior: Prior probability from parent's policy
+        reward: Reward received when transitioning to this node
+        value_sum: Sum of backed-up values
+        visit_count: Number of times this node was visited
+        total_child_visits: Sum of visit counts across all children
+    """
 
     __slots__ = (
+        "board",
         "children",
         "expanded",
         "latent",
@@ -105,12 +118,13 @@ class _LatentNode:
         "visit_count",
     )
 
-    def __init__(self, prior: float) -> None:
+    def __init__(self, prior: float, board: chess.Board | None = None) -> None:
         self.prior = prior
         self.value_sum = 0.0
         self.visit_count = 0
         self.total_child_visits = 0
         self.reward = 0.0
+        self.board = board  # Chess position at this node
         self.latent: torch.Tensor | None = None
         self.children: dict[int, _LatentNode] = {}
         self.expanded = False
@@ -156,7 +170,8 @@ class MCTS:
         if len(valid_indices) == 0:
             return [0.0] * action_size, 0.0
 
-        root = _LatentNode(prior=0.0)
+        # Store the root board position for legal move tracking in children
+        root = _LatentNode(prior=0.0, board=canonical_board.copy())
         root.latent = latent
         root.expanded = True
 
@@ -199,6 +214,20 @@ class MCTS:
         return probs, root_value
 
     def _latent_simulate(self, node: _LatentNode, cpuct: float) -> float:
+        """Recursively simulate one MCTS path from node to leaf and backup value.
+
+        Implements the core MCTS loop:
+        1. Select best child via PUCT (exploration + exploitation)
+        2. If leaf, expand with recurrent_predict (dynamics + prediction)
+        3. Backup negated value (two-player zero-sum alternating)
+
+        Args:
+            node: Current node to simulate from.
+            cpuct: PUCT exploration constant.
+
+        Returns:
+            Backed-up value from perspective of node's parent (-v for minimax).
+        """
         if not node.expanded or not node.children:
             return 0.0
 
@@ -207,7 +236,20 @@ class MCTS:
         discount = float(self.params.discount)
 
         if not child.expanded and node.latent is not None:
-            pi_np, value, reward, next_latent = self.nnet.recurrent_predict(node.latent, best_action)
+            child_valid_mask = None
+            if node.board is not None:
+                try:
+                    child_board, child_player = self.game.get_next_state(node.board, 1, best_action)
+                    canonical_child = self.game.get_canonical_form(child_board, child_player)
+                    child.board = canonical_child
+                    child_valid_mask = self.game.get_valid_moves(canonical_child, 1)
+                except (ValueError, AssertionError):
+                    pass
+
+            # Recurrent inference with legal move masking (if available)
+            pi_np, value, reward, next_latent = self.nnet.recurrent_predict(
+                node.latent, best_action, valid_mask=child_valid_mask
+            )
             child.latent = next_latent
             child.reward = reward
             child.expanded = True
@@ -286,6 +328,7 @@ class BatchedMCTS:
         self._pending: list[_PendingExpansion] = []
         self._parent_latents: list[torch.Tensor] = []
         self._pending_actions: list[int] = []
+        self._pending_parent_boards: list[chess.Board | None] = []  # For computing child valid masks
 
     def search_batch(
         self,
@@ -332,7 +375,8 @@ class BatchedMCTS:
 
         roots: list[_LatentNode] = []
         for i in range(N):
-            root = _LatentNode(prior=0.0)
+            # Store root board position for legal move tracking
+            root = _LatentNode(prior=0.0, board=canonical_boards[i].copy())
             root.latent = latents[i : i + 1]
             root.expanded = True
 
@@ -356,9 +400,11 @@ class BatchedMCTS:
             pending = self._pending
             parent_latents = self._parent_latents
             pending_actions = self._pending_actions
+            parent_boards = self._pending_parent_boards
             pending.clear()
             parent_latents.clear()
             pending_actions.clear()
+            parent_boards.clear()
 
             for root in roots:
                 if not root.children:
@@ -366,9 +412,12 @@ class BatchedMCTS:
                 result = self._select_leaf(root, cpuct)
                 if result is not None:
                     ancestors, child, action = result
+                    parent_node = ancestors[-1]
                     pending.append(_PendingExpansion(ancestors, child))
-                    parent_latents.append(ancestors[-1].latent)  # type: ignore[arg-type]
+                    parent_latents.append(parent_node.latent)  # type: ignore[arg-type]
                     pending_actions.append(action)
+                    # Store parent board (may be None for early root children)
+                    parent_boards.append(parent_node.board)
 
             if tm is not None:
                 tm.selection_s += time.perf_counter() - t_sel
@@ -379,10 +428,29 @@ class BatchedMCTS:
             if tm is not None:
                 t_rec = time.perf_counter()
 
+            # Compute child boards and valid masks in one pass (avoid redundant computation)
+            child_boards_list: list[chess.Board | None] = []
+            valid_masks_list: list[np.ndarray | None] = []
+            for parent_board, action in zip(parent_boards, pending_actions):
+                if parent_board is not None:
+                    try:
+                        child_board, child_player = self.game.get_next_state(parent_board, 1, action)
+                        canonical_child = self.game.get_canonical_form(child_board, child_player)
+                        child_boards_list.append(canonical_child)
+                        child_valid_mask = self.game.get_valid_moves(canonical_child, 1)
+                        valid_masks_list.append(child_valid_mask)
+                    except (ValueError, AssertionError):
+                        child_boards_list.append(None)
+                        valid_masks_list.append(None)
+                else:
+                    child_boards_list.append(None)
+                    valid_masks_list.append(None)
+
             batched_latent = torch.cat(parent_latents, dim=0)
             rb = self.nnet.batched_recurrent_inference(
                 batched_latent,
                 pending_actions,
+                valid_masks=valid_masks_list,
                 policy_topk=self.params.recurrent_policy_topk,
             )
 
@@ -403,6 +471,9 @@ class BatchedMCTS:
                     child.reward = float(r_f[j])
                     child.expanded = True
 
+                    # Reuse precomputed child board (no redundant computation)
+                    child.board = child_boards_list[j]
+
                     pi_row = pi_batch[j]
                     child_indices = np.flatnonzero(pi_row > 1e-6)
                     for a in child_indices:
@@ -419,6 +490,9 @@ class BatchedMCTS:
                     child.latent = next_latents[j : j + 1]
                     child.reward = float(r_f[j])
                     child.expanded = True
+
+                    # Reuse precomputed child board (no redundant computation)
+                    child.board = child_boards_list[j]
 
                     for t in range(k_w):
                         a = int(idx_bt[j, t])
@@ -468,9 +542,18 @@ class BatchedMCTS:
     def _select_leaf(
         self, root: _LatentNode, cpuct: float
     ) -> tuple[list[_LatentNode], _LatentNode, int] | None:
-        """Walk from *root* to an unexpanded leaf. Returns (ancestors, leaf, action) or None.
+        """Traverse tree via PUCT until reaching unexpanded node.
 
-        *ancestors* is ``[root, ..., parent]`` such that *leaf* is a child of ``ancestors[-1]``.
+        Repeatedly selects highest PUCT-scored child until finding a node without
+        children (either terminal or unexpanded). This is the selection phase of MCTS.
+
+        Args:
+            root: Root node to start traversal.
+            cpuct: PUCT exploration constant.
+
+        Returns:
+            Tuple of (ancestors, leaf, action) where ancestors is [root, ..., parent]
+            such that leaf is a child of ancestors[-1], or None if no expansion possible.
         """
         if not root.expanded or not root.children:
             return None

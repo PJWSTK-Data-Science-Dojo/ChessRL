@@ -1,7 +1,5 @@
 """EfficientZeroV2 target generation: n-step bootstrap values, unroll targets."""
 
-from __future__ import annotations
-
 from typing import Any
 
 import numpy as np
@@ -17,11 +15,22 @@ def compute_target_value(
     *,
     root_value_override: dict[int, float] | None = None,
 ) -> float:
-    """Compute n-step bootstrapped value target for a position.
+    """Compute n-step TD target values with alternating signs for two-player games.
 
-    V_target = sum_{i=0}^{n-1} discount^i * r_{t+i} + discount^n * v_{t+n}
-    where v_{t+n} comes from the stored MCTS root value.
-    Rewards alternate sign for two-player zero-sum games.
+    Formula: V_t = r_t + γ r_{t+1} + γ² r_{t+2} + ... + γⁿ V_{t+n}
+
+    Two-player adjustment: Rewards alternate signs based on player perspective.
+
+    Args:
+        trajectory: Game trajectory containing rewards and root values.
+        pos_idx: Position index in trajectory to compute target for.
+        td_steps: Bootstrap horizon n (how many steps to look ahead).
+        discount: Discount factor γ ∈ (0, 1].
+        root_value_override: Optional dict mapping position indices to fresh MCTS values
+            (for reanalysis-based search value).
+
+    Returns:
+        n-step value target with shape matching rewards.
     """
     game_len = trajectory.game_length
     bootstrap_idx = pos_idx + td_steps
