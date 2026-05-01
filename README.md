@@ -51,7 +51,7 @@ make train
 ```
 
 - `uv sync` installs the `luna` package (editable) and dependencies from `pyproject.toml`.
-- `make train` runs `uv run python src/main.py`, which runs self-play, replay writes, gradient updates, and arena evaluation in a loop.
+- `make train` runs `uv run python src/main.py` with **Makefile presets** tuned for a strong GPU (higher batch size, parallel games, MCTS sims, compile, reanalysis on, etc.). Override with `ARGS='...'` or `TRAIN_ARGS='...'`. A bare `uv run python src/main.py` uses **tyro defaults** from `config.py` (lighter footprint).
 
 ### Training readiness
 
@@ -60,7 +60,7 @@ make train
 | Install | `uv sync` (or `uv sync --extra dev` for tests/lint). |
 | Entry point | `src/main.py` imports the installed `luna` package; do not rely on ad-hoc `PYTHONPATH` if you use `uv run`. |
 | Checkpoints | `./temp/` is created when saving; optional warm-start: set `--load-model --load-checkpoint-dir ./temp/`. |
-| Hardware | **CUDA GPU required** for training (PyTorch raises if CUDA is missing). 4 GB VRAM works with defaults; 24 GB allows `--num-channels 128 --batch-size 64`. |
+| Hardware | **CUDA** is typical for full training (`--learner.device cuda`); use **`make test-pipeline-macbook`** (CPU) or **`make test-pipeline-macbook-mps`** (Apple Silicon) for a short smoke run. 4 GB VRAM works with config defaults; 24 GB allows `--learner.num-channels 128 --run.batch-size 64`. |
 
 If `uv run python -c "import torch; print(torch.cuda.is_available())"` prints `False` but the NVIDIA driver works, try **`make torch-fix`** (reinstalls a CUDA-enabled `torch` in `.venv`). Then run **`make profile-smoke`** for one training iteration with wall-clock phase breakdown and a Kineto trace under `./profiles/` (open with TensorBoard’s PyTorch Profiler tab or `chrome://tracing`). With `--run.profile`, the log also prints **self-play detail**: time in the chess/env loop vs MCTS, plus a breakdown of `search_batch` (encode, initial vs recurrent GPU calls, PUCT selection, expand/backup, finalize). The same numbers are stored in `iter_timings.json`.
 
@@ -100,14 +100,23 @@ The loop starts with `Starting Iter #1 ...` and a **Self Play** tqdm bar once im
 1. Generate self-play games with latent MCTS (`num_episodes` per iteration).
 2. Store trajectory positions in prioritized replay.
 3. Train the network from replay (`train_steps_per_iter` updates).
-4. Arena-evaluate new vs previous model.
-5. Save checkpoints to `./temp/` (`temp.pth.tar`, `checkpoint_<iter>.pth.tar`, `best.pth.tar`).
+4. *(Optional)* If ``arena_compare > 0``, pit new vs previous network (for metrics or AlphaZero-style gating when ``save_anyway`` is False).
+5. Save checkpoints to `./temp/` (`checkpoint_<iter>.pth.tar`, `best.pth.tar`).
+6. *(Optional)* **Stockfish benchmark** every ``stockfish_eval_every`` iterations (default 50; set to `0` to disable), using ``stockfish_eval_games`` alternating-color games after a checkpoint is accepted.
+
+For a **standalone** benchmark (no training loop), load a checkpoint and run:
+
+```bash
+uv run python src/eval_vs_stockfish.py --checkpoint ./temp/best.pth.tar
+```
+
+Use ``--run.stockfish-*`` flags (same `TrainingRunConfig` as training) to set game count, engine path, Elo/skill, depth, time limit, etc.
 
 Tune behavior by editing CLI args or `src/main.py`.
 
 ### Laptop / fast bootstrap
 
-Self-play time grows roughly with **plies per game** \(\times\) **(1 + `num_mcts_sims`)** network evaluations. On a single GPU, cut MCTS cost, cap pathological game length, use a smaller net, shorten arena, and optionally enable compiled inference (PyTorch 2.x).
+Self-play time grows roughly with **plies per game** \(\times\) **(1 + `num_mcts_sims`)** network evaluations. On a single GPU, cut MCTS cost, cap pathological game length, use a smaller net, and optionally enable pit/Stockfish less often or with fewer games.
 
 Example (faster iterations; raise `--run.num-mcts-sims` again when experiments look sensible):
 
@@ -127,9 +136,7 @@ Omit `--learner.compile-inference` if you hit `torch.compile` issues on your sta
 
 ### GPU/CPU utilization and profiling
 
-Self-play keeps up to `--run.parallel-games` episodes in a **sliding pool** so recurrent MCTS inference stays batched even when some games finish early. Raise this until you approach VRAM limits. Arena evaluation batches up to `--run.arena-parallel-games` games per ply (same idea). Use `--run.arena-num-mcts-sims N` for cheaper evaluation than self-play (default: same as `--run.num-mcts-sims`).
-
-**Speed without retraining:** lower `--run.num-mcts-sims`, `--run.max-ply`, and `--run.arena-compare`; raise `--run.parallel-games` until VRAM-bound. **`--run.recurrent-policy-topk`** (default `512`) limits GPU→CPU policy transfer after each recurrent forward (renormalized top-K); use `None` for the full action vector (~4k floats per batch row) if you need exact expansion. **`uv sync --extra perf`** installs **Numba** for faster PUCT when nodes have many children.
+**Speed without retraining:** lower `--run.num-mcts-sims`, `--run.max-ply`, and (if enabled) `--run.arena-compare`; raise `--run.parallel-games` until VRAM-bound. When pitting is enabled, evaluation batches up to `--run.arena-parallel-games` games per ply. Use `--run.arena-num-mcts-sims N` for cheaper evaluation than self-play (default: same as `--run.num-mcts-sims`). **`--run.recurrent-policy-topk`** (default `512`) limits GPU→CPU policy transfer after each recurrent forward (renormalized top-K); use `None` for the full action vector (~4k floats per batch row) if you need exact expansion. **`uv sync --extra perf`** installs **Numba** for faster PUCT when nodes have many children.
 
 ### Search-based value / reanalysis (learner flags)
 
@@ -183,7 +190,8 @@ Configured via `python src/main.py --help`:
 | `num_channels` | Latent channel width (main capacity knob) |
 | `lr` / `lr_min` | Learning rate and cosine annealing floor |
 | `checkpoint` | Checkpoint output directory |
-| `save_anyway` | Default false: keep new weights only if arena beats `update_threshold`; pass `--run.save-anyway` to always accept |
+| `save_anyway` | Default **true**: always keep new checkpoints. Use `--run.no-save-anyway` with pitting (`arena_compare > 0`) for AlphaZero-style gating |
+| `stockfish_eval_every` / `stockfish_eval_games` / `stockfish_*` | Periodic eval vs Stockfish during training; `stockfish_eval_every=0` disables |
 | `max_ply` | Optional cap on plies per self-play game (draw if exceeded); speeds laptop runs |
 | `parallel_games` | Self-play pool size: more games in flight → larger GPU batches (watch VRAM) |
 | `recurrent_policy_topk` | Batched MCTS: top-K policy rows from GPU (`None` = full vector) |
@@ -201,6 +209,7 @@ Training regression coverage includes `tests/test_train_ezv2.py` (optimizer step
 ```
 src/
 ├── main.py                    # self-play + training entry point
+├── eval_vs_stockfish.py       # one-off checkpoint vs Stockfish (no training)
 ├── luna/
 │   ├── coach.py               # training loop orchestration
 │   ├── mcts.py                # latent MCTS
@@ -230,7 +239,13 @@ make types
 make check
 make test
 make bench
-make serve
+make serve          # Flask UI (default CUDA)
+make serve-cpu      # CPU (e.g. MacBook)
+make serve-mps      # Apple Silicon MPS
+make torch-fix      # reinstall CUDA-enabled torch in `.venv` if CUDA missing
+make profile-smoke  # one short iter + phase timings + Kineto trace → ./profiles/
+make test-pipeline-macbook      # 3 iters, CPU — smoke-test the training loop
+make test-pipeline-macbook-mps  # same on MPS
 ```
 
 `make bench` runs `tests/bench_throughput.py`; pass laptop-style flags to match training (for example `--max-ply 80 --mcts-sims 8`).
