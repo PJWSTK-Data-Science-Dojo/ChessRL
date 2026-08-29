@@ -1,243 +1,234 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-    <title>Luna Chess</title>
-    <link rel="stylesheet" href="/static/chessboard.min.css">
-    <script src="/static/jquery.min.js"></script>
-    <script src="/static/chessboard.min.js"></script>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            text-align: center;
-            margin: 20px;
-        }
-        #board {
-            width: 400px;
-            margin: 0 auto;
-        }
-        .btn {
-            margin: 10px;
-            padding: 8px 16px;
-            cursor: pointer;
-            background-color: #4CAF50;
-            color: white;
-            border: none;
-            border-radius: 4px;
-        }
-        .btn:hover {
-            background-color: #45a049;
-        }
-        #status {
-            margin: 15px 0;
-            font-weight: bold;
-            min-height: 20px;
-        }
-        #gameOptions {
-            margin: 20px auto;
-            width: 400px;
-        }
-        #chessboard {
-            display: none;
-        }
-    </style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#080b18">
+    <meta name="description" content="Play and spectate Luna, a self-learning neural chess engine.">
+    <title>Luna Chess Observatory</title>
+    <link rel="stylesheet" href="/static/luna.css">
+    <script src="/static/luna.js" defer></script>
 </head>
 <body>
-    <h1>Luna Chess</h1>
-    
-    <div id="gameOptions">
-        <h2>Choose Your Color</h2>
-        <button id="playAsWhiteBtn" class="btn">Play as White</button>
-        <button id="playAsBlackBtn" class="btn">Play as Black</button>
-        <a href="/selfplay"><button class="btn">Watch Self-Play</button></a>
+    <div class="star-field" aria-hidden="true">
+        <span class="moon-glow"></span>
+        <span class="orbit orbit-one"></span>
+        <span class="orbit orbit-two"></span>
     </div>
-    
-    <div id="chessboard">
-        <div id="board"></div>
-        <p id="status"></p>
-        <button id="newGameBtn" class="btn">New Game</button>
-        <button id="backBtn" class="btn">Back to Selection</button>
-    </div>
-    
-    <script>
-        // Global variables
-        let board = null;
-        let game = null;
-        let currentOrientation = 'white'; // Default orientation
-        
-        // Initialize the board when the page loads
-        $(document).ready(function() {
-            // Set up event listeners for color selection
-            $('#playAsWhiteBtn').on('click', function() {
-                playAsWhite();
-            });
-            
-            $('#playAsBlackBtn').on('click', function() {
-                playAsBlack();
-            });
-            
-            // Set up the New Game button handler
-            $('#newGameBtn').on('click', function() {
-                // Send full_reset=true to indicate we want to go back to the start screen
-                fetch('/reset', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                    },
-                    body: 'full_reset=true'
-                })
-                .then(response => response.json())
-                .then(data => {
-                    // Return to the game options panel
-                    $('#gameOptions').show();
-                    $('#chessboard').hide();
-                    // Reset any other UI elements
-                    $('#status').text('');
-                });
-            });
-            
-            // Set up the Back button handler
-            $('#backBtn').on('click', function() {
-                $('#gameOptions').show();
-                $('#chessboard').hide();
-            });
-        });
-        
-        // Function to play as white
-        function playAsWhite() {
-            currentOrientation = 'white';
-            
-            // Initialize the board with the starting position
-            let config = {
-                draggable: true,
-                position: 'start',
-                orientation: 'white',
-                onDragStart: onDragStart,
-                onDrop: onDrop,
-                onSnapEnd: onSnapEnd
-            };
-            
-            board = ChessBoard('board', config);
-            
-            // Reset the server-side board
-            fetch('/reset', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: 'color=white'
-            })
-            .then(response => response.json())
-            .then(data => {
-                // Update the UI
-                board.position(data.fen);
-                $('#gameOptions').hide();
-                $('#chessboard').show();
-                $('#status').text('Your turn (White)');
-            });
-        }
-        
-        // Function to play as black
-        function playAsBlack() {
-            currentOrientation = 'black';
-            
-            // Initialize the board with the starting position
-            let config = {
-                draggable: true,
-                position: 'start',
-                orientation: 'black',
-                onDragStart: onDragStart,
-                onDrop: onDrop,
-                onSnapEnd: onSnapEnd
-            };
-            
-            board = ChessBoard('board', config);
-            
-            // Reset the server-side board and request Luna's first move
-            fetch('/reset', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: 'color=black'
-            })
-            .then(response => response.json())
-            .then(data => {
-                // Update the UI
-                board.position(data.fen);
-                $('#gameOptions').hide();
-                $('#chessboard').show();
-                $('#status').text('Your turn (Black)');
-            });
-        }
-        
-        // Function to handle drag start
-        function onDragStart(source, piece) {
-            // Only allow the current player to move their pieces
-            if ((currentOrientation === 'white' && piece.search(/^b/) !== -1) ||
-                (currentOrientation === 'black' && piece.search(/^w/) !== -1)) {
-                return false;
-            }
-            
-            // Don't allow moves if the game is over
-            if ($('#status').text().includes('Game over')) {
-                return false;
-            }
-        }
-        
-        // Function to handle piece drop (move)
-        function onDrop(source, target) {
-            // Check if the move is valid (client-side check)
-            if (source === target) return 'snapback';
-            
-            // Send the move to the server
-            fetch('/move', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: `move=${source}${target}`
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === 'error') {
-                    // Invalid move
-                    $('#status').text(data.message);
-                    return 'snapback';
-                } else if (data.status === 'gameover') {
-                    // Game is over
-                    board.position(data.fen);
-                    handleGameOver(data);
-                } else {
-                    // Valid move, update board with computer's response move
-                    board.position(data.fen);
-                    $('#status').text(`Luna played: ${data.move}`);
-                }
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                return 'snapback';
-            });
-        }
-        
-        function onSnapEnd() {
-            // This function is called when the piece snaps to its new position
-            // In this implementation, we don't need to update the board here
-            // because we update it in the response handler of the move request
-            
-            // However, we can use this to play a sound, update UI elements, etc.
-            
-            // The most important thing is that we DON'T reset the board orientation here
-            board.orientation(currentOrientation);
-        }
-        
-        // Function to handle game over
-        function handleGameOver(result) {
-            // Display game over message
-            $('#status').text(result.message);
-            
-            // Maintain board orientation instead of resetting it
-            board.orientation(currentOrientation);
-        }
-    </script>
+
+    <header class="site-header">
+        <button class="brand" id="brandButton" type="button" aria-label="Return to mission setup">
+            <span class="brand-mark" aria-hidden="true">
+                <span class="brand-crescent"></span>
+            </span>
+            <span>
+                <strong>LUNA</strong>
+                <small>Chess Observatory</small>
+            </span>
+        </button>
+        <div class="connection-pill" id="connectionPill" role="status">
+            <span class="signal-dot"></span>
+            <span id="connectionText">Connecting</span>
+        </div>
+    </header>
+
+    <main>
+        <section class="lobby view" id="lobbyView" aria-labelledby="lobbyTitle">
+            <div class="hero-copy">
+                <p class="eyebrow">Neural search · zero handcrafted evaluation</p>
+                <h1 id="lobbyTitle">Enter Luna’s<br><em>chess observatory.</em></h1>
+                <p class="hero-summary">
+                    Challenge a self-learning engine or watch two search trees collide.
+                    Every move is calculated live from the loaded neural checkpoint.
+                </p>
+                <div class="telemetry-row" aria-label="Engine status">
+                    <span><i class="telemetry-icon"></i> Model <strong id="modelStatus">verifying</strong></span>
+                    <span>Search <strong id="searchStatus">—</strong></span>
+                    <span>Session <strong>private</strong></span>
+                </div>
+            </div>
+
+            <form class="mission-panel glass" id="missionForm">
+                <div class="panel-heading">
+                    <span class="step-index">01</span>
+                    <div>
+                        <p class="eyebrow">Configure encounter</p>
+                        <h2>Choose your side</h2>
+                    </div>
+                </div>
+
+                <fieldset class="choice-grid color-choices">
+                    <legend class="sr-only">Your color</legend>
+                    <label class="choice-card">
+                        <input type="radio" name="color" value="white" checked>
+                        <span class="piece-avatar light-piece" aria-hidden="true">♘</span>
+                        <span><strong>White</strong><small>Make the first move</small></span>
+                        <i class="selection-ring"></i>
+                    </label>
+                    <label class="choice-card">
+                        <input type="radio" name="color" value="black">
+                        <span class="piece-avatar dark-piece" aria-hidden="true">♞</span>
+                        <span><strong>Black</strong><small>Let Luna open</small></span>
+                        <i class="selection-ring"></i>
+                    </label>
+                    <label class="choice-card">
+                        <input type="radio" name="color" value="random">
+                        <span class="piece-avatar split-piece" aria-hidden="true">♜</span>
+                        <span><strong>Eclipse</strong><small>Random assignment</small></span>
+                        <i class="selection-ring"></i>
+                    </label>
+                </fieldset>
+
+                <div class="strength-field">
+                    <label for="strengthSelect">
+                        <span>Search depth</span>
+                        <small id="strengthDescription">Loading available profiles…</small>
+                    </label>
+                    <div class="select-wrap">
+                        <select id="strengthSelect" name="strength" disabled>
+                            <option value="strong">Deep orbit</option>
+                        </select>
+                    </div>
+                </div>
+
+                <button class="primary-action" id="launchButton" type="submit" disabled>
+                    <span>Launch challenge</span>
+                    <span class="button-arrow" aria-hidden="true">↗</span>
+                </button>
+                <button class="secondary-action" id="spectateButton" type="button" disabled>
+                    <span class="pulse-icon" aria-hidden="true"></span>
+                    Observe Luna self-play
+                </button>
+                <p class="launch-note">Games live only in this browser session and expire automatically.</p>
+            </form>
+        </section>
+
+        <section class="game-view view" id="gameView" hidden aria-label="Luna chess game">
+            <div class="game-topline">
+                <div>
+                    <p class="eyebrow" id="modeEyebrow">Live encounter</p>
+                    <h1 id="gameTitle">You <span>vs</span> Luna</h1>
+                </div>
+                <button class="quiet-action" id="newMissionButton" type="button">
+                    <span aria-hidden="true">←</span> New mission
+                </button>
+            </div>
+
+            <div class="game-layout">
+                <aside class="game-sidebar left-sidebar">
+                    <section class="status-card glass" aria-labelledby="statusHeading">
+                        <div class="thinking-orb" id="thinkingOrb" aria-hidden="true">
+                            <span></span><i></i>
+                        </div>
+                        <div>
+                            <p class="eyebrow" id="statusHeading">Position status</p>
+                            <h2 id="turnStatus">Your turn</h2>
+                            <p id="statusDetail">White to move</p>
+                        </div>
+                    </section>
+
+                    <section class="evaluation-card glass" aria-labelledby="evaluationHeading">
+                        <div class="card-label">
+                            <span id="evaluationHeading">Neural evaluation</span>
+                            <strong id="evaluationValue">—</strong>
+                        </div>
+                        <div class="evaluation-track" role="meter" aria-valuemin="-1" aria-valuemax="1" aria-valuenow="0" aria-label="Evaluation from White's perspective">
+                            <span id="evaluationFill"></span>
+                            <i></i>
+                        </div>
+                        <div class="evaluation-scale"><span>Black</span><span>Equal</span><span>White</span></div>
+                        <dl class="search-metrics">
+                            <div><dt>Think time</dt><dd id="thinkTime">—</dd></div>
+                            <div><dt>Search</dt><dd id="simulationCount">—</dd></div>
+                            <div><dt>Top line</dt><dd id="confidenceValue">—</dd></div>
+                        </dl>
+                    </section>
+
+                    <section class="captures-card glass" aria-labelledby="capturesHeading">
+                        <div class="card-label"><span id="capturesHeading">Captured matter</span></div>
+                        <div class="capture-line"><span class="side-chip light">W</span><span id="whiteCaptures" class="captured-pieces">None</span></div>
+                        <div class="capture-line"><span class="side-chip dark">B</span><span id="blackCaptures" class="captured-pieces">None</span></div>
+                    </section>
+                </aside>
+
+                <section class="board-stage" aria-label="Chessboard area">
+                    <div class="player-ribbon opponent-ribbon">
+                        <span class="player-avatar" id="topAvatar">L</span>
+                        <span><strong id="topPlayer">Luna</strong><small id="topPlayerMeta">Neural engine</small></span>
+                        <span class="turn-lamp" id="topTurnLamp" aria-label="Not active"></span>
+                    </div>
+
+                    <div class="board-shell" id="boardShell">
+                        <div id="chessboard" class="chessboard" role="grid" aria-label="Interactive chessboard"></div>
+                        <div class="board-thinking" id="boardThinking" hidden aria-live="polite">
+                            <div class="search-radar" aria-hidden="true"><i></i><span></span></div>
+                            <strong>Luna is calculating</strong>
+                            <small>Exploring latent continuations…</small>
+                        </div>
+                    </div>
+
+                    <div class="player-ribbon human-ribbon">
+                        <span class="player-avatar human" id="bottomAvatar">Y</span>
+                        <span><strong id="bottomPlayer">You</strong><small id="bottomPlayerMeta">White pieces</small></span>
+                        <span class="turn-lamp" id="bottomTurnLamp" aria-label="Active turn"></span>
+                    </div>
+
+                    <div class="board-controls" aria-label="Game controls">
+                        <button type="button" id="undoButton" title="Undo your previous turn" aria-label="Undo your previous turn">
+                            <span aria-hidden="true">↶</span><span>Undo</span>
+                        </button>
+                        <button type="button" id="hintButton" title="Ask Luna to search this position" aria-label="Ask Luna to search this position">
+                            <span aria-hidden="true">✦</span><span>Hint</span>
+                        </button>
+                        <button type="button" id="flipButton" title="Rotate the board" aria-label="Rotate the board">
+                            <span aria-hidden="true">⇅</span><span>Flip</span>
+                        </button>
+                        <button type="button" id="soundButton" title="Toggle move sounds" aria-label="Toggle move sounds" aria-pressed="true">
+                            <span aria-hidden="true">♪</span><span>Sound</span>
+                        </button>
+                        <button type="button" id="stepButton" class="spectate-control" hidden aria-label="Calculate the next self-play move">
+                            <span aria-hidden="true">›</span><span>Next move</span>
+                        </button>
+                        <button type="button" id="autoplayButton" class="spectate-control" hidden aria-label="Start automatic self-play" aria-pressed="false">
+                            <span aria-hidden="true">▶</span><span>Auto</span>
+                        </button>
+                    </div>
+                </section>
+
+                <aside class="game-sidebar right-sidebar">
+                    <section class="history-card glass" aria-labelledby="historyHeading">
+                        <div class="card-label history-label">
+                            <span id="historyHeading">Mission log</span>
+                            <small id="moveCount">0 moves</small>
+                        </div>
+                        <div class="move-list" id="moveList" role="log" aria-live="polite">
+                            <div class="empty-log">
+                                <span aria-hidden="true">☾</span>
+                                <p>Your moves will appear here.</p>
+                            </div>
+                        </div>
+                    </section>
+                    <section class="hint-card glass" id="hintCard" hidden aria-live="polite">
+                        <button class="dismiss-hint" id="dismissHint" type="button" aria-label="Dismiss hint">×</button>
+                        <p class="eyebrow">Luna recommends</p>
+                        <div><strong id="hintSan">—</strong><span id="hintUci">—</span></div>
+                        <small id="hintMeta">Calculated from the current position</small>
+                    </section>
+                </aside>
+            </div>
+        </section>
+    </main>
+
+    <dialog class="promotion-dialog glass" id="promotionDialog" aria-labelledby="promotionTitle">
+        <form method="dialog">
+            <p class="eyebrow">Pawn reached the horizon</p>
+            <h2 id="promotionTitle">Choose a promotion</h2>
+            <div id="promotionChoices" class="promotion-choices"></div>
+            <button class="dialog-cancel" value="cancel">Cancel</button>
+        </form>
+    </dialog>
+
+    <div class="toast-stack" id="toastStack" aria-live="assertive" aria-atomic="true"></div>
+    <div class="sr-only" id="liveRegion" aria-live="polite"></div>
 </body>
 </html>

@@ -1,18 +1,29 @@
 """Luna-Chess EfficientZeroV2 training entry point."""
 
+import random
 import sys
 
+import numpy as np
+import torch
 import tyro
 from loguru import logger
 
 from luna.coach import Coach
 from luna.config import TrainCliConfig
-from luna.game import ChessGame as Game
+from luna.game.chess_game import ChessGame as Game
 from luna.network import LunaNetwork
 
 
 def main() -> int:
+    torch.set_float32_matmul_precision("medium")
+
     cfg = tyro.cli(TrainCliConfig)
+
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
 
     logger.remove()
     logger.add(sys.stderr, level=cfg.log_level.upper())
@@ -33,7 +44,7 @@ def main() -> int:
         )
         nnet.load_checkpoint(cfg.load_checkpoint_dir, cfg.load_checkpoint_file)
     else:
-        logger.warning("Not loading a checkpoint!")
+        logger.info("Starting a new run from randomly initialized weights.")
 
     run_cfg = cfg.to_training_run()
     if run_cfg.profile:

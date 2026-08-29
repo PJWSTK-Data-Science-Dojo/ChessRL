@@ -1,37 +1,32 @@
-version: '3.8'
-
 services:
-  luna-chess-web:
+  luna-web:
     build:
       context: .
       dockerfile: Dockerfile.web
-    container_name: luna-chess-web
+    init: true
     ports:
-      - "5000:5000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-5000}:5000"
     environment:
-      - HOST=0.0.0.0
-      - PORT=5000
-      - DEVICE=cpu  # Change to 'cuda' if GPU available
-      - MCTS_SIMS=50
-      - CHECKPOINT_DIR=/app/temp/
-      - CHECKPOINT_FILE=best.pth.tar
-      - VERBOSE=true
-      - LOG_LEVEL=INFO
+      HOST: 0.0.0.0
+      PORT: 5000
+      DEVICE: "${DEVICE:-cpu}"
+      CHECKPOINT_PATH: /app/temp/latest.pth.tar
+      SEARCH_SIMULATIONS: "${SEARCH_SIMULATIONS:-96}"
+      COMPILE_INFERENCE: "${COMPILE_INFERENCE:-false}"
+      LUNA_WEB_SECRET: "${LUNA_WEB_SECRET:?Set LUNA_WEB_SECRET in .env}"
+      SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-true}"
+      THREADS: "${THREADS:-4}"
+      TIMEOUT: "${TIMEOUT:-180}"
+      GRACEFUL_TIMEOUT: "${GRACEFUL_TIMEOUT:-30}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
     volumes:
-      - ./temp:/app/temp:ro  # Mount checkpoint directory (read-only)
-      - ./src/static:/app/src/static:ro  # Mount static files
+      - ./temp:/app/temp:ro
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/model_info"]
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:5000/api/v1/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
-    # Uncomment for GPU support
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+      start_period: 120s

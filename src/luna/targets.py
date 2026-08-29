@@ -11,13 +11,13 @@ def compute_target_value(
     trajectory: Trajectory,
     pos_idx: int,
     td_steps: int,
-    discount: float = 0.997,
+    discount: float = 1.0,
     *,
     root_value_override: dict[int, float] | None = None,
 ) -> float:
     """Compute n-step TD target values with alternating signs for two-player games.
 
-    Formula: V_t = r_t + γ r_{t+1} + γ² r_{t+2} + ... + γⁿ V_{t+n}
+    Formula: V_t = r_t + gamma r_{t+1} + gamma^2 r_{t+2} + ... + gamma^n V_{t+n}
 
     Two-player adjustment: Rewards alternate signs based on player perspective.
 
@@ -25,14 +25,16 @@ def compute_target_value(
         trajectory: Game trajectory containing rewards and root values.
         pos_idx: Position index in trajectory to compute target for.
         td_steps: Bootstrap horizon n (how many steps to look ahead).
-        discount: Discount factor γ ∈ (0, 1].
-        root_value_override: Optional dict mapping position indices to fresh MCTS values
-            (for reanalysis-based search value).
+        discount: Discount factor in ``(0, 1]``.
+        root_value_override: Optional direct search-value targets keyed by position.
+            When the current position is present, its fresh SVE target replaces TD.
 
     Returns:
         n-step value target with shape matching rewards.
     """
     game_len = trajectory.game_length
+    if root_value_override is not None and pos_idx in root_value_override:
+        return float(root_value_override[pos_idx])
     bootstrap_idx = pos_idx + td_steps
 
     end = min(bootstrap_idx, game_len)
@@ -62,7 +64,7 @@ def build_unroll_targets(
     pos_idx: int,
     unroll_steps: int,
     td_steps: int,
-    discount: float = 0.997,
+    discount: float = 1.0,
     *,
     root_value_override: dict[int, float] | None = None,
     policy_override: dict[int, np.ndarray] | None = None,
@@ -79,6 +81,8 @@ def build_unroll_targets(
         valid_mask: legal-action mask at pos_idx
         valid_masks_unroll: legal masks aligned with observations_unroll / policy rows
         unroll_mask: (unroll_steps,) float mask -- 1.0 for real steps, 0.0 for padding
+        consistency_mask: (unroll_steps,) float mask -- 1.0 only when the real
+            next observation exists (terminal observations are not stored)
         value_mask: (unroll_steps + 1,) float mask -- 1.0 for real value targets
     """
     game_len = trajectory.game_length
@@ -90,6 +94,7 @@ def build_unroll_targets(
     valid_masks_unroll: list[np.ndarray] = []
     actions: list[int] = []
     unroll_mask: list[float] = []
+    consistency_mask: list[float] = []
     value_mask: list[float] = []
 
     for step in range(unroll_steps + 1):
@@ -114,10 +119,12 @@ def build_unroll_targets(
                 actions.append(int(trajectory.actions[idx]))
                 target_rewards.append(float(trajectory.rewards[idx]))
                 unroll_mask.append(1.0)
+                consistency_mask.append(float(idx + 1 < game_len))
             else:
                 actions.append(0)
                 target_rewards.append(0.0)
                 unroll_mask.append(0.0)
+                consistency_mask.append(0.0)
 
         if idx < game_len:
             if policy_override is not None and idx in policy_override:
@@ -145,6 +152,7 @@ def build_unroll_targets(
         "valid_masks_unroll": valid_masks_unroll,
         "actions": actions,
         "unroll_mask": unroll_mask,
+        "consistency_mask": consistency_mask,
         "value_mask": value_mask,
     }
 
@@ -161,20 +169,17 @@ def collate_batch(
 
     target_values = np.array([t["target_values"] for t in batch_targets], dtype=np.float32)
     target_rewards = np.array([t["target_rewards"] for t in batch_targets], dtype=np.float32)
-    observations_unroll = np.stack(
-        [np.stack(t["observations_unroll"]) for t in batch_targets]
-    ).astype(np.float32)
+    observations_unroll = np.stack([np.stack(t["observations_unroll"]) for t in batch_targets]).astype(np.float32)
 
     policies_list = [np.stack(t["target_policies"]) for t in batch_targets]
     target_policies = np.stack(policies_list).astype(np.float32)
     assert target_policies.shape == (B, K + 1, target_policies.shape[2])
 
-    valid_masks_unroll = np.stack([np.stack(t["valid_masks_unroll"]) for t in batch_targets]).astype(
-        np.float32
-    )
+    valid_masks_unroll = np.stack([np.stack(t["valid_masks_unroll"]) for t in batch_targets]).astype(np.float32)
 
     actions = np.array([t["actions"] for t in batch_targets], dtype=np.int64)
     unroll_mask = np.array([t["unroll_mask"] for t in batch_targets], dtype=np.float32)
+    consistency_mask = np.array([t["consistency_mask"] for t in batch_targets], dtype=np.float32)
     value_mask = np.array([t["value_mask"] for t in batch_targets], dtype=np.float32)
 
     return {
@@ -187,5 +192,6 @@ def collate_batch(
         "valid_masks_unroll": valid_masks_unroll,
         "actions": actions,
         "unroll_mask": unroll_mask,
+        "consistency_mask": consistency_mask,
         "value_mask": value_mask,
     }

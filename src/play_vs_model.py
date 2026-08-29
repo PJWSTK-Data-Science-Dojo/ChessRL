@@ -1,7 +1,7 @@
 """Play chess against a trained Luna model via command-line interface.
 
 Usage:
-    uv run python src/play_vs_model.py --checkpoint ./temp/best.pth.tar --device cpu --mcts-sims 25
+    uv run python src/play_vs_model.py --checkpoint ./temp/latest.pth.tar --device cpu --mcts-sims 25
 """
 
 import sys
@@ -11,8 +11,8 @@ import chess
 import tyro
 from loguru import logger
 
-from luna.config import EzV2LearnerConfig, MCTSParams
-from luna.game.chess_game import ChessGame, action_to_move, mirror_move
+from luna.config import MCTSParams
+from luna.game.chess_game import ChessGame
 from luna.mcts import MCTS
 from luna.network import LunaNetwork
 
@@ -21,7 +21,7 @@ from luna.network import LunaNetwork
 class PlayConfig:
     """Configuration for playing against the model."""
 
-    checkpoint: str = "./temp/best.pth.tar"
+    checkpoint: str = "./temp/latest.pth.tar"
     """Path to model checkpoint"""
 
     device: str = "cpu"
@@ -99,7 +99,7 @@ def play_game(
     """Play one game and return result from human's perspective.
 
     Returns:
-        1.0 if human wins, -1.0 if model wins, small value for draw
+        1.0 if human wins, -1.0 if model wins, or 0.0 for a draw
     """
     board = game_obj.get_init_board()
     move_count = 0
@@ -119,21 +119,21 @@ def play_game(
         human_player = 1 if human_is_white else -1
 
         # Check if game is over
-        result = game_obj.get_game_ended(board, current_player)
-        if abs(result) > 1e-8:
+        outcome = game_obj.get_game_outcome(board, current_player)
+        if outcome is not None:
             print_board(board, human_is_white)
-            if result > 0:
-                winner = "White" if board.turn == chess.WHITE else "Black"
+            terminal = board.outcome(claim_draw=True)
+            assert terminal is not None
+            if terminal.winner is not None:
+                winner = "White" if terminal.winner == chess.WHITE else "Black"
                 print(f"\nGame over! {winner} wins!")
-                if current_player == human_player:
+                if terminal.winner == human_is_white:
                     print("Congratulations! You won!")
                     return 1.0
-                else:
-                    print("Model wins. Better luck next time!")
-                    return -1.0
-            else:
-                print("\nGame over! Draw.")
-                return 0.0
+                print("Model wins. Better luck next time!")
+                return -1.0
+            print("\nGame over! Draw.")
+            return 0.0
 
         if current_player == human_player:
             # Human's turn
@@ -148,29 +148,17 @@ def play_game(
             canonical_board = game_obj.get_canonical_form(board, current_player)
 
             # Run MCTS to get best move
-            policy, _value = model_mcts.search_latent(canonical_board, temp=0.0)
-            action = int(max(range(len(policy)), key=lambda a: policy[a]))
+            model_mcts.search_latent(
+                canonical_board,
+                temp=0.0,
+                add_exploration_noise=False,
+            )
+            if model_mcts.last_action is None:
+                raise RuntimeError("Search returned no legal continuation")
+            action = model_mcts.last_action
 
-            # Convert action index directly to chess move
-            # This is more reliable than comparing board states
-            move = action_to_move(action)
-            if not board.turn:  # Black to move - need to unmirror
-                move = mirror_move(move)
-
-            # Verify move is legal (should always be true with legal masking)
-            if move not in board.legal_moves:
-                # This shouldn't happen with legal masking, but be defensive
-                logger.warning(f"Model selected illegal move {move.uci()}, picking best legal alternative")
-                # Pick the legal move with highest policy probability
-                legal_actions = [a for a, p in enumerate(policy) if policy[a] > 0]
-                if legal_actions:
-                    action = max(legal_actions, key=lambda a: policy[a])
-                    move = action_to_move(action)
-                    if not board.turn:
-                        move = mirror_move(move)
-                else:
-                    # Last resort
-                    move = list(board.legal_moves)[0]
+            next_board, _ = game_obj.get_next_state(board, current_player, action)
+            move = next_board.peek()
 
             print(f"Model plays: {move.uci()}")
 
@@ -189,20 +177,19 @@ def main() -> int:
     logger.info("Loading chess game...")
     game = ChessGame()
 
-    # Configure learner for inference only
-    learner_cfg = EzV2LearnerConfig(
-        device=cfg.device,
-        compile_inference=False,  # Disable compile for inference
-    )
-
     # Load network
     logger.info(f"Loading model from {cfg.checkpoint} on device {cfg.device}...")
-    nnet = LunaNetwork(game, learner_cfg)
     try:
-        nnet.load_checkpoint(folder="", filename=cfg.checkpoint)
+        nnet = LunaNetwork.from_checkpoint(
+            game,
+            cfg.checkpoint,
+            device=cfg.device,
+            compile_inference=False,
+            load_optimizer=False,
+        )
         logger.info("Model loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load checkpoint: {e}")
+    except Exception as exc:
+        logger.error("Failed to load checkpoint: {}", exc)
         logger.error("Make sure the checkpoint path is correct and was trained with a compatible version")
         return 1
 

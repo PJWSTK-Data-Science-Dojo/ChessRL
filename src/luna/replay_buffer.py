@@ -1,7 +1,8 @@
 """Prioritized trajectory replay buffer for EfficientZeroV2 training.
 
-Trajectories are stored as contiguous numpy arrays for cache-friendly access
-and zero-copy slicing during training.
+Large, dense fields use compact storage and are expanded to float32 only while
+collating a sampled batch. This keeps a long self-play window practical without
+changing the learner's numerical precision.
 """
 
 import numpy as np
@@ -21,13 +22,38 @@ class Trajectory:
         root_values: list[float] | np.ndarray,
         valids: list[np.ndarray] | np.ndarray,
     ) -> None:
-        self.observations = np.ascontiguousarray(observations, dtype=np.float32)
-        self.actions = np.asarray(actions, dtype=np.int64)
-        self.rewards = np.asarray(rewards, dtype=np.float32)
-        self.root_policies = np.ascontiguousarray(root_policies, dtype=np.float32)
-        self.root_values = np.asarray(root_values, dtype=np.float32)
-        self.valids = np.ascontiguousarray(valids, dtype=np.float32)
-        self.game_length = int(self.actions.shape[0])
+        observations_array = np.ascontiguousarray(observations, dtype=np.float16)
+        actions_array = np.asarray(actions, dtype=np.int64)
+        rewards_array = np.asarray(rewards, dtype=np.float32)
+        policies_array = np.ascontiguousarray(root_policies, dtype=np.float16)
+        values_array = np.asarray(root_values, dtype=np.float32)
+        valids_array = np.ascontiguousarray(valids, dtype=np.bool_)
+
+        if actions_array.ndim != 1 or actions_array.size == 0:
+            raise ValueError("A trajectory must contain at least one one-dimensional action sequence")
+        game_length = int(actions_array.shape[0])
+        named_lengths = {
+            "observations": len(observations_array),
+            "rewards": len(rewards_array),
+            "root_policies": len(policies_array),
+            "root_values": len(values_array),
+            "valids": len(valids_array),
+        }
+        mismatched = {name: length for name, length in named_lengths.items() if length != game_length}
+        if mismatched:
+            raise ValueError(f"Trajectory fields must all have length {game_length}; got {mismatched}")
+        if policies_array.ndim != 2 or valids_array.ndim != 2 or policies_array.shape != valids_array.shape:
+            raise ValueError("root_policies and valids must be matching two-dimensional arrays")
+        if not np.isfinite(rewards_array).all() or not np.isfinite(values_array).all():
+            raise ValueError("Trajectory rewards and root values must be finite")
+
+        self.observations = observations_array
+        self.actions = actions_array
+        self.rewards = rewards_array
+        self.root_policies = policies_array
+        self.root_values = values_array
+        self.valids = valids_array
+        self.game_length = game_length
 
 
 class _SumTree:
@@ -80,6 +106,14 @@ class PrioritizedReplayBuffer:
     """Stores full game trajectories with per-position priority."""
 
     def __init__(self, capacity: int, alpha: float = 0.6, beta: float = 0.4, beta_increment: float = 6e-6) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("alpha must be between 0 and 1")
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError("beta must be between 0 and 1")
+        if beta_increment < 0.0:
+            raise ValueError("beta_increment cannot be negative")
         self.capacity = capacity
         self.alpha = alpha
         self.beta = beta
@@ -105,7 +139,12 @@ class PrioritizedReplayBuffer:
             weights: importance-sampling weights (batch_size,)
             indices: tree data indices for priority updates
         """
-        assert unroll_steps >= 0
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if unroll_steps < 0:
+            raise ValueError("unroll_steps cannot be negative")
+        if self.size == 0:
+            raise ValueError("Cannot sample an empty replay buffer")
         self.beta = min(1.0, self.beta + self.beta_increment)
 
         batch: list[tuple[Trajectory, int]] = []
@@ -113,6 +152,8 @@ class PrioritizedReplayBuffer:
         priorities = np.zeros(batch_size, dtype=np.float64)
 
         total = self._tree.total()
+        if not np.isfinite(total) or total <= 0.0:
+            raise RuntimeError("Replay priorities must have a positive finite sum")
         segment = total / batch_size
 
         for i in range(batch_size):
@@ -136,7 +177,14 @@ class PrioritizedReplayBuffer:
 
     def update_priorities(self, indices: list[int], td_errors: np.ndarray) -> None:
         """Update priorities based on absolute TD errors."""
+        if len(indices) != len(td_errors):
+            raise ValueError("indices and td_errors must have the same length")
         for idx, err in zip(indices, td_errors):
-            priority = (abs(float(err)) + 1e-6) ** self.alpha
-            self._max_priority = max(self._max_priority, priority)
+            if not 0 <= idx < self.capacity:
+                raise IndexError(f"Replay index out of range: {idx}")
+            if not np.isfinite(err):
+                raise ValueError("TD errors must be finite")
+            raw_priority = abs(float(err)) + 1e-6
+            priority = raw_priority**self.alpha
+            self._max_priority = max(self._max_priority, raw_priority)
             self._tree.update(idx, priority)

@@ -1,12 +1,14 @@
 [project]
 name = "chessrl"
-version = "0.2.0"
-description = "EfficientZeroV2-based chess engine trained via self-play"
+version = "0.3.0"
+description = "Model-based reinforcement-learning chess engine with Gumbel MuZero search"
+readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "numpy>=1.24,<3.0",
-    "torch>=2.0,<2.6",
+    "torch>=2.5,<2.14",
     "python-chess>=1.9.0",
+    "PyYAML>=6.0",
     "flask>=3.0.0",
     "loguru>=0.7.0",
     "tyro>=0.8.0",
@@ -22,10 +24,18 @@ dev = [
     "ruff",
     "mypy",
     "pytest",
+    "types-PyYAML",
 ]
 perf = [
     "numba",
 ]
+web = [
+    "gunicorn>=23,<24",
+]
+
+[project.scripts]
+luna-lichess-config = "luna.lichess_config:main"
+luna-uci = "luna.uci:main"
 
 [tool.ruff]
 target-version = "py312"

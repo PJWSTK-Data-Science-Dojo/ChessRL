@@ -1,12 +1,15 @@
 """EfficientZeroV2 Coach: self-play -> replay buffer -> unroll training loop.
 
 Self-play uses a sliding pool of up to ``parallel_games`` episodes with
-:class:`~luna.mcts.BatchedMCTS`, refilling finished games so recurrent inference
-stays batched. Arena pits batch up to ``arena_parallel_games`` games per ply.
+:class:`~luna.mcts.BatchedMCTS`. Training publishes every completed iteration;
+periodic Stockfish matches provide an external, fixed-opponent benchmark.
 """
 
+import json
 import os
+import shutil
 import time
+from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
 
@@ -19,20 +22,22 @@ try:
 except ImportError:
     wandb = None  # type: ignore
 
-from .config import MCTSParams, TrainingRunConfig
-from .game.chess_game import DRAW_VALUE, ChessGame
+from .config import TrainingRunConfig
+from .game.chess_game import ChessGame
+from .game.stockfish_eval import StockfishEvalOutcome, StockfishEvalScores, StockfishEvalSkipped
 from .mcts import MCTS, BatchedMCTS
 from .network import LunaNetwork
 from .profiling import IterProfileStats, SelfPlayMCTSTimings, write_iter_summaries_json
 from .replay_buffer import PrioritizedReplayBuffer, Trajectory
 
+_BEST_EVAL_NAME = "best_eval.json"
+
 
 class Coach:
-    """Orchestrates EZV2 self-play data collection, replay storage, and learning."""
+    """Orchestrates EZV2 self-play, replay storage, and unroll learning."""
 
     game: ChessGame
     nnet: LunaNetwork
-    pnet: LunaNetwork
     run: TrainingRunConfig
     replay: PrioritizedReplayBuffer
 
@@ -45,7 +50,6 @@ class Coach:
     ) -> None:
         self.game = game
         self.nnet = nnet
-        self.pnet = nnet.__class__(game, nnet._learner)
         self.run = run
         self.replay = PrioritizedReplayBuffer(
             capacity=run.replay_capacity,
@@ -74,7 +78,7 @@ class Coach:
             logger.warning("WandB project specified but wandb not installed. Install with: uv add wandb")
 
     # ------------------------------------------------------------------
-    # Single-game self-play (fallback / arena)
+    # Single-game self-play fallback
     # ------------------------------------------------------------------
     def execute_episode(self) -> Trajectory:
         """Run one self-play game using latent MCTS, collecting a full trajectory."""
@@ -93,9 +97,15 @@ class Coach:
         while True:
             episode_step += 1
             canonical_board = self.game.get_canonical_form(board, current_player)
-            temp = 1.0 if episode_step < self.run.temp_threshold else 0.0
+            explore = episode_step < self.run.temp_threshold
 
-            pi, root_v = mcts.search_latent(canonical_board)
+            # Store the untempered visit distribution as the policy target.
+            # Temperature affects only which action is played.
+            pi, root_v = mcts.search_latent(
+                canonical_board,
+                temp=1.0,
+                add_exploration_noise=explore,
+            )
 
             obs = self.game.to_array(canonical_board)
             valid = self.game.get_valid_moves(canonical_board, 1)
@@ -105,23 +115,37 @@ class Coach:
             root_values.append(root_v)
             valids_list.append(valid)
 
-            if temp == 0:
-                action = int(np.argmax(pi))
-            else:
+            if self.run.search_mode == "gumbel":
+                if mcts.last_action is None:
+                    raise RuntimeError("Gumbel search did not propose an action")
+                action = mcts.last_action
+            elif explore:
                 action = int(np.random.choice(len(pi), p=pi))
+            else:
+                action = int(np.argmax(pi))
 
             board, current_player = self.game.get_next_state(board, current_player, action)
             actions.append(action)
 
-            r = self.game.get_game_ended(board, current_player)
-            if abs(r) > 1e-8:
+            outcome = self.game.get_game_outcome(board, current_player)
+            if outcome is not None:
                 return self._trajectory_with_terminal_rewards(
-                    observations, actions, root_policies, root_values, valids_list, terminal_r=r,
+                    observations,
+                    actions,
+                    root_policies,
+                    root_values,
+                    valids_list,
+                    terminal_value_for_next_player=outcome,
                 )
 
             if self.run.max_ply is not None and episode_step >= self.run.max_ply:
                 return self._trajectory_with_terminal_rewards(
-                    observations, actions, root_policies, root_values, valids_list, terminal_r=DRAW_VALUE,
+                    observations,
+                    actions,
+                    root_policies,
+                    root_values,
+                    valids_list,
+                    terminal_value_for_next_player=0.0,
                 )
 
     # ------------------------------------------------------------------
@@ -197,27 +221,19 @@ class Coach:
                     self._profile_sp_env_s += time.perf_counter() - _t_env0
                 break
 
-            temps = [
-                1.0 if steps[i] + 1 < self.run.temp_threshold else 0.0
-                for i in active_indices
-            ]
+            explore = [steps[i] + 1 < self.run.temp_threshold for i in active_indices]
 
             if self.run.profile:
                 _t_env1 = time.perf_counter()
                 self._profile_sp_env_s += _t_env1 - _t_env0
 
-            temp_groups: dict[float, list[int]] = {}
-            for j, idx in enumerate(active_indices):
-                temp_groups.setdefault(temps[j], []).append(idx)
-
-            results_by_idx: dict[int, tuple[np.ndarray, float, np.ndarray, np.ndarray]] = {}
-            for temp_key, idxs in temp_groups.items():
-                canonical_boards = [
-                    self.game.get_canonical_form(boards[i], players[i]) for i in idxs
-                ]
-                batch_out = bmcts.search_batch(canonical_boards, temp=temp_key)
-                for local_j, game_i in enumerate(idxs):
-                    results_by_idx[game_i] = batch_out[local_j]
+            canonical_boards = [self.game.get_canonical_form(boards[i], players[i]) for i in active_indices]
+            batch_out = bmcts.search_batch(
+                canonical_boards,
+                temp=1.0,
+                add_exploration_noise=explore,
+            )
+            results_by_idx = dict(zip(active_indices, batch_out))
 
             if self.run.profile:
                 _t_env2 = time.perf_counter()
@@ -231,25 +247,29 @@ class Coach:
                 value_lists[idx].append(root_v)
                 valid_lists[idx].append(valid_row)
 
-                t = temps[j]
-                if t == 0:
-                    action = int(np.argmax(pi))
-                else:
+                if self.run.search_mode == "gumbel":
+                    proposed_action = bmcts.last_actions[j]
+                    if proposed_action is None:
+                        raise RuntimeError("Batched Gumbel search did not propose an action")
+                    action = proposed_action
+                elif explore[j]:
                     action = int(np.random.choice(len(pi), p=pi))
+                else:
+                    action = int(np.argmax(pi))
 
                 boards[idx], players[idx] = self.game.get_next_state(boards[idx], players[idx], action)
                 action_lists[idx].append(action)
 
-                r = self.game.get_game_ended(boards[idx], players[idx])
-                if abs(r) > 1e-8:
-                    terminal_rewards[idx] = r
+                outcome = self.game.get_game_outcome(boards[idx], players[idx])
+                if outcome is not None:
+                    terminal_rewards[idx] = outcome
                     traj = self._trajectory_with_terminal_rewards(
                         obs_lists[idx],
                         action_lists[idx],
                         policy_lists[idx],
                         value_lists[idx],
                         valid_lists[idx],
-                        terminal_r=terminal_rewards[idx],
+                        terminal_value_for_next_player=terminal_rewards[idx],
                     )
                     if len(completed) < num_episodes:
                         completed.append(traj)
@@ -259,14 +279,14 @@ class Coach:
                     else:
                         reset_slot(idx)
                 elif self.run.max_ply is not None and steps[idx] >= self.run.max_ply:
-                    terminal_rewards[idx] = DRAW_VALUE
+                    terminal_rewards[idx] = 0.0
                     traj = self._trajectory_with_terminal_rewards(
                         obs_lists[idx],
                         action_lists[idx],
                         policy_lists[idx],
                         value_lists[idx],
                         valid_lists[idx],
-                        terminal_r=terminal_rewards[idx],
+                        terminal_value_for_next_player=terminal_rewards[idx],
                     )
                     if len(completed) < num_episodes:
                         completed.append(traj)
@@ -281,74 +301,6 @@ class Coach:
 
         return completed
 
-    @staticmethod
-    def _arena_mcts_params(run: TrainingRunConfig) -> MCTSParams:
-        sims = run.arena_num_mcts_sims if run.arena_num_mcts_sims is not None else run.num_mcts_sims
-        return MCTSParams(
-            num_mcts_sims=sims,
-            cpuct=run.cpuct,
-            dir_noise=False,
-            dir_alpha=run.dir_alpha,
-            discount=run.discount,
-            recurrent_policy_topk=run.recurrent_policy_topk,
-        )
-
-    def _play_arena_games_batched(
-        self,
-        white: LunaNetwork,
-        black: LunaNetwork,
-        mcts_params: MCTSParams,
-        num_games: int,
-    ) -> list[float]:
-        """Pit current vs previous model with parallel game execution.
-
-        Runs num_games head-to-head matches with batched inference for speed.
-        Each model plays both colors to reduce variance.
-
-        Args:
-            white: Network playing white pieces.
-            black: Network playing black pieces.
-            mcts_params: MCTS search parameters for both players.
-            num_games: Number of parallel games to play.
-
-        Returns:
-            List of game results from white's perspective (1.0 = win, 0.0 = loss, 0.5 = draw).
-        """
-        game = self.game
-        max_ply = self.run.max_ply
-        white_bm = BatchedMCTS(game, white, mcts_params)
-        black_bm = BatchedMCTS(game, black, mcts_params)
-
-        boards = [game.get_init_board() for _ in range(num_games)]
-        players = [1] * num_games
-        steps = [0] * num_games
-        done = [False] * num_games
-        results = [0.0] * num_games
-
-        while not all(done):
-            active = [i for i in range(num_games) if not done[i]]
-            p_side = players[active[0]]
-            for i in active:
-                if players[i] != p_side:
-                    raise RuntimeError("internal: arena batch games desynchronized")
-            bm = white_bm if p_side == 1 else black_bm
-            canonicals = [game.get_canonical_form(boards[i], players[i]) for i in active]
-            batch_res = bm.search_batch(canonicals, temp=0.0)
-            for j, idx in enumerate(active):
-                pi, _rv, _obs, _valid = batch_res[j]
-                action = int(np.argmax(pi))
-                steps[idx] += 1
-                boards[idx], players[idx] = game.get_next_state(boards[idx], players[idx], action)
-                r = game.get_game_ended(boards[idx], players[idx])
-                if abs(r) > 1e-8:
-                    results[idx] = float(players[idx] * r)
-                    done[idx] = True
-                elif max_ply is not None and steps[idx] >= max_ply:
-                    results[idx] = 0.0
-                    done[idx] = True
-
-        return results
-
     def _trajectory_with_terminal_rewards(
         self,
         observations: list[np.ndarray],
@@ -356,13 +308,13 @@ class Coach:
         root_policies: list[np.ndarray],
         root_values: list[float],
         valids_list: list[np.ndarray],
-        terminal_r: float,
+        terminal_value_for_next_player: float,
     ) -> Trajectory:
         game_len = len(actions)
         rewards = [0.0] * game_len
-        # Terminal reward is already from the correct player's perspective
-        # (ChessGame.get_terminal_r returns +1 for winner, -1 for loser)
-        rewards[-1] = float(terminal_r)
+        # Transition rewards use the acting (parent) player's perspective. The
+        # terminal environment value is for the next player, hence the sign flip.
+        rewards[-1] = -float(terminal_value_for_next_player)
         return Trajectory(
             observations=observations,
             actions=actions,
@@ -381,7 +333,6 @@ class Coach:
         total_train_steps = self.run.num_iters * train_steps_per_iter
 
         self.nnet.warmup_mcts_inference(self.game)
-        self.pnet.warmup_mcts_inference(self.game)
 
         profile_rows: list[IterProfileStats] = []
         if self.run.profile:
@@ -396,8 +347,18 @@ class Coach:
                 self.run.profile_with_stack,
             )
 
-        steps_completed = 0
-        for i in range(1, self.run.num_iters + 1):
+        start_iteration = self.nnet._trainer_iteration + 1
+        if start_iteration > self.run.num_iters:
+            logger.info(
+                "Checkpoint is already at iteration {}; requested total is {}. Nothing to train.",
+                self.nnet._trainer_iteration,
+                self.run.num_iters,
+            )
+            return
+        if start_iteration > 1:
+            logger.info("Resuming training at iteration {} of {}", start_iteration, self.run.num_iters)
+
+        for i in range(start_iteration, self.run.num_iters + 1):
             logger.info("Starting Iter #{} ...", i)
             iter_t0 = time.perf_counter()
             stats = IterProfileStats(iter_index=i)
@@ -421,18 +382,14 @@ class Coach:
                 self.replay.save_trajectory(traj)
             stats.replay_save_s = time.perf_counter() - t0
 
-            if self.replay.size < self.run.batch_size:
+            learner_batch_size = self.nnet._learner.batch_size
+            if self.replay.size < learner_batch_size:
                 logger.warning("Replay buffer too small ({}), skipping training.", self.replay.size)
                 if self.run.profile:
                     stats.total_s = time.perf_counter() - iter_t0
                     profile_rows.append(stats)
                     logger.info("\n{}\n", stats.to_log_lines())
                 continue
-
-            t0 = time.perf_counter()
-            self.nnet.save_checkpoint(folder=self.run.checkpoint, filename="temp.pth.tar")
-            self.pnet.load_checkpoint(folder=self.run.checkpoint, filename="temp.pth.tar")
-            stats.checkpoint_io_s = time.perf_counter() - t0
 
             do_kineto = (
                 self.run.profile
@@ -456,7 +413,6 @@ class Coach:
                 self.replay,
                 steps=train_steps_per_iter,
                 total_train_steps=total_train_steps,
-                start_step=steps_completed,
                 discount=self.run.discount,
                 mcts_for_reanalyze=self.run,
                 torch_profile_steps=self.run.profile_torch_steps if do_kineto else 0,
@@ -467,76 +423,25 @@ class Coach:
                 torch_profile_with_stack=self.run.profile_with_stack,
             )
             stats.train_s = time.perf_counter() - t0
-            steps_completed += train_steps_per_iter
             logger.info("Training done: {}", loss_info)
 
-            logger.info("PITTING AGAINST PREVIOUS VERSION")
-            arena_params = self._arena_mcts_params(self.run)
-            batch_cap = max(1, self.run.arena_parallel_games)
-
-            num_arena_pits = max(1, int(self.run.arena_compare / 2))
-            nwins = 0
-            pwins = 0
-            draws = 0
-
-            t_arena0 = time.perf_counter()
-            with tqdm(total=num_arena_pits * 2, desc="Arena (batched)") as aprog:
-                remaining = num_arena_pits
-                while remaining > 0:
-                    b = min(batch_cap, remaining)
-                    for result in self._play_arena_games_batched(self.pnet, self.nnet, arena_params, b):
-                        if result > 0.5:
-                            pwins += 1
-                        elif result < -0.5:
-                            nwins += 1
-                        else:
-                            draws += 1
-                        aprog.update(1)
-                    remaining -= b
-
-                remaining = num_arena_pits
-                while remaining > 0:
-                    b = min(batch_cap, remaining)
-                    for result in self._play_arena_games_batched(self.nnet, self.pnet, arena_params, b):
-                        if result > 0.5:
-                            nwins += 1
-                        elif result < -0.5:
-                            pwins += 1
-                        else:
-                            draws += 1
-                        aprog.update(1)
-                    remaining -= b
-            stats.arena_s = time.perf_counter() - t_arena0
-
-            logger.info("NEW/PREV WINS: {} / {} ; DRAWS: {}", nwins, pwins, draws)
-
-            # Log iteration metrics to WandB
             if wandb is not None and wandb.run is not None:
-                total_games = nwins + pwins + draws
-                win_rate = nwins / total_games if total_games > 0 else 0.0
-                wandb.log({
-                    "arena/new_wins": nwins,
-                    "arena/prev_wins": pwins,
-                    "arena/draws": draws,
-                    "arena/win_rate": win_rate,
-                    "arena/total_games": total_games,
-                    "iteration": i,
-                    "replay_buffer_size": self.replay.size,
-                })
+                wandb.log(
+                    {
+                        "iteration": i,
+                        "replay_buffer_size": self.replay.size,
+                    }
+                )
 
             t0 = time.perf_counter()
-            if self.run.save_anyway:
-                logger.warning("save_anyway=True, accepting new model unconditionally.")
-                self._accept_model(i)
-            else:
-                total_decisive = pwins + nwins
-                if total_decisive == 0 or float(nwins) / total_decisive < self.run.update_threshold:
-                    logger.info("REJECTING NEW MODEL")
-                    self.nnet.load_checkpoint(folder=self.run.checkpoint, filename="temp.pth.tar")
-                else:
-                    logger.info("ACCEPTING NEW MODEL")
-                    self._accept_model(i)
-            stats.accept_s = time.perf_counter() - t0
+            self._publish_checkpoint(i)
+            stats.checkpoint_publish_s = time.perf_counter() - t0
+
+            if self.run.stockfish_eval_every > 0 and i % self.run.stockfish_eval_every == 0:
+                from .game.stockfish_eval import run_stockfish_eval
+
+                sf_outcome = run_stockfish_eval(self.game, self.nnet, self.run, iteration=i)
+                self._update_best_from_stockfish(i, sf_outcome)
 
             stats.total_s = time.perf_counter() - iter_t0
             if self.run.profile:
@@ -548,6 +453,94 @@ class Coach:
             write_iter_summaries_json(str(summary_path), profile_rows)
             logger.info("Wrote aggregated phase timings to {}", summary_path.resolve())
 
-    def _accept_model(self, iteration: int) -> None:
-        self.nnet.save_checkpoint(folder=self.run.checkpoint, filename=f"checkpoint_{iteration}.pth.tar")
-        self.nnet.save_checkpoint(folder=self.run.checkpoint, filename="best.pth.tar")
+    @staticmethod
+    def _stockfish_normalized_score(scores: StockfishEvalScores) -> float:
+        """Map Stockfish matchup to ``[0, 1]`` (draws weighted 0.5)."""
+
+        total = scores.model_wins + scores.draws + scores.stockfish_wins
+        if total <= 0:
+            return float("-inf")
+        return (scores.model_wins + 0.5 * scores.draws) / float(total)
+
+    def _checkpoint_dir_usable(self) -> bool:
+        return bool(str(self.run.checkpoint).strip())
+
+    def _prune_checkpoint_files(self) -> None:
+        top_k = self.run.checkpoint_top_k
+        if top_k is None or top_k <= 0:
+            return
+        if not self._checkpoint_dir_usable():
+            return
+
+        folder = Path(self.run.checkpoint).resolve()
+        numbered_with_iterations: list[tuple[int, Path]] = []
+        for path in folder.glob("checkpoint_*.pth.tar"):
+            try:
+                iteration = int(path.name.removeprefix("checkpoint_").removesuffix(".pth.tar"))
+            except ValueError:
+                logger.warning("Ignoring checkpoint with an invalid iteration name: {}", path)
+                continue
+            numbered_with_iterations.append((iteration, path))
+        numbered = [path for _, path in sorted(numbered_with_iterations, reverse=True)]
+        for fp in numbered[max(1, int(top_k)) :]:
+            try:
+                fp.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Could not remove old checkpoint {}: {}", fp, exc)
+
+    @staticmethod
+    def _atomic_copy(source: Path, destination: Path) -> None:
+        temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _update_best_from_stockfish(self, iteration: int, outcome: StockfishEvalOutcome) -> None:
+        if isinstance(outcome, StockfishEvalSkipped):
+            return
+        if not isinstance(outcome, StockfishEvalScores):
+            return
+        if not self._checkpoint_dir_usable():
+            return
+
+        folder = Path(self.run.checkpoint).resolve()
+        fp = folder / f"checkpoint_{iteration}.pth.tar"
+        if not fp.is_file():
+            return
+
+        sf_score = self._stockfish_normalized_score(outcome)
+        metadata_path = folder / _BEST_EVAL_NAME
+        previous_score = float("-inf")
+        with suppress(FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            previous_score = float(json.loads(metadata_path.read_text(encoding="utf-8"))["score"])
+        if sf_score <= previous_score:
+            return
+        self._atomic_copy(fp, folder / "best.pth.tar")
+        temporary_metadata = metadata_path.with_name(f".{metadata_path.name}.tmp-{os.getpid()}")
+        temporary_metadata.write_text(
+            json.dumps({"iteration": iteration, "score": sf_score}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_metadata, metadata_path)
+        logger.info("New best external score {:.3f} at iteration {}", sf_score, iteration)
+
+    def _publish_checkpoint(self, iteration: int) -> None:
+        if not self._checkpoint_dir_usable():
+            logger.warning(
+                'run.checkpoint "" or unset-like; skipping checkpoint_{} and best.pth.tar writes.',
+                iteration,
+            )
+            return
+
+        ck_name = f"checkpoint_{iteration}.pth.tar"
+        self.nnet._trainer_iteration = iteration
+        self.nnet.save_checkpoint(
+            folder=self.run.checkpoint,
+            filename=ck_name,
+            extra_state={"trainer_iteration": iteration},
+        )
+        folder = Path(self.run.checkpoint).resolve()
+        self._atomic_copy(folder / ck_name, folder / "latest.pth.tar")
+        self._prune_checkpoint_files()

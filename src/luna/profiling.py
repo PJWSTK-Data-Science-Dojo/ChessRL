@@ -43,10 +43,8 @@ class IterProfileStats:
     iter_index: int
     self_play_s: float = 0.0
     replay_save_s: float = 0.0
-    checkpoint_io_s: float = 0.0
     train_s: float = 0.0
-    arena_s: float = 0.0
-    accept_s: float = 0.0
+    checkpoint_publish_s: float = 0.0
     total_s: float = 0.0
     # Self-play interior (filled when ``TrainingRunConfig.profile`` is true).
     self_play_env_s: float = 0.0
@@ -65,10 +63,8 @@ class IterProfileStats:
             "[profile] iter {} — wall clock (total {:.1f}s):",
             "  self_play {:.1f}s ({:.0f}%)",
             "  replay_save {:.1f}s ({:.0f}%)",
-            "  checkpoint_io {:.1f}s ({:.0f}%)",
             "  train {:.1f}s ({:.0f}%)",
-            "  arena {:.1f}s ({:.0f}%)",
-            "  accept_checkpoints {:.1f}s ({:.0f}%)",
+            "  checkpoint_publish {:.1f}s ({:.0f}%)",
         ]
 
         def pct(x: float) -> float:
@@ -78,10 +74,8 @@ class IterProfileStats:
             lines[0].format(self.iter_index, self.total_s),
             lines[1].format(self.self_play_s, pct(self.self_play_s)),
             lines[2].format(self.replay_save_s, pct(self.replay_save_s)),
-            lines[3].format(self.checkpoint_io_s, pct(self.checkpoint_io_s)),
-            lines[4].format(self.train_s, pct(self.train_s)),
-            lines[5].format(self.arena_s, pct(self.arena_s)),
-            lines[6].format(self.accept_s, pct(self.accept_s)),
+            lines[3].format(self.train_s, pct(self.train_s)),
+            lines[4].format(self.checkpoint_publish_s, pct(self.checkpoint_publish_s)),
         ]
         if self.self_play_search_batch_calls > 0 and self.self_play_s > 0:
             sp = self.self_play_s

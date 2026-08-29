@@ -1,11 +1,14 @@
 """Neural Network Wrapper -- EfficientZeroV2 learner with unroll training."""
 
+from __future__ import annotations
+
 import math
 import os
-import random
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from contextlib import suppress
+from dataclasses import asdict, fields, replace
+from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 import numpy as np
@@ -31,7 +34,7 @@ from .ezv2_networks import (
 )
 from .game.chess_game import ChessGame
 from .mcts import BatchedMCTS
-from .replay_buffer import PrioritizedReplayBuffer, Trajectory
+from .replay_buffer import PrioritizedReplayBuffer
 from .targets import build_unroll_targets, collate_batch
 from .utils import AverageMeter
 
@@ -55,6 +58,15 @@ def _pinned_h2d_float32(arr: np.ndarray, device: torch.device) -> torch.Tensor:
     pin = torch.empty(arr.shape, dtype=torch.float32, pin_memory=True)
     pin.copy_(t)
     return pin.to(device, non_blocking=True)
+
+
+def _scale_gradient(tensor: torch.Tensor, scale: float) -> torch.Tensor:
+    """Return ``tensor`` unchanged while multiplying its backward gradient by ``scale``.
+
+    MuZero applies this at every recurrent dynamics edge so gradients from deeper
+    unroll steps do not grow disproportionately with the unroll horizon.
+    """
+    return tensor * scale + tensor.detach() * (1.0 - scale)
 
 
 def _get_device(device_type: str = "cuda", cuda_device_index: int | None = None) -> torch.device:
@@ -117,9 +129,7 @@ def _get_device(device_type: str = "cuda", cuda_device_index: int | None = None)
             raise RuntimeError("CUDA available but no devices found.")
 
         # Try requested device index, or scan all devices
-        indices_to_try = (
-            [cuda_device_index] if cuda_device_index is not None else list(range(device_count))
-        )
+        indices_to_try = [cuda_device_index] if cuda_device_index is not None else list(range(device_count))
         for idx in indices_to_try:
             if idx is None or idx < 0 or idx >= device_count:
                 continue
@@ -144,8 +154,7 @@ def _get_device(device_type: str = "cuda", cuda_device_index: int | None = None)
 
     # Unknown device type
     raise ValueError(
-        f"Unknown device type '{device_type}'. "
-        "Valid options: 'cuda' (NVIDIA GPU), 'mps' (Apple Silicon), 'cpu'"
+        f"Unknown device type '{device_type}'. Valid options: 'cuda' (NVIDIA GPU), 'mps' (Apple Silicon), 'cpu'"
     )
 
 
@@ -166,20 +175,37 @@ class LunaNetwork:
 
         self.nnet = EZV2Networks(game, self._learner).to(self.device)
 
-        self.optimizer = optim.Adam(
+        requested_amp_dtype = self._learner.amp_dtype.lower()
+        if requested_amp_dtype not in {"bfloat16", "float16"}:
+            raise ValueError("amp_dtype must be 'bfloat16' or 'float16'")
+        if not 0.0 <= self._learner.recurrent_gradient_scale <= 1.0:
+            raise ValueError("recurrent_gradient_scale must be between 0 and 1")
+        self._amp_dtype = torch.bfloat16 if requested_amp_dtype == "bfloat16" else torch.float16
+        if self.device.type == "cuda" and self._amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            logger.warning("CUDA bfloat16 is unavailable; falling back to float16 autocast.")
+            self._amp_dtype = torch.float16
+
+        self.optimizer = optim.AdamW(
             self.nnet.parameters(),
             lr=self._learner.lr,
             weight_decay=self._learner.weight_decay,
+            fused=self.device.type == "cuda",
         )
 
         # GradScaler only supports CUDA, disable for MPS/CPU
         scaler_backend = "cuda" if self.device.type == "cuda" else "cpu"
-        scaler_enabled = self._learner.mixed_precision and self.device.type == "cuda"
+        scaler_enabled = (
+            self._learner.mixed_precision and self.device.type == "cuda" and self._amp_dtype == torch.float16
+        )
         self.scaler = GradScaler(scaler_backend, enabled=scaler_enabled)
 
         self._global_step = 0
+        self._trainer_iteration = 0
         self._mcts_inference_compiled = False
         self._training_compiled = False
+
+        # Training must call eager forward (gradients, batch shapes); MCTS uses compiled wrappers below.
+        self._train_initial_inference_with_latent = self.nnet.initial_inference_with_latent
 
         if self.device.type == "cuda":
             cap_major, _ = torch.cuda.get_device_capability(self.device)
@@ -188,13 +214,12 @@ class LunaNetwork:
             if self._learner.compile_inference:
                 if not can_compile:
                     logger.warning(
-                        "torch.compile disabled: device capability < 7.0 (Volta+). "
-                        "Run without --compile-inference.",
+                        "torch.compile disabled: device capability < 7.0 (Volta+). Run without --compile-inference.",
                     )
                 else:
                     logger.info("Compiling MCTS inference paths with torch.compile (reduce-overhead)")
                     self.nnet.initial_inference_with_latent = torch.compile(  # type: ignore[method-assign]
-                        self.nnet.initial_inference_with_latent,
+                        self._train_initial_inference_with_latent,
                         mode="reduce-overhead",
                     )
                     self.nnet.recurrent_inference = torch.compile(  # type: ignore[method-assign]
@@ -230,98 +255,25 @@ class LunaNetwork:
             torch.cuda.synchronize()
 
     def _lr_schedule(self, step_in_run: int, total_steps: int) -> float:
-        """Cosine annealing from lr to lr_min over the full training run."""
+        """Linear warmup followed by cosine annealing over the full training run."""
         L = self._learner
-        """Cosine annealing learning rate schedule.
-
-        Args:
-            step: Current training step.
-            total_steps: Total steps for full annealing cycle.
-
-        Returns:
-            Learning rate interpolated between lr_max and lr_min via cosine.
-        """
-        progress = step_in_run / max(total_steps, 1)
+        warmup_steps = min(max(L.lr_warmup_steps, 0), max(total_steps - 1, 0))
+        if warmup_steps > 0 and step_in_run <= warmup_steps:
+            return L.lr * step_in_run / warmup_steps
+        progress = (step_in_run - warmup_steps) / max(total_steps - warmup_steps, 1)
         return L.lr_min + 0.5 * (L.lr - L.lr_min) * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
-    def _async_batch_prefetch(self) -> bool:
-        """Background prefetch is unsafe when reanalysis runs MCTS on the live GPU weights."""
-        L = self._learner
-        return L.reanalyze_mcts_sims <= 0 or L.reanalyze_prob <= 0
+    def _async_batch_prefetch(self, upcoming_steps: int = 0) -> bool:
+        """Allow background sampling only while no upcoming batch can run reanalysis.
 
-    def _reanalyze_overrides_for_sample(
-        self,
-        game: ChessGame,
-        traj: Trajectory,
-        pos_idx: int,
-        unroll: int,
-        td: int,
-        mcts_base: MCTSParams,
-    ) -> tuple[dict[int, float] | None, dict[int, np.ndarray] | None]:
-        """Compute fresh MCTS search-based value/policy for reanalysis.
-
-        Runs MCTS with the current network on a sample's root observation to generate
-        improved value/policy targets, replacing stale bootstrapped values. See EfficientZero V2
-        Section 4.4 "Search-Based Value" for algorithm details.
-
-        Args:
-            game: Chess game environment.
-            traj: Training trajectory containing game history.
-            pos_idx: Starting position index in trajectory.
-            unroll: Number of recurrent unroll steps (K).
-            td: Bootstrap horizon for value targets (n).
-            mcts_base: Base MCTS parameters to customize for reanalysis.
-
-        Returns:
-            Tuple of (root_value_overrides, policy_overrides) where each is a dict mapping
-            position index to fresh target, or None if no reanalysis was performed.
+        Plain replay collation is safe to overlap with training. Reanalysis uses the
+        live network, so the call that reaches its activation step and all later calls
+        remain on the training thread.
         """
         L = self._learner
-        actions = traj.actions
-        game_len = traj.game_length
-        mcts_r = replace(
-            mcts_base,
-            num_mcts_sims=L.reanalyze_mcts_sims,
-            dir_noise=False,
-        )
-
-        need_val: set[int] = set()
-        for step_off in range(unroll + 1):
-            idx = pos_idx + step_off
-            bidx = idx + td
-            if bidx < game_len:
-                need_val.add(bidx)
-
-        pol_pos: set[int] = set()
-        if L.reanalyze_policy:
-            for step_off in range(unroll + 1):
-                idx = pos_idx + step_off
-                if idx < game_len:
-                    pol_pos.add(idx)
-
-        all_pos = sorted(need_val | pol_pos)
-        if not all_pos:
-            return None, None
-
-        boards = []
-        for p in all_pos:
-            board, player = game.replay_board_player(actions, p)
-            boards.append(game.get_canonical_form(board, player))
-
-        bm = BatchedMCTS(game, self, mcts_r)
-        results = bm.search_batch(boards, temp=0.0)
-
-        root_ov: dict[int, float] = {}
-        pol_ov: dict[int, np.ndarray] | None = {} if L.reanalyze_policy else None
-
-        for j, p in enumerate(all_pos):
-            pi, rv, _, _ = results[j]
-            if p in need_val:
-                root_ov[p] = rv
-            if pol_ov is not None and p in pol_pos:
-                pol_ov[p] = pi.astype(np.float32, copy=False)
-
-        return root_ov or None, pol_ov if pol_ov else None
+        if L.reanalyze_mcts_sims <= 0 or L.reanalyze_prob <= 0:
+            return True
+        return self._global_step + max(0, upcoming_steps) < L.mixed_value_td_until_step
 
     def _prepare_batch(
         self,
@@ -356,24 +308,56 @@ class LunaNetwork:
         batch, is_weights, tree_indices = replay.sample(bs, unroll)
         mcts_base = mcts_for_reanalyze or MCTSParams()
 
-        batch_targets: list[dict[str, Any]] = []
-        for traj, pos_idx in batch:
-            root_ov: dict[int, float] | None = None
-            pol_ov: dict[int, np.ndarray] | None = None
+        root_overrides: list[dict[int, float] | None] = [None] * len(batch)
+        policy_overrides: list[dict[int, np.ndarray] | None] = [None] * len(batch)
+        requests: list[tuple[int, int]] = []
+        boards = []
+        reanalysis_enabled = (
+            game is not None
+            and L.reanalyze_mcts_sims > 0
+            and L.reanalyze_prob > 0
+            and training_step >= L.mixed_value_td_until_step
+        )
+        if reanalysis_enabled:
+            for sample_idx, (traj, pos_idx) in enumerate(batch):
+                if np.random.random() >= L.reanalyze_prob:
+                    continue
+                root_overrides[sample_idx] = {}
+                if L.reanalyze_policy:
+                    policy_overrides[sample_idx] = {}
+                for offset in range(unroll + 1):
+                    position = pos_idx + offset
+                    if position >= traj.game_length:
+                        break
+                    board, player = game.replay_board_player(traj.actions, position)
+                    boards.append(game.get_canonical_form(board, player))
+                    requests.append((sample_idx, position))
 
-            use_sve = (
-                game is not None
-                and L.reanalyze_mcts_sims > 0
-                and L.reanalyze_prob > 0
-                and training_step >= L.mixed_value_td_until_step
-                and random.random() < L.reanalyze_prob
+        if boards:
+            mcts_r = replace(
+                mcts_base,
+                num_mcts_sims=L.reanalyze_mcts_sims,
+                dir_noise=False,
             )
-
-            if use_sve:
-                root_ov, pol_ov = self._reanalyze_overrides_for_sample(
-                    game, traj, pos_idx, unroll, td, mcts_base
+            was_training = self.nnet.training
+            try:
+                results = BatchedMCTS(game, self, mcts_r).search_batch(
+                    boards,
+                    temp=1.0,
+                    add_exploration_noise=False,
                 )
+            finally:
+                self.nnet.train(was_training)
+            for (sample_idx, position), (pi, root_value, _obs, _valid) in zip(requests, results):
+                root_override = root_overrides[sample_idx]
+                assert root_override is not None
+                root_override[position] = root_value
+                policy_override = policy_overrides[sample_idx]
+                if policy_override is not None:
+                    policy_override[position] = pi.astype(np.float32, copy=False)
 
+        batch_targets: list[dict[str, Any]] = []
+        for sample_idx, (traj, pos_idx) in enumerate(batch):
             batch_targets.append(
                 build_unroll_targets(
                     traj,
@@ -381,8 +365,8 @@ class LunaNetwork:
                     unroll,
                     td,
                     discount,
-                    root_value_override=root_ov,
-                    policy_override=pol_ov,
+                    root_value_override=root_overrides[sample_idx],
+                    policy_override=policy_overrides[sample_idx],
                 )
             )
 
@@ -418,7 +402,6 @@ class LunaNetwork:
         replay: PrioritizedReplayBuffer,
         steps: int,
         total_train_steps: int = 0,
-        start_step: int = 0,
         *,
         discount: float | None = None,
         mcts_for_reanalyze: MCTSParams | None = None,
@@ -468,13 +451,12 @@ class LunaNetwork:
                     torch_profile_dir,
                     f"train_trace_iter{torch_profile_iter}.json",
                 )
+            tb_cb: Any | None = None
             if want_tb:
                 assert torch_profile_tensorboard_dir is not None
-                os.makedirs(torch_profile_tensorboard_dir, exist_ok=True)
-
-            tb_cb: Any | None = (
-                tensorboard_trace_handler(torch_profile_tensorboard_dir) if want_tb else None
-            )
+                tb_dir = torch_profile_tensorboard_dir
+                os.makedirs(tb_dir, exist_ok=True)
+                tb_cb = tensorboard_trace_handler(tb_dir)
 
             def _on_trace_ready(p: Any) -> None:
                 # tensorboard_trace_handler also calls export_chrome_trace; Kineto allows only one save per cycle.
@@ -485,8 +467,11 @@ class LunaNetwork:
                     p.export_chrome_trace(trace_path)
                     logger.info("PyTorch Chrome trace saved to {}", trace_path)
 
+            activities = [ProfilerActivity.CPU]
+            if self.device.type == "cuda":
+                activities.append(ProfilerActivity.CUDA)
             prof = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                activities=activities,
                 schedule=schedule(wait=0, warmup=0, active=torch_profile_steps, repeat=1),
                 on_trace_ready=_on_trace_ready,
                 record_shapes=True,
@@ -510,8 +495,9 @@ class LunaNetwork:
         lr_total = total_train_steps if total_train_steps > 0 else steps
         grad_accum = max(1, L.grad_accum_steps)
         train_discount = discount if discount is not None else L.discount
-        async_pf = self._async_batch_prefetch()
+        async_pf = self._async_batch_prefetch(steps)
 
+        self.optimizer.zero_grad(set_to_none=True)
         prefetch_future = None
         if async_pf:
             prefetch_future = self._prefetch_executor.submit(
@@ -521,14 +507,14 @@ class LunaNetwork:
                 unroll,
                 td,
                 train_discount,
-                start_step + 1,
+                self._global_step + 1,
                 mcts_for_reanalyze,
             )
 
         try:
             for step in range(1, steps + 1):
                 self._global_step += 1
-                new_lr = self._lr_schedule(start_step + step, lr_total)
+                new_lr = self._lr_schedule(self._global_step, lr_total)
                 for pg in self.optimizer.param_groups:
                     pg["lr"] = new_lr
 
@@ -539,7 +525,7 @@ class LunaNetwork:
                 accum_v_acc = torch.zeros((), device=self.device, dtype=torch.float32)
                 accum_r_acc = torch.zeros((), device=self.device, dtype=torch.float32)
                 accum_c_acc = torch.zeros((), device=self.device, dtype=torch.float32)
-                all_td_errors: list[np.ndarray] = []
+                all_priority_errors: list[np.ndarray] = []
                 all_tree_indices: list[list[int]] = []
 
                 for accum_idx in range(grad_accum):
@@ -547,9 +533,7 @@ class LunaNetwork:
                         assert prefetch_future is not None
                         collated, is_weights, tree_indices = prefetch_future.result()
                         if step < steps or accum_idx < grad_accum - 1:
-                            next_ts = start_step + step + (
-                                1 if accum_idx == grad_accum - 1 else 0
-                            )
+                            next_ts = self._global_step + (1 if accum_idx == grad_accum - 1 else 0)
                             prefetch_future = self._prefetch_executor.submit(
                                 self._prepare_batch,
                                 replay,
@@ -567,7 +551,7 @@ class LunaNetwork:
                             unroll,
                             td,
                             train_discount,
-                            start_step + step,
+                            self._global_step,
                             mcts_for_reanalyze,
                         )
 
@@ -582,13 +566,18 @@ class LunaNetwork:
                     actions = torch.as_tensor(collated["actions"], dtype=torch.long, device=self.device)
                     is_w = torch.as_tensor(is_weights, dtype=torch.float32, device=self.device)
                     u_mask = torch.as_tensor(collated["unroll_mask"], dtype=torch.float32, device=self.device)
+                    c_mask = torch.as_tensor(collated["consistency_mask"], dtype=torch.float32, device=self.device)
                     v_mask = torch.as_tensor(collated["value_mask"], dtype=torch.float32, device=self.device)
                     valid_unroll = torch.as_tensor(
                         collated["valid_masks_unroll"], dtype=torch.float32, device=self.device
                     )
 
-                    with autocast("cuda", enabled=self.scaler.is_enabled()):
-                        latent, log_pi_0, _ = self.nnet.initial_inference_with_latent(obs, valid)
+                    with autocast(
+                        "cuda",
+                        enabled=L.mixed_precision and self.device.type == "cuda",
+                        dtype=self._amp_dtype,
+                    ):
+                        latent, log_pi_0, value_pred_0 = self._train_initial_inference_with_latent(obs, valid)
 
                         loss_pi = -(t_policies[:, 0] * log_pi_0).sum(dim=1)
 
@@ -612,7 +601,14 @@ class LunaNetwork:
                             valid_k = valid_unroll[:, k + 1]
 
                             act_planes = action_index_to_planes(actions[:, k], self.device)
-                            next_latent_raw, r_logits = self.nnet.dynamics(current_latent, act_planes)
+                            dynamics_input = _scale_gradient(
+                                current_latent,
+                                L.recurrent_gradient_scale,
+                            )
+                            next_latent_raw, r_logits = self.nnet.dynamics(
+                                dynamics_input,
+                                act_planes,
+                            )
                             next_latent = _scale_latent(next_latent_raw)
                             policy_logits_k, _ = self.nnet.prediction(next_latent, valid_k)
                             log_pi_k = F.log_softmax(policy_logits_k, dim=1)
@@ -629,7 +625,7 @@ class LunaNetwork:
                             )
 
                             target_latent = all_target_latents[:, k]
-                            loss_consist = _simsiam_loss(self.nnet.simsiam, next_latent, target_latent) * mask_k
+                            loss_consist = _simsiam_loss(self.nnet.simsiam, next_latent, target_latent) * c_mask[:, k]
 
                             loss_r_total = loss_r_total + loss_r
                             loss_pi_total = loss_pi_total + loss_pi_k
@@ -655,7 +651,7 @@ class LunaNetwork:
                     accum_v_acc = accum_v_acc + loss_v_total.mean().detach().float()
                     accum_r_acc = accum_r_acc + loss_r_total.mean().detach().float()
                     accum_c_acc = accum_c_acc + loss_consist_total.mean().detach().float()
-                    all_td_errors.append(total.detach().cpu().numpy())
+                    all_priority_errors.append((value_pred_0.float() - t_values[:, 0]).abs().detach().cpu().numpy())
                     all_tree_indices.append(tree_indices)
 
                 # Check for NaN/Inf in accumulated losses (training divergence detection)
@@ -678,13 +674,16 @@ class LunaNetwork:
 
                 self.scaler.unscale_(self.optimizer)
                 # Capture gradient norm before clipping for monitoring
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.nnet.parameters(), 5.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.nnet.parameters(),
+                    L.grad_clip_norm,
+                )
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
 
-                for td_err, tri in zip(all_td_errors, all_tree_indices):
-                    replay.update_priorities(tri, td_err)
+                for priority_error, tri in zip(all_priority_errors, all_tree_indices):
+                    replay.update_priorities(tri, priority_error)
 
                 scale_m = float(grad_accum)
                 total_loss_m.update(float(accum_weighted.item()) * grad_accum, bs * grad_accum)
@@ -710,17 +709,19 @@ class LunaNetwork:
 
                     # Log training metrics to WandB
                     if wandb is not None and wandb.run is not None:
-                        wandb.log({
-                            "train/loss_total": total_loss_m.avg,
-                            "train/loss_policy": pi_loss_m.avg,
-                            "train/loss_value": v_loss_m.avg,
-                            "train/loss_reward": r_loss_m.avg,
-                            "train/loss_consistency": consist_loss_m.avg,
-                            "train/lr": new_lr,
-                            "train/grad_norm": float(grad_norm),
-                            "train/step_time": step_time_m.avg,
-                            "global_step": self._global_step,
-                        })
+                        wandb.log(
+                            {
+                                "train/loss_total": total_loss_m.avg,
+                                "train/loss_policy": pi_loss_m.avg,
+                                "train/loss_value": v_loss_m.avg,
+                                "train/loss_reward": r_loss_m.avg,
+                                "train/loss_consistency": consist_loss_m.avg,
+                                "train/lr": new_lr,
+                                "train/grad_norm": float(grad_norm),
+                                "train/step_time": step_time_m.avg,
+                                "global_step": self._global_step,
+                            }
+                        )
 
                 if prof is not None:
                     prof.step()
@@ -739,6 +740,16 @@ class LunaNetwork:
     def _raw_value_logits(self, latent: torch.Tensor) -> torch.Tensor:
         return cast(torch.Tensor, self.nnet.prediction.value_head(latent))
 
+    def _persist_compiled_mcts_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        """Copy latent off CUDAGraph output buffers when MCTS inference is torch.compile'd.
+
+        ``mode='reduce-overhead'`` captures CUDA graphs; retaining outputs across subsequent
+        compiled invocations triggers "tensor output ... overwritten" unless we snapshot.
+        """
+        if not self._mcts_inference_compiled:
+            return latent
+        return latent.clone()
+
     # ------------------------------------------------------------------
     # Batched inference for parallel self-play
     # ------------------------------------------------------------------
@@ -753,12 +764,19 @@ class LunaNetwork:
         valid_t = _pinned_h2d_float32(valid_batch.astype(np.float32, copy=False), self.device)
 
         self.nnet.eval()
-        with torch.inference_mode():
+        with (
+            torch.inference_mode(),
+            autocast(
+                "cuda",
+                enabled=self._learner.mixed_precision and self.device.type == "cuda",
+                dtype=self._amp_dtype,
+            ),
+        ):
             latent, log_pi, v = self.nnet.initial_inference_with_latent(board_t, valid_t)
 
-        policies = torch.exp(log_pi).data.cpu().numpy()
-        values = v.data.cpu().numpy()
-        return policies, values, latent
+        policies = torch.exp(log_pi).float().cpu().numpy()
+        values = v.float().cpu().numpy()
+        return policies, values, self._persist_compiled_mcts_latent(latent)
 
     def batched_recurrent_inference(
         self,
@@ -796,33 +814,42 @@ class LunaNetwork:
             for i, mask in enumerate(valid_masks):
                 if mask is not None:
                     valid_mask_np[i] = mask
-            valid_mask_tensor = torch.as_tensor(
-                valid_mask_np, dtype=torch.float32, device=self.device
-            )
+            valid_mask_tensor = torch.as_tensor(valid_mask_np, dtype=torch.float32, device=self.device)
 
         self.nnet.eval()
-        with torch.inference_mode():
-            next_latent, reward, log_pi, v = self.nnet.recurrent_inference(
-                latents, act_planes, valid_mask_tensor
-            )
+        with (
+            torch.inference_mode(),
+            autocast(
+                "cuda",
+                enabled=self._learner.mixed_precision and self.device.type == "cuda",
+                dtype=self._amp_dtype,
+            ),
+        ):
+            next_latent, reward, log_pi, v = self.nnet.recurrent_inference(latents, act_planes, valid_mask_tensor)
 
         a_dim = int(log_pi.shape[1])
         k_limit = policy_topk if policy_topk is not None else a_dim
+        if valid_masks:
+            max_legal = max(
+                (int(np.count_nonzero(mask)) for mask in valid_masks if mask is not None),
+                default=0,
+            )
+            k_limit = max(k_limit, max_legal)
         if k_limit <= 0:
             k_use = a_dim
         else:
             k_use = min(k_limit, a_dim)
 
-        values = v.data.cpu().numpy()
-        rewards = reward.data.cpu().numpy()
+        values = v.float().cpu().numpy()
+        rewards = reward.float().cpu().numpy()
+        next_latent = self._persist_compiled_mcts_latent(next_latent)
 
         if k_use >= a_dim:
-            policies = torch.exp(log_pi).data.cpu().numpy()
+            policies = torch.exp(log_pi).float().cpu().numpy()
             return RecurrentBatchResult(policies, None, None, values, rewards, next_latent)
 
         top_log, top_i = torch.topk(log_pi, k=k_use, dim=1)
-        probs_t = torch.exp(top_log)
-        probs_t = probs_t / probs_t.sum(dim=1, keepdim=True)
+        probs_t = torch.softmax(top_log.float(), dim=1)
         idx_np = top_i.cpu().numpy().astype(np.int32)
         pr_np = probs_t.cpu().numpy().astype(np.float32)
         return RecurrentBatchResult(None, idx_np, pr_np, values, rewards, next_latent)
@@ -835,10 +862,18 @@ class LunaNetwork:
             valid_t = valid_t.unsqueeze(0)
 
         self.nnet.eval()
-        with torch.inference_mode():
+        with (
+            torch.inference_mode(),
+            autocast(
+                "cuda",
+                enabled=self._learner.mixed_precision and self.device.type == "cuda",
+                dtype=self._amp_dtype,
+            ),
+        ):
             latent, log_pi, v = self.nnet.initial_inference_with_latent(board_t, valid_t)
 
-        return torch.exp(log_pi).data.cpu().numpy()[0], float(v.item()), latent
+        latent = self._persist_compiled_mcts_latent(latent)
+        return torch.exp(log_pi).float().cpu().numpy()[0], float(v.item()), latent
 
     def recurrent_predict(
         self,
@@ -861,51 +896,182 @@ class LunaNetwork:
         # Convert valid_mask to tensor if provided
         valid_mask_tensor = None
         if valid_mask is not None:
-            valid_mask_tensor = torch.as_tensor(
-                valid_mask, dtype=torch.float32, device=self.device
-            ).unsqueeze(0)  # Add batch dimension
+            valid_mask_tensor = torch.as_tensor(valid_mask, dtype=torch.float32, device=self.device).unsqueeze(
+                0
+            )  # Add batch dimension
 
         self.nnet.eval()
-        with torch.inference_mode():
-            next_latent, reward, log_pi, v = self.nnet.recurrent_inference(
-                latent, act_planes, valid_mask_tensor
-            )
+        with (
+            torch.inference_mode(),
+            autocast(
+                "cuda",
+                enabled=self._learner.mixed_precision and self.device.type == "cuda",
+                dtype=self._amp_dtype,
+            ),
+        ):
+            next_latent, reward, log_pi, v = self.nnet.recurrent_inference(latent, act_planes, valid_mask_tensor)
+        next_latent = self._persist_compiled_mcts_latent(next_latent)
         return (
-            torch.exp(log_pi).data.cpu().numpy()[0],
+            torch.exp(log_pi).float().cpu().numpy()[0],
             float(v.item()),
             float(reward.item()),
             next_latent,
         )
 
-    def save_checkpoint(self, folder: str = "checkpoint", filename: str = "checkpoint.pth.tar") -> None:
+    def save_checkpoint(
+        self,
+        folder: str = "checkpoint",
+        filename: str = "checkpoint.pth.tar",
+        *,
+        extra_state: dict[str, object] | None = None,
+    ) -> None:
         filepath = os.path.join(folder, filename)
-        os.makedirs(folder, exist_ok=True)
-        torch.save(
-            {
-                "state_dict": self.nnet.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "global_step": self._global_step,
+        output_dir = os.path.dirname(filepath) or "."
+        os.makedirs(output_dir, exist_ok=True)
+        payload: dict[str, object] = {
+            "format_version": 2,
+            "state_dict": self.nnet.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scaler": self.scaler.state_dict(),
+            "global_step": self._global_step,
+            "learner_config": asdict(self._learner),
+            "model_spec": {
+                "action_size": self.action_size,
+                "observation_shape": [self.board_x, self.board_y, self.board_z],
             },
-            filepath,
-        )
+        }
+        if extra_state:
+            reserved = payload.keys() & extra_state.keys()
+            if reserved:
+                raise ValueError(f"extra_state cannot replace reserved checkpoint fields: {sorted(reserved)}")
+            payload.update(extra_state)
+        temporary_path = f"{filepath}.tmp-{os.getpid()}"
+        try:
+            torch.save(payload, temporary_path)
+            os.replace(temporary_path, filepath)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(temporary_path)
 
-    def load_checkpoint(self, folder: str = "checkpoint", filename: str = "checkpoint.pth.tar") -> None:
+    def load_checkpoint(
+        self,
+        folder: str = "checkpoint",
+        filename: str = "checkpoint.pth.tar",
+        *,
+        load_optimizer: bool = True,
+    ) -> None:
         filepath = os.path.join(folder, filename)
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"No model in path {filepath}")
-        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
-        self.nnet.load_state_dict(checkpoint["state_dict"], strict=True)
-        if "optimizer" in checkpoint:
+        checkpoint = self._read_checkpoint(filepath)
+        self._restore_checkpoint(checkpoint, filepath, load_optimizer=load_optimizer)
+
+    @staticmethod
+    def _read_checkpoint(filepath: str | os.PathLike[str]) -> dict[str, Any]:
+        """Read one supported checkpoint onto CPU without executing pickled code."""
+        checkpoint = torch.load(filepath, map_location="cpu", weights_only=True)
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"Checkpoint payload is not a mapping: {filepath}")
+        if checkpoint.get("format_version") != 2:
+            raise ValueError(f"Unsupported checkpoint format in {filepath}; only format version 2 is accepted.")
+        return checkpoint
+
+    def _restore_checkpoint(
+        self,
+        checkpoint: dict[str, Any],
+        filepath: str | os.PathLike[str],
+        *,
+        load_optimizer: bool,
+    ) -> None:
+        """Validate and restore an already-read format-v2 checkpoint."""
+        model_spec = checkpoint.get("model_spec")
+        expected_shape = [self.board_x, self.board_y, self.board_z]
+        if not isinstance(model_spec, dict):
+            raise ValueError(f"Checkpoint is missing model_spec metadata: {filepath}")
+        if model_spec.get("action_size") != self.action_size or model_spec.get("observation_shape") != expected_shape:
+            raise ValueError(
+                f"Checkpoint model specification does not match this game: {filepath} "
+                f"(expected action_size={self.action_size}, observation_shape={expected_shape})."
+            )
+
+        raw_state_dict = checkpoint.get("state_dict")
+        if not isinstance(raw_state_dict, dict):
+            raise ValueError(f"Checkpoint has no valid state_dict: {filepath}")
+        state_dict = self._normalize_compiled_state_dict(raw_state_dict)
+        try:
+            self.nnet.load_state_dict(state_dict, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Checkpoint architecture does not match the configured network: {filepath}. "
+                "Construct it with LunaNetwork.from_checkpoint() or use matching learner settings."
+            ) from exc
+        optimizer_restored = False
+        if load_optimizer and "optimizer" in checkpoint:
             try:
                 self.optimizer.load_state_dict(checkpoint["optimizer"])
-            except (ValueError, KeyError):
+                optimizer_restored = True
+            except (ValueError, KeyError, RuntimeError):
                 logger.warning("Could not restore optimizer state, starting fresh.")
+        if optimizer_restored and "scaler" in checkpoint:
+            try:
+                self.scaler.load_state_dict(checkpoint["scaler"])
+            except (ValueError, KeyError, RuntimeError):
+                logger.warning("Could not restore gradient-scaler state, starting fresh.")
         if "global_step" in checkpoint:
-            self._global_step = checkpoint["global_step"]
+            self._global_step = int(checkpoint["global_step"])
+        self._trainer_iteration = int(checkpoint.get("trainer_iteration", 0))
+
+    @staticmethod
+    def _normalize_compiled_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Remove ``torch.compile`` wrapper segments from persisted module keys."""
+        return {key.replace("._orig_mod.", ".").removeprefix("_orig_mod."): value for key, value in state_dict.items()}
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        game: ChessGame,
+        checkpoint_path: str | os.PathLike[str],
+        *,
+        device: str = "cuda",
+        cuda_device: int | None = None,
+        compile_inference: bool = False,
+        load_optimizer: bool = False,
+    ) -> LunaNetwork:
+        """Build the matching architecture from versioned checkpoint metadata and load it."""
+        path = Path(checkpoint_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"No model in path {path}")
+        checkpoint = cls._read_checkpoint(path)
+        state_dict = checkpoint.get("state_dict")
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"Checkpoint has no valid state_dict: {path}")
+
+        allowed = {field.name for field in fields(EzV2LearnerConfig)}
+        stored = checkpoint.get("learner_config")
+        if not isinstance(stored, dict):
+            raise ValueError(f"Checkpoint is missing learner_config metadata: {path}")
+        config_values = {key: value for key, value in stored.items() if key in allowed}
+        config_values.update(
+            device=device,
+            cuda_device=cuda_device,
+            compile_inference=compile_inference,
+            compile_training=False,
+        )
+        network = cls(game, EzV2LearnerConfig(**config_values))
+        network._restore_checkpoint(checkpoint, path, load_optimizer=load_optimizer)
+        return network
 
     def log_model_summary(self) -> None:
         total = sum(p.numel() for p in self.nnet.parameters())
-        logger.info("Model: {} params\n{}", f"{total:,}", self.nnet)
+        logger.info(
+            "Model: {} parameters | observation={} | actions={} | channels={} | representation_blocks={} | dynamics_blocks={}",
+            f"{total:,}",
+            (self.board_x, self.board_y, self.board_z),
+            self.action_size,
+            self._learner.num_channels,
+            self._learner.repr_blocks,
+            self._learner.dyn_blocks,
+        )
 
 
 def _soft_ce_with_support(logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:

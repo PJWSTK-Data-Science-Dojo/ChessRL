@@ -1,7 +1,7 @@
 """EfficientZeroV2 network architecture: representation, dynamics, prediction.
 
 Key design choices:
-- Spatial action planes (2-channel from/to encoding) instead of dense Linear(4096, C*8*8).
+- Spatial action planes (from/to plus underpromotion identity) instead of a dense action embedding.
   Cuts ~76% of parameters and gives the conv stack spatially meaningful input.
 - SimSiam-style projection + prediction heads for the consistency loss.
 - GroupNorm everywhere (stable at batch=1 during MCTS inference, unlike BatchNorm).
@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .config import EzV2LearnerConfig
-from .game.chess_game import ChessGame
+from .game.chess_game import ACTION_SIZE, ChessGame
 
 _NUM_GROUPS = 8
 
@@ -31,6 +31,7 @@ def _num_groups(channels: int) -> int:
 # ------------------------------------------------------------------
 # Residual blocks
 # ------------------------------------------------------------------
+
 
 class _ResBlock(nn.Module):
     """Standard residual block with GroupNorm."""
@@ -82,6 +83,7 @@ def _make_dw_sep_block(channels: int) -> nn.Module:
 # Sub-networks
 # ------------------------------------------------------------------
 
+
 class RepresentationNetwork(nn.Module):
     """h(observation) -> latent state."""
 
@@ -104,7 +106,10 @@ class DynamicsNetwork(nn.Module):
     Uses depthwise-separable blocks for speed (called once per MCTS simulation).
     """
 
-    ACTION_PLANES = 2
+    # from-square, to-square, then knight/rook/bishop underpromotion identity.
+    # Keeping promotion identity is essential: these actions share from/to squares
+    # but lead to different chess positions.
+    ACTION_PLANES = 5
 
     def __init__(self, channels: int, support_size: int, num_blocks: int = 2) -> None:
         super().__init__()
@@ -125,7 +130,7 @@ class DynamicsNetwork(nn.Module):
         )
 
     def forward(self, latent: torch.Tensor, action_planes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """action_planes: (B, 2, 8, 8) with from/to spatial encoding."""
+        """action_planes: ``(B, 5, 8, 8)`` spatial action encoding."""
         x = torch.cat([latent, action_planes], dim=1)
         x = F.relu(self.gn_in(self.conv_in(x)))
         next_latent = self.blocks(x)
@@ -133,19 +138,62 @@ class DynamicsNetwork(nn.Module):
         return next_latent, reward_logits
 
 
+def _flatten_spatial_policy(raw_logits: torch.Tensor) -> torch.Tensor:
+    """Map chess-aligned spatial logits to the canonical 4,288-action vector.
+
+    The first 64 output channels identify the destination square while the
+    spatial location identifies the source square. The final 24 channels encode
+    the three underpromotion pieces crossed with the eight destination files;
+    canonical observations always promote from rank seven.
+    """
+    expected_shape = (88, 8, 8)
+    if raw_logits.ndim != 4 or tuple(raw_logits.shape[1:]) != expected_shape:
+        raise ValueError(
+            "Spatial policy logits must have shape "
+            f"(batch, {expected_shape[0]}, {expected_shape[1]}, {expected_shape[2]}), "
+            f"got {tuple(raw_logits.shape)}"
+        )
+
+    batch_size = raw_logits.shape[0]
+
+    # (destination, source_rank, source_file) -> (source, destination)
+    base_logits = raw_logits[:, :64].permute(0, 2, 3, 1).reshape(batch_size, 4096)
+
+    # Channels are (piece, destination_file). Select canonical source rank seven,
+    # then reorder to the action layout (piece, source_file, destination_file).
+    promotion_logits = raw_logits[:, 64:, 6, :]
+    promotion_logits = promotion_logits.reshape(batch_size, 3, 8, 8)
+    promotion_logits = promotion_logits.permute(0, 1, 3, 2).reshape(batch_size, 192)
+    return torch.cat((base_logits, promotion_logits), dim=1)
+
+
+class _SpatialPolicyHead(nn.Module):
+    """Convolutional policy head whose axes match the chess action geometry."""
+
+    OUTPUT_CHANNELS = 64 + 3 * 8
+
+    def __init__(self, channels: int, action_size: int) -> None:
+        super().__init__()
+        if action_size != ACTION_SIZE:
+            raise ValueError(f"Spatial policy head requires {ACTION_SIZE} actions, got {action_size}")
+        hidden_channels = 64
+        self.tower = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, 3, padding=1, bias=False),
+            nn.GroupNorm(_num_groups(hidden_channels), hidden_channels),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels, self.OUTPUT_CHANNELS, 1),
+        )
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return _flatten_spatial_policy(self.tower(latent))
+
+
 class PredictionNetwork(nn.Module):
     """f(latent) -> (policy_logits, value_logits)."""
 
     def __init__(self, channels: int, action_size: int, support_size: int) -> None:
         super().__init__()
-        g32 = _num_groups(32)
-        self.policy_head = nn.Sequential(
-            nn.Conv2d(channels, 32, 1, bias=False),
-            nn.GroupNorm(g32, 32),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(32 * 8 * 8, action_size),
-        )
+        self.policy_head = _SpatialPolicyHead(channels, action_size)
 
         value_bins = 2 * support_size + 1
         g16 = _num_groups(16)
@@ -195,6 +243,7 @@ class SimSiamProjector(nn.Module):
 # ------------------------------------------------------------------
 # Combined model
 # ------------------------------------------------------------------
+
 
 class EZV2Networks(nn.Module):
     """Combined wrapper holding all three sub-networks + SimSiam projector."""
@@ -277,6 +326,7 @@ class EZV2Networks(nn.Module):
 # Action encoding helpers
 # ---------------------------------------------------------------------------
 
+
 def _action_to_squares(action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Decode action indices into (from_square, to_square) handling promotions.
 
@@ -305,20 +355,30 @@ def _action_to_squares(action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 
 
 def action_index_to_planes(action: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Convert a batch of action indices to (B, 2, 8, 8) spatial planes.
+    """Convert action indices to five spatial planes.
 
-    Plane 0: one-hot at from_square, Plane 1: one-hot at to_square.
+    Planes 0-1 identify from/to squares. Planes 2-4 identify knight, rook,
+    and bishop underpromotions at the destination square. Queen promotions use
+    the base action and need no extra plane.
     """
     B = action.shape[0]
     from_sq, to_sq = _action_to_squares(action)
-    planes = torch.zeros(B, 2, 64, device=device)
-    planes[torch.arange(B, device=device), 0, from_sq] = 1.0
-    planes[torch.arange(B, device=device), 1, to_sq] = 1.0
-    return planes.view(B, 2, 8, 8)
+    rows = torch.arange(B, device=device)
+    planes = torch.zeros(B, DynamicsNetwork.ACTION_PLANES, 64, device=device)
+    planes[rows, 0, from_sq] = 1.0
+    planes[rows, 1, to_sq] = 1.0
+    promotion_plane = torch.where(
+        action >= 4224,
+        4,
+        torch.where(action >= 4160, 3, torch.where(action >= 4096, 2, -1)),
+    )
+    is_underpromotion = promotion_plane >= 0
+    planes[rows[is_underpromotion], promotion_plane[is_underpromotion], to_sq[is_underpromotion]] = 1.0
+    return planes.view(B, DynamicsNetwork.ACTION_PLANES, 8, 8)
 
 
 def action_int_to_planes(action: int, device: torch.device) -> torch.Tensor:
-    """Single action index -> (1, 2, 8, 8) spatial planes."""
+    """Single action index -> ``(1, 5, 8, 8)`` spatial planes."""
     action_t = torch.tensor([action], device=device)
     return action_index_to_planes(action_t, device)
 
@@ -326,6 +386,7 @@ def action_int_to_planes(action: int, device: torch.device) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
+
 
 def _scale_latent(latent: torch.Tensor) -> torch.Tensor:
     """Normalise latent per sample using mean/std for smooth gradient flow."""

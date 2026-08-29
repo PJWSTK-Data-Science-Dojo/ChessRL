@@ -1,11 +1,12 @@
 """Tests for EfficientZeroV2 model components."""
 
-import torch
+import chess
 import pytest
+import torch
 
-from luna.config import EzV2LearnerConfig
 from luna.ezv2_networks import (
     EZV2Networks,
+    _flatten_spatial_policy,
     _support_to_scalar,
     action_index_to_planes,
     scalar_to_support,
@@ -52,6 +53,23 @@ def test_support_transform_roundtrip():
 def test_action_spatial_encoding():
     actions = torch.tensor([0, 4095, 100])
     planes = action_index_to_planes(actions, torch.device("cpu"))
-    assert planes.shape == (3, 2, 8, 8)
+    assert planes.shape == (3, 5, 8, 8)
     assert planes[0, 0].sum().item() == 1.0
     assert planes[0, 1].sum().item() == 1.0
+
+
+def test_spatial_policy_head_preserves_action_layout():
+    raw_logits = torch.zeros(1, 88, 8, 8)
+
+    normal_action = chess.E2 * 64 + chess.E4
+    raw_logits[0, chess.E4, chess.square_rank(chess.E2), chess.square_file(chess.E2)] = 3.0
+
+    knight_promotion_action = 4096 + chess.square_file(chess.B7) * 8 + chess.square_file(chess.B8)
+    promotion_channel = 64 + chess.square_file(chess.B8)
+    raw_logits[0, promotion_channel, 6, chess.square_file(chess.B7)] = 5.0
+
+    policy_logits = _flatten_spatial_policy(raw_logits)
+
+    assert policy_logits.shape == (1, 4288)
+    assert policy_logits[0, normal_action].item() == 3.0
+    assert policy_logits[0, knight_promotion_action].item() == 5.0

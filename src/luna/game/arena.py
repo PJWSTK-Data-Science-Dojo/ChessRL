@@ -10,7 +10,6 @@ from tqdm import tqdm
 from .chess_game import ChessGame
 
 _WIN_THRESHOLD = 0.5
-_DRAW_THRESHOLD = 1e-8
 
 
 class Arena:
@@ -33,7 +32,7 @@ class Arena:
         self.display: Callable[[chess.Board], None] | None = display
 
     def play_game(self, verbose: bool = False, max_ply: int | None = None) -> float:
-        """Execute one episode. Returns +1 if player1 wins, -1 if player2 wins, else small draw value.
+        """Execute one episode. Returns +1 if player1 wins, -1 if player2 wins, or 0 for a draw.
 
         If ``max_ply`` is set and reached without a terminal outcome, returns ``0.0`` (draw).
         """
@@ -41,7 +40,7 @@ class Arena:
         current_player = 1
         board = self.game.get_init_board()
         turn_count = 0
-        while abs(self.game.get_game_ended(board, current_player)) < _DRAW_THRESHOLD:
+        while self.game.get_game_outcome(board, current_player) is None:
             if max_ply is not None and turn_count >= max_ply:
                 return 0.0
             turn_count += 1
@@ -66,10 +65,12 @@ class Arena:
             logger.info(
                 "Game over: Turn {} Result {}",
                 turn_count,
-                self.game.get_game_ended(board, 1),
+                self.game.get_game_outcome(board, 1),
             )
             self.display(board)
-        return current_player * self.game.get_game_ended(board, current_player)
+        outcome = self.game.get_game_outcome(board, current_player)
+        assert outcome is not None
+        return current_player * outcome
 
     @staticmethod
     def _classify_result(result: float) -> int:

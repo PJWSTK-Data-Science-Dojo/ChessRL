@@ -1,17 +1,7 @@
-# Web Interface Requirements
-# Install with: pip install -r requirements-web.txt
-
-flask>=3.0.0
-python-chess>=1.999
-numpy>=1.24.0
-torch>=2.4.0
-loguru>=0.7.0
-tyro>=0.7.0
-
-# Optional: Production Server
-gunicorn>=21.0.0  # For production deployment
-
-# Optional: Development Tools
-pytest>=7.4.0
-ruff>=0.1.0
-mypy>=1.7.0
+flask>=3.0,<4
+gunicorn>=23,<24
+loguru>=0.7,<1
+numpy>=1.24,<3
+python-chess>=1.999,<2
+torch>=2.5,<2.14
+tyro>=0.8,<2

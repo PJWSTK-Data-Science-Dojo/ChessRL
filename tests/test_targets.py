@@ -31,6 +31,7 @@ class TestBuildUnrollTargets:
         assert len(targets["actions"]) == 3
         assert targets["observation"].shape == (8, 8, OBS_PLANES)
         assert len(targets["unroll_mask"]) == 3
+        assert len(targets["consistency_mask"]) == 3
         assert len(targets["value_mask"]) == 4
 
     def test_past_end_padding(self, make_trajectory):
@@ -39,6 +40,7 @@ class TestBuildUnrollTargets:
         assert len(targets["target_values"]) == 6
         assert targets["target_values"][-1] == 0.0
         assert targets["unroll_mask"] == [1.0, 1.0, 0.0, 0.0, 0.0]
+        assert targets["consistency_mask"] == [1.0, 0.0, 0.0, 0.0, 0.0]
         assert targets["value_mask"] == [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
 
 
@@ -53,13 +55,30 @@ def test_collation(make_trajectory):
     assert collated["target_policies"].shape == (4, 4, ACTION_SIZE)
     assert collated["valid_masks_unroll"].shape == (4, 4, ACTION_SIZE)
     assert collated["unroll_mask"].shape == (4, 3)
+    assert collated["consistency_mask"].shape == (4, 3)
     assert collated["value_mask"].shape == (4, 4)
 
 
-def test_root_value_override(make_trajectory):
+def test_bootstrap_value_override_respects_two_player_perspective(make_trajectory):
     traj = make_trajectory(length=10)
     traj.root_values = np.zeros(10, dtype=np.float32)
     traj.rewards = np.zeros(10, dtype=np.float32)
     ov = {5: 0.99}
     val = compute_target_value(traj, pos_idx=0, td_steps=5, discount=1.0, root_value_override=ov)
     assert abs(val - (-0.99)) < 1e-5
+
+
+def test_current_position_sve_override_directly_replaces_td_target(make_trajectory):
+    traj = make_trajectory(length=10)
+    traj.rewards = np.ones(10, dtype=np.float32)
+    traj.root_values = np.full(10, -0.75, dtype=np.float32)
+
+    val = compute_target_value(
+        traj,
+        pos_idx=2,
+        td_steps=5,
+        discount=1.0,
+        root_value_override={2: 0.625, 7: -0.5},
+    )
+
+    assert val == 0.625

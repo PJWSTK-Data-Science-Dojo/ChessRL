@@ -30,10 +30,20 @@ def chess_game():
 @pytest.fixture
 def make_trajectory():
     """Factory for creating test trajectories."""
+
     def _make(length: int = 10) -> Trajectory:
         game = ChessGame()
-        observations = [np.random.randn(*game.get_board_size()) for _ in range(length)]
-        policies = [np.random.rand(game.get_action_size()) for _ in range(length)]
+        action_size = game.get_action_size()
+        observations = [np.random.randn(*game.get_board_size()).astype(np.float32) for _ in range(length)]
+        policies = [np.full(action_size, 1.0 / action_size, dtype=np.float32) for _ in range(length)]
         rewards = [0.0] * length
-        return Trajectory(observations, policies, rewards, 1.0)
+        return Trajectory(
+            observations=observations,
+            actions=np.zeros(length, dtype=np.int64),
+            rewards=rewards,
+            root_policies=policies,
+            root_values=np.zeros(length, dtype=np.float32),
+            valids=np.ones((length, action_size), dtype=np.float32),
+        )
+
     return _make

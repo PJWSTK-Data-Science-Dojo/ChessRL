@@ -8,8 +8,6 @@ Action encoding (4288 total):
 Queen promotions share the base 0..4095 range (default promotion type).
 """
 
-import random
-
 import chess
 import numpy as np
 from loguru import logger
@@ -22,39 +20,73 @@ _PROMOTION_OFFSETS: dict[int, int] = {
 _OFFSET_TO_PROMO: dict[int, int] = {v: k for k, v in _PROMOTION_OFFSETS.items()}
 
 ACTION_SIZE = 4288
-DRAW_VALUE = 1e-4
 
-NUM_PIECE_PLANES = 6
-NUM_AUX_PLANES = 7  # castling (4) + en-passant (1) + halfmove clock (1) + color (1)
-OBS_PLANES = NUM_PIECE_PLANES + NUM_AUX_PLANES
+HISTORY_LENGTH = 8
+PIECE_PLANES_PER_POSITION = 12
+REPETITION_PLANES_PER_POSITION = 2
+PLANES_PER_POSITION = PIECE_PLANES_PER_POSITION + REPETITION_PLANES_PER_POSITION
+NUM_AUX_PLANES = 7
+OBS_PLANES = HISTORY_LENGTH * PLANES_PER_POSITION + NUM_AUX_PLANES
+
+CASTLING_PLANES_START = HISTORY_LENGTH * PLANES_PER_POSITION
+EN_PASSANT_PLANE = CASTLING_PLANES_START + 4
+HALFMOVE_CLOCK_PLANE = CASTLING_PLANES_START + 5
+SIDE_TO_MOVE_PLANE = CASTLING_PLANES_START + 6
+HALFMOVE_CLOCK_NORMALIZER = 100.0
 
 
 def board_to_numpy(board: chess.Board) -> np.ndarray:
-    """Encode board as (8, 8, OBS_PLANES) with piece planes + auxiliary planes."""
+    """Encode a position and its history as an AlphaZero-style 119-plane tensor.
+
+    The first 112 planes contain eight temporal positions, newest first. Each
+    position uses six white piece planes, six black piece planes, and two
+    repetition planes. The final seven planes encode the current position's four
+    castling rights, en-passant square, normalized halfmove clock, and side to move.
+
+    A board constructed from FEN has no recoverable history, so all unavailable
+    temporal slots remain zero. The returned layout is HWC to match the rest of the
+    training pipeline.
+    """
     arr = np.zeros((8, 8, OBS_PLANES), dtype=np.float32)
 
-    for sq, piece in board.piece_map().items():
-        rank, file = divmod(sq, 8)
-        arr[rank, file, piece.piece_type - 1] = 1.0 if piece.color else -1.0
+    historical_board = board.copy(stack=True)
+    for history_index in range(HISTORY_LENGTH):
+        plane_offset = history_index * PLANES_PER_POSITION
+        for square, piece in historical_board.piece_map().items():
+            rank, file = divmod(square, 8)
+            color_offset = 0 if piece.color == chess.WHITE else 6
+            piece_plane = plane_offset + color_offset + piece.piece_type - 1
+            arr[rank, file, piece_plane] = 1.0
 
-    arr[:, :, 6] = float(board.has_kingside_castling_rights(chess.WHITE))
-    arr[:, :, 7] = float(board.has_queenside_castling_rights(chess.WHITE))
-    arr[:, :, 8] = float(board.has_kingside_castling_rights(chess.BLACK))
-    arr[:, :, 9] = float(board.has_queenside_castling_rights(chess.BLACK))
+        arr[:, :, plane_offset + PIECE_PLANES_PER_POSITION] = float(historical_board.is_repetition(2))
+        arr[:, :, plane_offset + PIECE_PLANES_PER_POSITION + 1] = float(historical_board.is_repetition(3))
+
+        if not historical_board.move_stack:
+            break
+        historical_board.pop()
+
+    arr[:, :, CASTLING_PLANES_START] = float(board.has_kingside_castling_rights(chess.WHITE))
+    arr[:, :, CASTLING_PLANES_START + 1] = float(board.has_queenside_castling_rights(chess.WHITE))
+    arr[:, :, CASTLING_PLANES_START + 2] = float(board.has_kingside_castling_rights(chess.BLACK))
+    arr[:, :, CASTLING_PLANES_START + 3] = float(board.has_queenside_castling_rights(chess.BLACK))
 
     if board.ep_square is not None:
         ep_rank, ep_file = divmod(board.ep_square, 8)
-        arr[ep_rank, ep_file, 10] = 1.0
+        arr[ep_rank, ep_file, EN_PASSANT_PLANE] = 1.0
 
-    arr[:, :, 11] = board.halfmove_clock / 100.0
-    arr[:, :, 12] = 1.0 if board.turn else 0.0
+    arr[:, :, HALFMOVE_CLOCK_PLANE] = min(board.halfmove_clock / HALFMOVE_CLOCK_NORMALIZER, 1.0)
+    arr[:, :, SIDE_TO_MOVE_PLANE] = float(board.turn == chess.WHITE)
 
     return arr
 
 
 def move_to_action(move: chess.Move) -> int:
+    if move.drop is not None:
+        raise ValueError("Drop moves are not part of standard chess action encoding")
     base = move.from_square * 64 + move.to_square
-    if move.promotion is not None and move.promotion in _PROMOTION_OFFSETS:
+    if move.promotion is not None and move.promotion != chess.QUEEN:
+        if move.promotion not in _PROMOTION_OFFSETS:
+            raise ValueError(f"Unsupported promotion piece: {move.promotion}")
         from_file = chess.square_file(move.from_square)
         to_file = chess.square_file(move.to_square)
         return _PROMOTION_OFFSETS[move.promotion] + from_file * 8 + to_file
@@ -62,6 +94,8 @@ def move_to_action(move: chess.Move) -> int:
 
 
 def action_to_move(action: int) -> chess.Move:
+    if not 0 <= action < ACTION_SIZE:
+        raise ValueError(f"Action index must be in [0, {ACTION_SIZE}), got {action}")
     for offset, promo_type in _OFFSET_TO_PROMO.items():
         if action >= offset and action < offset + 64:
             idx = action - offset
@@ -94,11 +128,27 @@ def mirror_move(move: chess.Move) -> chess.Move:
     )
 
 
+def mirror_board(board: chess.Board) -> chess.Board:
+    """Mirror a position while retaining its reversible move history.
+
+    ``python-chess`` intentionally drops the stack in :meth:`Board.mirror`. Search
+    needs that stack for threefold-repetition adjudication, so rebuild it from the
+    mirrored root and transformed moves.
+    """
+    mirrored = board.root().mirror()
+    for move in board.move_stack:
+        mirrored.push(mirror_move(move))
+    mirrored.fullmove_number = board.fullmove_number
+    return mirrored
+
+
 class ChessGame:
     """python-chess wrapper."""
 
-    def __init__(self) -> None:
-        self._illegal_move_fallback_count = 0
+    def __init__(self, *, claim_draw: bool = True) -> None:
+        # Self-play claims available draws to bound repeated trajectories. Protocol
+        # adapters can disable this when the remote server still expects a move.
+        self.claim_draw = claim_draw
 
     def get_init_board(self) -> chess.Board:
         return chess.Board()
@@ -120,48 +170,33 @@ class ChessGame:
     def get_action_size(self) -> int:
         return ACTION_SIZE
 
-    def get_illegal_move_count(self) -> int:
-        """Return the number of times illegal moves were handled with fallback."""
-        return self._illegal_move_fallback_count
-
-    def reset_illegal_move_count(self) -> None:
-        """Reset the illegal move fallback counter."""
-        self._illegal_move_fallback_count = 0
-
     def get_next_state(self, board: chess.Board, player: int, action: int) -> tuple[chess.Board, int]:
         """Execute action and return next (board, player).
 
-        If the action is illegal, tries promotion fallback, then picks a random legal move
-        as a last resort to prevent crashes during self-play.
+        Queen promotions encoded without an explicit promotion type are completed
+        automatically. Any other illegal action raises instead of silently executing a
+        different move and corrupting replay data.
         """
         assert player_from_turn(board.turn) == player
-        move = action_to_move(action)
-        if not board.turn:
+        try:
+            move: chess.Move | None = action_to_move(action)
+        except ValueError:
+            move = None
+        if move is not None and not board.turn:
             move = mirror_move(move)
 
         # Try to execute the move
-        if move not in board.legal_moves:
+        if move is None or move not in board.legal_moves:
             # Fallback 1: Try queen promotion if it's a pawn-to-back-rank move
-            if move.promotion is None:
+            if move is not None and move.promotion is None:
                 promo_move = chess.Move(move.from_square, move.to_square, promotion=chess.QUEEN)
                 if promo_move in board.legal_moves:
                     move = promo_move
 
-            # Fallback 2: If still illegal, pick a random legal move as last resort
-            if move not in board.legal_moves:
-                legal_move_list = list(board.legal_moves)
-                if len(legal_move_list) > 0:
-                    self._illegal_move_fallback_count += 1
-                    move = random.choice(legal_move_list)
-                    logger.warning(
-                        "Illegal action {} selected. Falling back to random legal move: {} (total fallbacks: {})",
-                        action,
-                        move,
-                        self._illegal_move_fallback_count,
-                    )
-                else:
-                    # No legal moves - should never happen in valid chess positions
-                    raise ValueError(f"No legal moves available. Position: {board.fen()}")
+            # An illegal model action indicates a masking/encoding defect. Failing fast
+            # protects the action/observation alignment required by latent dynamics.
+            if move is None or move not in board.legal_moves:
+                raise ValueError(f"Illegal action {action} for position {board.fen()}")
 
         board = board.copy()
         board.push(move)
@@ -171,16 +206,21 @@ class ChessGame:
         assert player_from_turn(board.turn) == player
         acts = np.zeros(self.get_action_size(), dtype=np.float32)
         for move in board.legal_moves:
-            acts[move_to_action(move)] = 1.0
+            canonical_move = move if player == 1 else mirror_move(move)
+            acts[move_to_action(canonical_move)] = 1.0
         return acts
 
-    def get_game_ended(self, board: chess.Board, player: int) -> float:
-        """Return 0 if not ended. Otherwise return reward from *player*'s perspective."""
-        outcome = board.outcome()
+    def get_game_outcome(self, board: chess.Board, player: int) -> float | None:
+        """Return the exact terminal value from ``player``'s perspective.
+
+        Returns ``None`` while the game is ongoing, ``0.0`` for a draw, and ``+1`` or
+        ``-1`` for a decisive result.
+        """
+        outcome = board.outcome(claim_draw=self.claim_draw)
         if outcome is None:
-            return 0.0
+            return None
         if outcome.winner is None:
-            return DRAW_VALUE
+            return 0.0
         winner_int = player_from_turn(outcome.winner)
         return 1.0 if winner_int == player else -1.0
 
@@ -189,7 +229,7 @@ class ChessGame:
         if board.turn:
             return board
         else:
-            return board.mirror()
+            return mirror_board(board)
 
     def get_symmetries(self, board: chess.Board, pi: list | np.ndarray) -> list[tuple]:
         return [(board, pi)]

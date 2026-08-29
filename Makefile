@@ -1,3 +1,6 @@
+ARGS ?=
+TRAIN_ARGS ?=
+
 fmt:
 	uv run --extra dev ruff format .
 	uv run --extra dev ruff check --fix .
@@ -8,17 +11,54 @@ lint:
 types:
 	uv run --extra dev mypy src
 
-check: lint types
+check: lint types test
 
 test:
 	uv run --extra dev pytest tests/ -v
 
 bench:
-	uv run python tests/bench_throughput.py
+	uv run python tests/bench_throughput.py $(ARGS)
 
-# Example: one iter, small run, phase timings + 15-step CUDA trace in ./profiles/
-# Run `make torch-fix` first if PyTorch does not see CUDA on your machine.
-# On Volta+ GPUs (sm_70+), append `--learner.compile-inference` for faster MCTS forwards.
+# A bounded, high-throughput single-accelerator training recipe. ARGS is
+# appended last so every setting can be overridden without editing this file.
+train:
+	uv run python src/main.py \
+		--run.search-mode gumbel \
+		--run.gumbel-max-considered-actions 16 \
+		--run.num-iters 400 \
+		--run.num-episodes 32 \
+		--run.parallel-games 32 \
+		--run.num-mcts-sims 32 \
+		--run.recurrent-policy-topk 256 \
+		--run.temp-threshold 20 \
+		--run.max-ply 256 \
+		--run.train-steps-per-iter 150 \
+		--run.replay-capacity 150000 \
+		--run.stockfish-eval-every 25 \
+		--run.stockfish-eval-games 8 \
+		--run.checkpoint-top-k 3 \
+		--learner.device cuda \
+		--learner.cuda-device 0 \
+		--learner.batch-size 64 \
+		--learner.num-channels 128 \
+		--learner.repr-blocks 8 \
+		--learner.dyn-blocks 3 \
+		--learner.proj-dim 256 \
+		--learner.lr 2e-4 \
+		--learner.lr-warmup-steps 1000 \
+		--learner.grad-accum-steps 2 \
+		--learner.grad-clip-norm 5 \
+		--learner.recurrent-gradient-scale 0.5 \
+		--learner.compile-inference \
+		--learner.reanalyze-mcts-sims 16 \
+		--learner.reanalyze-prob 0.25 \
+		--learner.mixed-value-td-until-step 15000 \
+		$(TRAIN_ARGS) $(ARGS)
+
+resume:
+	$(MAKE) train TRAIN_ARGS="--load-model --load-checkpoint-dir ./temp/ --load-checkpoint-file latest.pth.tar $(TRAIN_ARGS)"
+
+# Short end-to-end run with phase timings and a compact profiler trace.
 profile-smoke:
 	uv run python src/main.py \
 		--run.num-iters 1 \
@@ -26,116 +66,58 @@ profile-smoke:
 		--run.parallel-games 2 \
 		--run.num-mcts-sims 4 \
 		--run.max-ply 40 \
-		--run.arena-compare 2 \
-		--run.train-steps-per-iter 30 \
-		--run.batch-size 8 \
+		--run.train-steps-per-iter 12 \
+		--run.stockfish-eval-every 0 \
 		--run.profile \
-		--run.profile-torch-steps 15 \
+		--run.profile-torch-steps 8 \
 		--run.profile-dir ./profiles \
 		--run.profile-tensorboard-logdir ./profiles/tb \
-		--run.profile-with-stack \
 		--learner.batch-size 8 \
 		--learner.num-channels 32 \
 		--learner.repr-blocks 2 \
 		--learner.dyn-blocks 1 \
 		--learner.proj-dim 64 \
-		--learner.grad-accum-steps 1 \
-		--learner.dataloader-workers 0
-
-# Extra CLI flags for main.py, e.g. make train ARGS='--num-mcts-sims 20'
-ARGS ?=
-
-# Extra args for training, e.g. make train TRAIN_ARGS='--num-mcts-sims 20'
-TRAIN_ARGS ?=
-
-train:
-	uv run python src/main.py $(TRAIN_ARGS) $(ARGS)
-
-# Optimized RTX 4090 config: Maximal GPU utilization (24GB VRAM)
-# Target: 2000-2200 Elo with 128ch (40M params), 200 MCTS sims, 8+4 blocks
-# Increased parallel games (48→64), arena parallelism (12→16), dataloader workers (4→6)
-train-rtx4090-balanced:
-	uv run python src/main.py \
-		--run.num-iters 400 \
-		--run.num-episodes 50 \
-		--run.parallel-games 64 \
-		--run.num-mcts-sims 200 \
-		--run.recurrent-policy-topk 1024 \
-		--run.train-steps-per-iter 300 \
-		--run.batch-size 96 \
-		--run.arena-compare 40 \
-		--run.arena-num-mcts-sims 200 \
-		--run.arena-parallel-games 16 \
-		--run.replay-capacity 300000 \
-		--learner.device cuda \
-		--learner.batch-size 96 \
-		--learner.num-channels 128 \
-		--learner.repr-blocks 8 \
-		--learner.dyn-blocks 4 \
-		--learner.support-size 15 \
-		--learner.proj-dim 512 \
-		--learner.lr 2e-4 \
-		--learner.grad-accum-steps 2 \
-		--learner.dataloader-workers 6 \
-		--learner.compile-inference \
-		--learner.reanalyze-mcts-sims 25 \
-		--learner.reanalyze-prob 0.25 \
-		--learner.mixed-value-td-until-step 5000 \
+		--learner.dataloader-workers 0 \
 		$(ARGS)
-
-# Reinstall a stable torch range that supports older and newer CUDA GPUs.
-torch-fix:
-	uv pip install --python .venv/bin/python "torch>=2.4,<2.6"
 
 serve:
-	uv run python src/web_app.py
+	uv run python src/web_app.py --checkpoint ./temp/latest.pth.tar $(ARGS)
 
-# Serve on CPU (for MacBook or systems without GPU)
 serve-cpu:
-	uv run python src/web_app.py --device cpu --mcts-sims 25
+	uv run python src/web_app.py --checkpoint ./temp/latest.pth.tar --device cpu --search-simulations 25 --no-compile-inference $(ARGS)
 
-# Serve on MPS (for Apple Silicon Macs)
 serve-mps:
-	uv run python src/web_app.py --device mps --mcts-sims 50
+	uv run python src/web_app.py --checkpoint ./temp/latest.pth.tar --device mps --search-simulations 50 --no-compile-inference $(ARGS)
 
-# MacBook pipeline testing: minimal config for testing training loop on CPU/MPS
-test-pipeline-macbook:
+uci:
+	uv run luna-uci --checkpoint ./temp/latest.pth.tar $(ARGS)
+
+lichess-config:
+	uv run luna-lichess-config $(ARGS)
+
+eval-stockfish:
+	uv run python src/eval_vs_stockfish.py --checkpoint ./temp/latest.pth.tar $(ARGS)
+
+test-pipeline-cpu:
 	uv run python src/main.py \
-		--run.num-iters 3 \
-		--run.num-episodes 4 \
+		--run.num-iters 2 \
+		--run.num-episodes 2 \
 		--run.parallel-games 2 \
-		--run.num-mcts-sims 8 \
-		--run.max-ply 60 \
-		--run.train-steps-per-iter 20 \
-		--run.batch-size 8 \
-		--run.arena-compare 4 \
+		--run.num-mcts-sims 4 \
+		--run.max-ply 32 \
+		--run.train-steps-per-iter 4 \
+		--run.stockfish-eval-every 0 \
 		--learner.device cpu \
-		--learner.batch-size 8 \
-		--learner.num-channels 32 \
-		--learner.repr-blocks 2 \
+		--learner.batch-size 4 \
+		--learner.num-channels 16 \
+		--learner.repr-blocks 1 \
 		--learner.dyn-blocks 1 \
-		--learner.proj-dim 64 \
-		--learner.dataloader-workers 2 \
+		--learner.proj-dim 32 \
+		--learner.dataloader-workers 0 \
 		$(ARGS)
 
-# Same as above but with MPS backend for Apple Silicon Macs
-test-pipeline-macbook-mps:
-	uv run python src/main.py \
-		--run.num-iters 3 \
-		--run.num-episodes 4 \
-		--run.parallel-games 2 \
-		--run.num-mcts-sims 8 \
-		--run.max-ply 60 \
-		--run.train-steps-per-iter 20 \
-		--run.batch-size 8 \
-		--run.arena-compare 4 \
-		--learner.device mps \
-		--learner.batch-size 8 \
-		--learner.num-channels 32 \
-		--learner.repr-blocks 2 \
-		--learner.dyn-blocks 1 \
-		--learner.proj-dim 64 \
-		--learner.dataloader-workers 2 \
-		$(ARGS)
+test-pipeline-mps:
+	$(MAKE) test-pipeline-cpu ARGS="--learner.device mps $(ARGS)"
 
-.PHONY: fmt lint types check test bench train serve serve-cpu serve-mps torch-fix profile-smoke train-rtx4090-balanced test-pipeline-macbook test-pipeline-macbook-mps
+.PHONY: bench check eval-stockfish fmt lichess-config lint profile-smoke resume serve \
+	serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train types uci

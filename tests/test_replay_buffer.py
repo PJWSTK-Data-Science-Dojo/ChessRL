@@ -1,8 +1,8 @@
 """Tests for prioritized replay buffer."""
 
 import numpy as np
+import pytest
 
-from luna.game.chess_game import ACTION_SIZE
 from luna.replay_buffer import PrioritizedReplayBuffer
 
 
@@ -45,3 +45,15 @@ class TestPrioritizedReplayBuffer:
         batch, _, _ = buf.sample(batch_size=10, unroll_steps=3)
         for t, pos in batch:
             assert 0 <= pos < t.game_length
+
+    def test_invalid_inputs_fail_fast(self, make_trajectory):
+        with pytest.raises(ValueError, match="capacity"):
+            PrioritizedReplayBuffer(capacity=0)
+
+        buf = PrioritizedReplayBuffer(capacity=8)
+        with pytest.raises(ValueError, match="empty"):
+            buf.sample(batch_size=1, unroll_steps=1)
+
+        buf.save_trajectory(make_trajectory(length=2))
+        with pytest.raises(ValueError, match="same length"):
+            buf.update_priorities([0, 1], np.array([0.5], dtype=np.float32))

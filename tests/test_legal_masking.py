@@ -1,6 +1,7 @@
 """Tests for legal move masking in latent MCTS."""
 
-import numpy as np
+import chess
+import pytest
 
 from luna.config import MCTSParams
 from luna.mcts import BatchedMCTS
@@ -26,13 +27,20 @@ def test_batched_mcts_expansion_with_boards(chess_game, small_learner_config):
         assert len(valids) == chess_game.get_action_size()
 
 
-def test_get_next_state_handles_illegal_action(chess_game):
-    """get_next_state should fall back to legal move if action is illegal."""
+def test_get_next_state_rejects_illegal_action(chess_game):
+    """Illegal actions must fail rather than corrupting action/transition pairs."""
     board = chess_game.get_init_board()
 
-    illegal_action = 9999
+    with pytest.raises(ValueError, match="Illegal action"):
+        chess_game.get_next_state(board, 1, 9999)
 
-    next_board, next_player = chess_game.get_next_state(board, 1, illegal_action)
 
-    assert next_board.fen() != board.fen()
-    assert next_player == -1
+def test_black_valid_mask_uses_canonical_actions(chess_game):
+    board = chess.Board()
+    board.push_uci("e2e4")
+    valids = chess_game.get_valid_moves(board, -1)
+
+    # Canonical e7-e5 is mirrored to e2-e4 for the side-to-move representation.
+    from luna.game.chess_game import move_to_action
+
+    assert valids[move_to_action(chess.Move.from_uci("e2e4"))] == 1.0

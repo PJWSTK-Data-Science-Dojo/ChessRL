@@ -17,11 +17,10 @@ def _minimal_config() -> tuple[TrainingRunConfig, EzV2LearnerConfig]:
         num_mcts_sims=3,
         max_ply=20,  # Short games
         train_steps_per_iter=5,
-        batch_size=4,
-        arena_compare=2,
         checkpoint="",  # Don't save checkpoints in tests
         temp_threshold=1,
         recurrent_policy_topk=None,  # Full policy for accuracy
+        stockfish_eval_every=0,  # Avoid Stockfish during integration runs if loop expands
     )
 
     learner = EzV2LearnerConfig(
@@ -49,7 +48,7 @@ class TestFullTrainingIteration:
         nnet = LunaNetwork(game, learner_cfg)
         coach = Coach(game, nnet, run_cfg)
 
-        # Run one iteration (self-play + training + arena)
+        # Run one iteration (self-play + training)
         # This should complete without errors and with legal masking active
         initial_step = coach.nnet._global_step
 
@@ -65,40 +64,29 @@ class TestFullTrainingIteration:
 
         # Add to replay
         for traj in train_examples:
-            coach.replay.save(traj)
+            coach.replay.save_trajectory(traj)
 
         # Training
-        if coach.replay.size() >= run_cfg.batch_size:
-            coach.nnet.train(
+        if coach.replay.size >= learner_cfg.batch_size:
+            coach.nnet.train_ezv2(
                 coach.replay,
-                run_cfg.train_steps_per_iter,
+                steps=run_cfg.train_steps_per_iter,
                 mcts_for_reanalyze=None,  # No reanalysis in test
             )
-
-        # Arena
-        coach.pnet.nnet.load_state_dict(coach.nnet.nnet.state_dict())
-        arena_results = coach._play_arena_games_batched(
-            coach.nnet,
-            coach.pnet,
-            Coach._arena_mcts_params(run_cfg),
-            num_games=run_cfg.arena_compare,
-        )
-        assert len(arena_results) == run_cfg.arena_compare
 
         elapsed = time.time() - start_time
 
         # Verify training happened
         assert coach.nnet._global_step > initial_step
-        assert coach.replay.size() > 0
+        assert coach.replay.size > 0
 
         # Should complete reasonably fast on CPU
         assert elapsed < 300, f"Integration test took {elapsed:.1f}s (should be <300s)"
 
         # Check that all games finished (no crashes from illegal moves)
         for traj in train_examples:
-            # Last reward should be terminal reward (non-zero)
-            # Note: get_next_state defensive handling might pick random moves,
-            # but it should still complete without crashing
+            # The trajectory remains internally consistent even when the
+            # configured ply cap adjudicates the position as a draw.
             assert len(traj.rewards) > 0
 
     def test_training_with_reanalysis(self) -> None:
@@ -117,14 +105,14 @@ class TestFullTrainingIteration:
         # Generate some data
         train_examples = coach.execute_episodes_batched(2)
         for traj in train_examples:
-            coach.replay.save(traj)
+            coach.replay.save_trajectory(traj)
 
         # Train with reanalysis
         initial_step = coach.nnet._global_step
-        coach.nnet.train(
+        coach.nnet.train_ezv2(
             coach.replay,
             steps=3,
-            mcts_for_reanalyze=coach.nnet,  # Use current network for reanalysis
+            mcts_for_reanalyze=run_cfg,
         )
 
         # Should complete without errors
@@ -186,8 +174,8 @@ class TestDeviceSupport:
         coach = Coach(game, nnet1, run_cfg)
         train_examples = coach.execute_episodes_batched(1)
         for traj in train_examples:
-            coach.replay.save(traj)
-        nnet1.train(coach.replay, steps=2, mcts_for_reanalyze=None)
+            coach.replay.save_trajectory(traj)
+        nnet1.train_ezv2(coach.replay, steps=2, mcts_for_reanalyze=None)
 
         # Save checkpoint
         with tempfile.TemporaryDirectory() as tmpdir:
