@@ -1,7 +1,7 @@
 """Benchmark a Luna checkpoint vs Stockfish (no training loop).
 
 Example:
-    uv run python src/eval_vs_stockfish.py --checkpoint ./temp/latest.pth.tar \\
+    uv run python src/eval_vs_stockfish.py --checkpoint ./runs/luna-main/latest.pth.tar \\
       --run.stockfish-eval-games 10 --run.stockfish-elo 1320
 """
 
@@ -24,7 +24,7 @@ from luna.network import LunaNetwork
 class EvalVsStockfishCli:
     """Load ``checkpoint`` and run :func:`~luna.game.stockfish_eval.run_stockfish_eval`."""
 
-    checkpoint: str = "./temp/latest.pth.tar"
+    checkpoint: str = "./runs/luna-main/latest.pth.tar"
     """Path to a ``*.pth.tar`` file."""
 
     log_level: str = "INFO"
@@ -56,8 +56,11 @@ def main() -> int:
     out = run_stockfish_eval(game, nnet, cfg.run, iteration=None)
     if isinstance(out, StockfishEvalScores):
         return 0
-    if out.reason == "too_few_games":
-        logger.error("Stockfish eval skipped: {} — set --run.stockfish-eval-games to an even number ≥ 2.", out.message)
+    if out.reason in {"too_few_games", "too_many_games"}:
+        logger.error(
+            "Stockfish eval skipped: {} — set --run.stockfish-eval-games to an even number from 2 through 20.",
+            out.message,
+        )
         return 3
     if out.reason == "no_engine":
         logger.error("Stockfish eval skipped (engine): {}", out.message)

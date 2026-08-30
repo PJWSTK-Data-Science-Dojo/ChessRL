@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from luna.config import MCTSParams
-from luna.game.chess_game import ChessGame
+from luna.game.chess_game import ChessGame, player_from_turn
 from luna.profiling import SelfPlayMCTSTimings
 
 if TYPE_CHECKING:
@@ -141,8 +141,8 @@ def _validate_search(params: MCTSParams, num_sims: int, temp: float) -> None:
     """Fail early on search settings that cannot define a valid policy."""
     if num_sims <= 0:
         raise ValueError("num_sims must be positive")
-    if temp < 0:
-        raise ValueError("temp must be non-negative")
+    if not math.isfinite(temp) or temp < 0:
+        raise ValueError("temp must be finite and non-negative")
     if params.search_mode not in {"gumbel", "puct"}:
         raise ValueError(f"unknown MCTS search_mode: {params.search_mode!r}")
     if params.pb_c_base <= 0:
@@ -243,6 +243,20 @@ def _softmax(logits: np.ndarray) -> np.ndarray:
     shifted = logits - float(np.max(logits))
     probabilities = np.exp(shifted)
     return probabilities / float(probabilities.sum())
+
+
+def _visit_count_policy(counts: np.ndarray, temp: float) -> np.ndarray:
+    """Apply temperature to positive visit counts without overflow."""
+    positive = counts > 0
+    if not np.any(positive):
+        raise ValueError("visit-count policy requires at least one positive count")
+    log_counts = np.log(counts[positive])
+    with np.errstate(over="ignore"):
+        logits = (log_counts - float(log_counts.max())) / temp
+    probabilities = np.exp(logits)
+    policy = np.zeros_like(counts, dtype=np.float64)
+    policy[positive] = probabilities / float(probabilities.sum())
+    return policy
 
 
 def _gumbel_interior_best_action(node: _LatentNode, params: MCTSParams) -> int:
@@ -460,8 +474,7 @@ class MCTS:
                 probs = [0.0] * action_size
                 probs[self.last_action] = 1.0
             else:
-                counts_temp = counts ** (1.0 / max(temp, 1e-8))
-                probs = (counts_temp / counts_temp.sum()).tolist()
+                probs = _visit_count_policy(counts, temp).tolist()
         else:
             actions = np.fromiter(root.children, dtype=np.int64)
             priors = np.array([root.children[int(action)].prior for action in actions], dtype=np.float64)
@@ -470,8 +483,7 @@ class MCTS:
             if temp == 0:
                 probs_array[self.last_action] = 1.0
             else:
-                tempered = np.maximum(priors, EPS) ** (1.0 / max(temp, EPS))
-                probs_array[actions] = tempered / tempered.sum()
+                probs_array[actions] = _visit_count_policy(np.maximum(priors, EPS), temp)
             probs = probs_array.tolist()
 
         return probs, root_value
@@ -492,12 +504,12 @@ class MCTS:
             terminal_value: float | None = None
             if node.board is not None:
                 try:
-                    child_board, child_player = self.game.get_next_state(node.board, 1, best_action)
+                    parent_player = player_from_turn(node.board.turn)
+                    child_board, child_player = self.game.get_next_state(node.board, parent_player, best_action)
                     terminal_value = self.game.get_game_outcome(child_board, child_player)
-                    canonical_child = self.game.get_canonical_form(child_board, child_player)
-                    child.board = canonical_child
+                    child.board = child_board
                     if terminal_value is None:
-                        child_valid_mask = self.game.get_valid_moves(canonical_child, 1)
+                        child_valid_mask = self.game.get_valid_moves(child_board, child_player)
                 except ValueError as exc:
                     raise RuntimeError(f"MCTS selected invalid action {best_action} at {node.board.fen()}") from exc
 
@@ -748,12 +760,12 @@ class BatchedMCTS:
             for parent_board, action in zip(parent_boards, pending_actions):
                 if parent_board is not None:
                     try:
-                        child_board, child_player = self.game.get_next_state(parent_board, 1, action)
+                        parent_player = player_from_turn(parent_board.turn)
+                        child_board, child_player = self.game.get_next_state(parent_board, parent_player, action)
                         terminal_value = self.game.get_game_outcome(child_board, child_player)
-                        canonical_child = self.game.get_canonical_form(child_board, child_player)
-                        child_boards_list.append(canonical_child)
+                        child_boards_list.append(child_board)
                         child_valid_mask = (
-                            self.game.get_valid_moves(canonical_child, 1) if terminal_value is None else None
+                            self.game.get_valid_moves(child_board, child_player) if terminal_value is None else None
                         )
                         valid_masks_list.append(child_valid_mask)
                         terminal_values.append(terminal_value)
@@ -894,8 +906,7 @@ class BatchedMCTS:
                     probs_arr = np.zeros(action_size, dtype=np.float32)
                     probs_arr[proposed_action] = 1.0
                 else:
-                    counts_temp = counts ** (1.0 / max(temp, 1e-8))
-                    probs_arr = (counts_temp / counts_temp.sum()).astype(np.float32, copy=False)
+                    probs_arr = _visit_count_policy(counts, temp).astype(np.float32, copy=False)
             else:
                 probs_arr = np.zeros(action_size, dtype=np.float32)
 

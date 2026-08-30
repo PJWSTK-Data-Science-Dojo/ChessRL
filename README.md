@@ -18,7 +18,8 @@ This is a research and portfolio project, not a claim of engine parity with esta
 - Prioritized trajectory replay with compact `float16` observations/policies and boolean legal masks.
 - AdamW, learning-rate warm-up followed by cosine decay, mixed precision, gradient clipping, accumulation, and recurrent gradient scaling.
 - Optional batched search-value estimation and policy reanalysis using the current network.
-- Versioned, atomic checkpoints that include architecture, optimizer, scaler, step, and trainer-iteration metadata.
+- Versioned, atomic checkpoints that include architecture, optimizer, scaler, step,
+  trainer iteration, and the learning-rate schedule horizon.
 
 The implementation follows ideas from [MuZero](https://arxiv.org/abs/1911.08265), [EfficientZero](https://arxiv.org/abs/2111.00210), [EfficientZero V2](https://proceedings.mlr.press/v235/wang24at.html), [Gumbel MuZero](https://openreview.net/forum?id=bERaNdoegnO), and [SimSiam](https://arxiv.org/abs/2011.10566).
 
@@ -37,7 +38,7 @@ Start a new training run with the maintained single-accelerator preset:
 ```bash
 command -v stockfish
 printf 'uci\nquit\n' | stockfish | rg '^uciok$'
-make train
+make train CHECKPOINT_DIR=./runs/luna-main
 ```
 
 The locked `stockfish` Python package is an engine controller, not the Stockfish
@@ -47,32 +48,45 @@ maintained preset. Its startup preflight deliberately stops the run if the sched
 external benchmark cannot launch. For a binary outside `PATH`, pass an absolute path:
 
 ```bash
-make train ARGS='--run.stockfish-path /absolute/path/to/stockfish'
+make train CHECKPOINT_DIR=./runs/luna-main \
+  ARGS='--run.stockfish-path /absolute/path/to/stockfish'
 ```
 
 All preset values remain overrideable because `ARGS` is appended last:
 
 ```bash
-make train ARGS='--run.num-iters 20 --run.num-mcts-sims 24'
+make train CHECKPOINT_DIR=./runs/luna-main \
+  ARGS='--run.num-iters 20 --run.num-mcts-sims 24'
 ```
 
 Resume the most recently published training state:
 
 ```bash
-make resume
+make resume CHECKPOINT_DIR=./runs/luna-main
 ```
 
-`make resume` uses `./temp/latest.pth.tar` and the same architecture preset as `make train`. For a custom architecture, pass the same learner flags that created the checkpoint. The loader intentionally rejects unversioned or incompatible legacy files.
+`CHECKPOINT_DIR` defaults to `./runs/luna-main`; giving each experiment a named directory keeps
+its checkpoints isolated. A fresh run requires a new or empty directory. `make resume`
+loads `latest.pth.tar` from the selected directory and uses the same architecture preset
+as `make train`. For a custom architecture, pass the same learner flags that created the
+checkpoint. The loader intentionally rejects unversioned or incompatible legacy files.
+Resuming into a different checkpoint directory is allowed only when that destination is
+empty of managed checkpoints and evaluation metadata, preventing two experiment lineages
+from being merged accidentally.
 
 Use `uv run python src/main.py --help` for the complete Tyro-generated option reference. A bare `src/main.py` invocation uses the lighter dataclass defaults; `make train` applies the larger maintained experiment preset.
 
 ## Checkpoint contract
 
-Training writes format-v2 files under `./temp/`:
+Training writes format-v2 files under `CHECKPOINT_DIR` (`./runs/luna-main` by default):
 
 - `checkpoint_<iteration>.pth.tar` is an immutable numbered snapshot. Retention is controlled by `--run.checkpoint-top-k`.
 - `latest.pth.tar` is atomically updated after every completed training iteration. Use it for resume and local testing, not as a public deployment artifact.
 - `best.pth.tar` is created or replaced only when a numbered checkpoint improves the external Stockfish benchmark score. It is not a synonym for “newest.”
+
+Resume restores the optimizer, scaler, global step, trainer iteration, and the original
+learning-rate schedule horizon. A resumed invocation cannot silently redefine the
+warm-up and cosine schedule by requesting a different training horizon.
 
 Checkpoints and evaluation metadata are runtime artifacts and are ignored by Git. No pretrained weights are bundled.
 Public serving uses a read-only, versioned copy of an evaluated checkpoint plus its SHA-256 digest; `make release-web-model RELEASE_ID=<id>` creates that release without overwriting an existing ID.
@@ -124,7 +138,7 @@ Run an external benchmark without changing checkpoint promotion state:
 
 ```bash
 uv run python src/eval_vs_stockfish.py \
-  --checkpoint ./temp/latest.pth.tar \
+  --checkpoint ./runs/luna-main/latest.pth.tar \
   --run.stockfish-eval-games 20 \
   --run.stockfish-depth 10
 ```
@@ -132,8 +146,8 @@ uv run python src/eval_vs_stockfish.py \
 Set `--run.stockfish-path` when the executable is not discoverable. Elo limiting defaults
 to Stockfish's supported floor of 1320; keep Elo, depth, engine build, and search
 settings fixed when comparing checkpoints. Periodic training evaluation is
-controlled by `--run.stockfish-eval-every`; set it to `0` to disable. Alternating colors
-make comparisons more useful, but a small match is still a noisy estimate.
+controlled by `--run.stockfish-eval-every`; set it to `0` to disable. Each versioned
+opening is played with both color assignments. A small match is still a noisy estimate.
 
 ## Training flow
 
@@ -150,10 +164,12 @@ Chess uses an undiscounted terminal objective (`discount=1.0`). Terminal outcome
 
 ```bash
 make fmt                 # format and apply safe Ruff fixes
+make format-check        # verify Ruff formatting without editing files
 make lint                # Ruff checks
 make types               # mypy over src
 make test                # pytest suite
-make check               # lint + types + tests
+make check               # format check + lint + types + tests
+make audit               # audit locked runtime dependencies (network required)
 make bench               # throughput benchmark
 make profile-smoke       # bounded end-to-end profile
 make test-pipeline-cpu   # short CPU training smoke test

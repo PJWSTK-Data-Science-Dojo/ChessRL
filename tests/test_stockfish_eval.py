@@ -3,7 +3,10 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import chess
+
 from luna.config import EzV2LearnerConfig, TrainingRunConfig, evaluation_mcts_params
+from luna.game.arena import Arena
 from luna.game.chess_game import ChessGame
 from luna.game.player import StockfishPlayer
 from luna.game.stockfish_eval import (
@@ -61,6 +64,78 @@ class TestRunStockfishEval:
         assert isinstance(out, StockfishEvalSkipped)
         assert out.reason == "no_engine"
 
+    def test_uses_distinct_paired_openings_and_resets_stockfish(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
+        calls: list[tuple[str, tuple[chess.Move, ...], bool, bool]] = []
+
+        def model_player(_board: chess.Board) -> int:
+            raise AssertionError("Patched Arena must not request a move")
+
+        class _Stockfish:
+            def __init__(self) -> None:
+                self.new_game_calls = 0
+                self.close_calls = 0
+
+            def play(self, _board: chess.Board) -> int:
+                raise AssertionError("Patched Arena must not request a move")
+
+            def new_game(self) -> None:
+                self.new_game_calls += 1
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        stockfish = _Stockfish()
+
+        def record_game(
+            arena: Arena,
+            verbose: bool = False,
+            max_ply: int | None = None,
+            initial_board: chess.Board | None = None,
+        ) -> float:
+            del verbose, max_ply
+            assert initial_board is not None
+            calls.append(
+                (
+                    initial_board.fen(),
+                    tuple(initial_board.move_stack),
+                    arena.player1 is model_player,
+                    arena.player2 is model_player,
+                )
+            )
+            return 0.0
+
+        network = LunaNetwork(chess_game, small_learner_config)
+        run = TrainingRunConfig(
+            stockfish_eval_games=4,
+            num_mcts_sims=1,
+            evaluation_num_mcts_sims=1,
+        )
+        with (
+            patch("luna.game.stockfish_eval._stockfish_player", return_value=stockfish),
+            patch("luna.game.stockfish_eval.ArenaMCTSPlayer", return_value=model_player),
+            patch.object(Arena, "play_game", new=record_game),
+        ):
+            outcome = run_stockfish_eval(chess_game, network, run)
+
+        assert outcome == StockfishEvalScores(model_wins=0, draws=4, stockfish_wins=0)
+        assert stockfish.new_game_calls == 4
+        assert stockfish.close_calls == 1
+        assert len(calls) == 4
+        assert calls[0][0] == calls[1][0]
+        assert calls[2][0] == calls[3][0]
+        assert calls[0][0] != calls[2][0]
+        assert [call[2:] for call in calls] == [
+            (True, False),
+            (False, True),
+            (True, False),
+            (False, True),
+        ]
+        assert all(len(call[1]) == 6 for call in calls)
+
     def test_returns_skipped_when_stockfish_process_exits(
         self,
         chess_game: ChessGame,
@@ -92,7 +167,7 @@ def test_scores_dataclass_fields() -> None:
     assert s.model_wins == 2 and s.draws == 1 and s.stockfish_wins == 7
 
 
-def test_stockfish_player_keeps_elo_limiting_enabled() -> None:
+def test_stockfish_player_configures_engine_and_forwards_new_game() -> None:
     calls: list[tuple[str, int]] = []
 
     class _Engine:
@@ -101,6 +176,9 @@ def test_stockfish_player_keeps_elo_limiting_enabled() -> None:
 
         def set_depth(self, depth: int) -> None:
             calls.append(("depth", depth))
+
+        def send_ucinewgame_command(self) -> None:
+            calls.append(("new_game", 0))
 
         def send_quit_command(self) -> None:
             calls.append(("close", 0))
@@ -115,9 +193,10 @@ def test_stockfish_player_keeps_elo_limiting_enabled() -> None:
     module = SimpleNamespace(Stockfish=create_engine)
     with patch("luna.game.player.importlib.import_module", return_value=module):
         player = StockfishPlayer(path="/opt/stockfish")
+        player.new_game()
         player.close()
 
-    assert calls == [("elo", 1320), ("depth", 10), ("close", 0)]
+    assert calls == [("elo", 1320), ("depth", 10), ("new_game", 0), ("close", 0)]
 
 
 def test_stockfish_preflight_closes_verified_process() -> None:

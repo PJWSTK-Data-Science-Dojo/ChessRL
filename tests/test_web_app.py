@@ -123,6 +123,21 @@ def test_selfplay_and_structured_validation_errors() -> None:
     assert invalid.get_json()["error"]["code"] == "invalid_mode"
 
 
+@pytest.mark.parametrize(
+    ("payload", "error_code"),
+    [
+        ({"mode": []}, "invalid_mode"),
+        ({"mode": "human", "strength": []}, "invalid_strength"),
+        ({"mode": "human", "color": []}, "invalid_color"),
+    ],
+)
+def test_game_creation_rejects_non_string_options(payload: dict[str, object], error_code: str) -> None:
+    response = _app().test_client().post("/api/v1/games", json=payload)
+
+    assert response.status_code == 422
+    assert response.get_json()["error"]["code"] == error_code
+
+
 def test_missing_model_reports_service_unavailable() -> None:
     application = create_app(None)
     application.config.update(TESTING=True, SECRET_KEY="test-secret")

@@ -17,18 +17,24 @@ Run these commands from the ChessRL repository root:
 ```bash
 uv sync --extra perf
 test -x .venv/bin/luna-uci
-test -f temp/latest.pth.tar
+test -f runs/luna-main/latest.pth.tar
 
 git clone https://github.com/lichess-bot-devs/lichess-bot.git ../lichess-bot
+git -C ../lichess-bot checkout --detach df7e730de58cc3ef2f1415a0dc2eeda842d39167
 ```
 
-The bridge runs through `uv run --with-requirements`, so it does not need a separately managed environment. The UCI executable and checkpoint are recorded as absolute paths, so the two repositories can live anywhere. Luna loads `temp/latest.pth.tar`; every new game therefore starts with the latest atomically published model.
+The pinned bridge revision is the version verified with this integration. Review its
+release notes and configuration schema before deliberately updating it. The bridge runs
+through `uv run --with-requirements`, so it does not need a separately managed
+environment. The UCI executable and checkpoint are recorded as absolute paths, so the
+two repositories can live anywhere. Luna loads `runs/luna-main/latest.pth.tar`; every new game
+therefore starts with the latest atomically published model.
 
 Smoke-test the engine before connecting it to an account:
 
 ```bash
 printf 'uci\nisready\nquit\n' | .venv/bin/luna-uci \
-  --checkpoint "$(pwd)/temp/latest.pth.tar" \
+  --checkpoint "$(pwd)/runs/luna-main/latest.pth.tar" \
   --device cuda \
   --mcts-sims 32
 ```
@@ -58,8 +64,7 @@ uv run luna-lichess-config \
   --device cuda \
   --mcts-sims 100 \
   --minimum-sims 8 \
-  --estimated-sim-ms 4 \
-  --compile-inference
+  --estimated-sim-ms 4
 
 stat -c '%a %n' ../lichess-bot/config.yml
 ```
@@ -74,10 +79,11 @@ Useful options:
 - `--mcts-sims N` sets the maximum search budget.
 - `--minimum-sims N` keeps at least a small search under clock pressure.
 - `--estimated-sim-ms FLOAT` converts available move time into a simulation budget.
-- `--compile-inference` enables compiled inference after its initial warm-up.
+- `--compile-inference` opts into compiled inference. Leave it disabled until measured
+  cold-start time fits the bridge's UCI startup budget reliably.
 
 The generated challenge policy starts with casual standard chess and permits only one active game and one game per challenger. Bullet is disabled because safe neural-search latency depends on the host and cannot be enforced reliably for every human challenge. Enable rated games only after sustained casual testing shows legal moves, stable clocks, and clean restarts. Edit the generated YAML only if you understand the current
-[`lichess-bot` configuration schema](https://github.com/lichess-bot-devs/lichess-bot/blob/master/config.yml.default).
+[`lichess-bot` configuration schema](https://github.com/lichess-bot-devs/lichess-bot/blob/df7e730de58cc3ef2f1415a0dc2eeda842d39167/config.yml.default).
 
 ## 4. Convert and run the account
 
@@ -101,7 +107,11 @@ Open the bot profile on Lichess and send it a direct challenge. Both human and b
 
 Start with incremented blitz while measuring real search time. Luna uses the smaller of the configured maximum and the amount affordable from the UCI clock. `--estimated-sim-ms` should be a conservative measured value, including Python and tree-search overhead.
 
-If the bot moves too slowly, increase `--estimated-sim-ms` or reduce `--mcts-sims`. If it consistently has unused time, lower the estimate gradually. Luna warms compiled inference before announcing UCI readiness, so bridge startup can take longer but timed moves do not absorb compilation. Disable `--compile-inference` if startup cannot complete reliably on the host.
+If the bot moves too slowly, increase `--estimated-sim-ms` or reduce `--mcts-sims`. If
+it consistently has unused time, lower the estimate gradually. Compiled inference is
+off by default because compilation can add substantial cold-start latency. Enable it
+only after timing a complete bridge startup and confirming reliable UCI readiness on
+the deployment host.
 
 The generated config disables pondering and reserves 250 ms of bridge overhead. Those settings favor clock safety over squeezing out one more search batch.
 
@@ -121,4 +131,4 @@ For protocol diagnostics, run the bridge with `-v`; check that Luna answers `uci
 - [Official Lichess Bot API](https://lichess.org/api#tag/Bot)
 - [Official bot-account upgrade contract](https://lichess.org/api#operation/botAccountUpgrade)
 - [Maintained lichess-bot bridge](https://github.com/lichess-bot-devs/lichess-bot)
-- [Current upstream configuration template](https://github.com/lichess-bot-devs/lichess-bot/blob/master/config.yml.default)
+- [Pinned configuration template](https://github.com/lichess-bot-devs/lichess-bot/blob/df7e730de58cc3ef2f1415a0dc2eeda842d39167/config.yml.default)

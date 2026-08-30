@@ -160,7 +160,7 @@ class ChessGame:
         board = self.get_init_board()
         player = 1
         for t in range(pos_idx):
-            board, player = self.get_next_state(board, player, int(actions[t]))
+            player = self.push_action(board, player, int(actions[t]))
         return board, player
 
     def get_board_size(self) -> tuple[int, int, int]:
@@ -179,6 +179,18 @@ class ChessGame:
         automatically. Any other illegal action raises instead of silently executing a
         different move and corrupting replay data.
         """
+        next_board = board.copy(stack=True)
+        next_player = self.push_action(next_board, player, action)
+        return next_board, next_player
+
+    def push_action(self, board: chess.Board, player: int, action: int) -> int:
+        """Validate and apply an action to a board owned by the caller."""
+        move = self._legal_move(board, player, action)
+        board.push(move)
+        return player_from_turn(board.turn)
+
+    @staticmethod
+    def _legal_move(board: chess.Board, player: int, action: int) -> chess.Move:
         _validate_player_turn(board, player)
         try:
             move: chess.Move | None = action_to_move(action)
@@ -195,10 +207,7 @@ class ChessGame:
 
             if move is None or move not in board.legal_moves:
                 raise ValueError(f"Illegal action {action} for position {board.fen()}")
-
-        board = board.copy()
-        board.push(move)
-        return (board, player_from_turn(board.turn))
+        return move
 
     def get_valid_moves(self, board: chess.Board, player: int) -> np.ndarray:
         _validate_player_turn(board, player)

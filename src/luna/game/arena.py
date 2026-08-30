@@ -7,7 +7,7 @@ import chess
 from loguru import logger
 from tqdm import tqdm
 
-from luna.game.chess_game import ChessGame
+from luna.game.chess_game import ChessGame, player_from_turn
 
 _WIN_THRESHOLD = 0.5
 
@@ -31,14 +31,19 @@ class Arena:
         self.game = game
         self.display: Callable[[chess.Board], None] | None = display
 
-    def play_game(self, verbose: bool = False, max_ply: int | None = None) -> float:
+    def play_game(
+        self,
+        verbose: bool = False,
+        max_ply: int | None = None,
+        initial_board: chess.Board | None = None,
+    ) -> float:
         """Execute one episode. Returns +1 if player1 wins, -1 if player2 wins, or 0 for a draw.
 
         If ``max_ply`` is set and reached without a terminal outcome, returns ``0.0`` (draw).
         """
         players = {1: self.player1, -1: self.player2}
-        current_player = 1
-        board = self.game.get_init_board()
+        board = self.game.get_init_board() if initial_board is None else initial_board.copy(stack=True)
+        current_player = player_from_turn(board.turn)
         turn_count = 0
         while self.game.get_game_outcome(board, current_player) is None:
             if max_ply is not None and turn_count >= max_ply:
@@ -58,7 +63,7 @@ class Arena:
                 logger.error("Action {} is not valid!", action)
                 logger.debug("valids = {}", valids)
                 raise ValueError(f"Action {action} is not valid")
-            board, current_player = self.game.get_next_state(board, current_player, action)
+            current_player = self.game.push_action(board, current_player, action)
         if verbose:
             if self.display is None:
                 raise ValueError("display callback required for verbose mode")

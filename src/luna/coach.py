@@ -8,6 +8,7 @@ periodic Stockfish matches provide an external, fixed-opponent benchmark.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import time
@@ -20,13 +21,14 @@ import wandb
 from loguru import logger
 from tqdm import tqdm
 
-from luna.config import TrainingRunConfig
+from luna.config import TrainingRunConfig, validate_training_configuration
 from luna.game.chess_game import ChessGame
 from luna.game.stockfish_eval import (
     StockfishEvalOutcome,
     StockfishEvalScores,
     StockfishEvalSkipped,
     run_stockfish_eval,
+    stockfish_evaluation_protocol,
     validate_stockfish_configuration,
 )
 from luna.mcts import MCTS, BatchedMCTS
@@ -35,6 +37,40 @@ from luna.profiling import IterProfileStats, SelfPlayMCTSTimings, write_iter_sum
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 
 _BEST_EVAL_NAME = "best_eval.json"
+
+
+def _managed_checkpoint_conflicts(folder: Path) -> list[str]:
+    managed = list(folder.glob("checkpoint_*.pth.tar"))
+    managed.extend(folder / name for name in ("latest.pth.tar", "best.pth.tar", _BEST_EVAL_NAME))
+    return sorted(path.name for path in managed if path.exists())
+
+
+def validate_fresh_checkpoint_target(run: TrainingRunConfig) -> None:
+    """Refuse to start a new run in a directory containing managed training state."""
+    if not str(run.checkpoint).strip():
+        return
+    folder = Path(run.checkpoint).resolve()
+    conflicts = _managed_checkpoint_conflicts(folder)
+    if conflicts:
+        raise FileExistsError(
+            f"Fresh training would overwrite managed files in {folder}: {conflicts}. "
+            "Choose a new --run.checkpoint directory or resume latest.pth.tar."
+        )
+
+
+def validate_resume_checkpoint_target(run: TrainingRunConfig, source_checkpoint: str | Path) -> None:
+    """Prevent a resume checkpoint from being merged into another managed run."""
+    if not str(run.checkpoint).strip():
+        return
+    target = Path(run.checkpoint).resolve()
+    if Path(source_checkpoint).expanduser().resolve().parent == target:
+        return
+    conflicts = _managed_checkpoint_conflicts(target)
+    if conflicts:
+        raise FileExistsError(
+            f"Resume target {target} contains managed files from another checkpoint lineage: {conflicts}. "
+            "Resume in the source directory or choose a new, empty --run.checkpoint directory."
+        )
 
 
 class Coach:
@@ -51,29 +87,28 @@ class Coach:
         nnet: LunaNetwork,
         run: TrainingRunConfig,
         wandb_project: str | None = None,
+        seed: int = 0,
     ) -> None:
         self.game = game
         self.nnet = nnet
         self.run = run
+        validate_training_configuration(run, nnet._learner)
+        if not math.isclose(run.discount, nnet._learner.discount, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("run.discount and learner.discount must match")
         self.replay = PrioritizedReplayBuffer(
             capacity=run.replay_capacity,
             alpha=run.per_alpha,
             beta=run.per_beta,
         )
-        if abs(self.nnet._learner.discount - self.run.discount) > 1e-9:
-            logger.warning(
-                "learner.discount ({}) != run.discount ({}); using run.discount for both MCTS and TD targets.",
-                self.nnet._learner.discount,
-                self.run.discount,
-            )
-        self.nnet._learner.discount = self.run.discount
         self._profile_mcts_timings: SelfPlayMCTSTimings | None = None
         self._profile_sp_env_s: float = 0.0
+        self._checkpoint_lineage_iteration: int | None = None
+        self._checkpoint_target_validated = False
 
         if wandb_project:
             wandb.init(
                 project=wandb_project,
-                config=asdict(run),
+                config={"seed": seed, "run": asdict(run), "learner": asdict(nnet._learner)},
                 tags=["chess", "ezv2"],
             )
             logger.info("WandB initialized for project: {}", wandb_project)
@@ -122,7 +157,7 @@ class Coach:
             else:
                 action = int(np.argmax(pi))
 
-            board, current_player = self.game.get_next_state(board, current_player, action)
+            current_player = self.game.push_action(board, current_player, action)
             actions.append(action)
 
             outcome = self.game.get_game_outcome(board, current_player)
@@ -239,7 +274,7 @@ class Coach:
                 else:
                     action = int(np.argmax(pi))
 
-                boards[idx], players[idx] = self.game.get_next_state(boards[idx], players[idx], action)
+                players[idx] = self.game.push_action(boards[idx], players[idx], action)
                 action_lists[idx].append(action)
 
                 outcome = self.game.get_game_outcome(boards[idx], players[idx])
@@ -308,6 +343,8 @@ class Coach:
 
     def learn(self) -> None:
         """Full EZV2 training loop: self-play -> store in replay -> train from replay -> evaluate."""
+        self._assert_checkpoint_target()
+        self._assert_checkpoint_lineage()
         train_steps_per_iter = self.run.train_steps_per_iter
         total_train_steps = self.run.num_iters * train_steps_per_iter
 
@@ -446,24 +483,35 @@ class Coach:
         return (scores.model_wins + 0.5 * scores.draws) / float(total)
 
     @staticmethod
-    def _previous_best_score(metadata_path: Path) -> float:
+    def _previous_best_score(metadata_path: Path, protocol: dict[str, object]) -> float:
         if not metadata_path.exists():
             return float("-inf")
         try:
             payload = json.loads(metadata_path.read_text(encoding="utf-8"))
             score: object = payload["score"]
+            stored_protocol: object = payload["protocol"]
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise RuntimeError(f"Could not read external-evaluation metadata: {metadata_path}") from exc
         if isinstance(score, bool) or not isinstance(score, int | float):
             raise RuntimeError(f"External-evaluation score is not numeric: {metadata_path}")
+        if stored_protocol != protocol:
+            raise RuntimeError(
+                f"External-evaluation protocol differs from the score in {metadata_path}; "
+                "use a new checkpoint directory for this benchmark contract"
+            )
         return float(score)
 
     @staticmethod
-    def _write_best_metadata(metadata_path: Path, iteration: int, score: float) -> None:
+    def _write_best_metadata(
+        metadata_path: Path,
+        iteration: int,
+        score: float,
+        protocol: dict[str, object],
+    ) -> None:
         temporary = metadata_path.with_name(f".{metadata_path.name}.tmp-{os.getpid()}")
         try:
             temporary.write_text(
-                json.dumps({"iteration": iteration, "score": score}, indent=2) + "\n",
+                json.dumps({"iteration": iteration, "score": score, "protocol": protocol}, indent=2) + "\n",
                 encoding="utf-8",
             )
             os.replace(temporary, metadata_path)
@@ -473,6 +521,50 @@ class Coach:
     def _checkpoint_dir_usable(self) -> bool:
         return bool(str(self.run.checkpoint).strip())
 
+    def _assert_checkpoint_target(self) -> None:
+        if self._checkpoint_target_validated or not self._checkpoint_dir_usable():
+            return
+        source_checkpoint = self.nnet._loaded_checkpoint_path
+        if source_checkpoint is None:
+            validate_fresh_checkpoint_target(self.run)
+        else:
+            validate_resume_checkpoint_target(self.run, source_checkpoint)
+        self._checkpoint_target_validated = True
+
+    @staticmethod
+    def _numbered_checkpoints(folder: Path) -> list[tuple[int, Path]]:
+        numbered: list[tuple[int, Path]] = []
+        for path in folder.glob("checkpoint_*.pth.tar"):
+            try:
+                iteration = int(path.name.removeprefix("checkpoint_").removesuffix(".pth.tar"))
+            except ValueError:
+                logger.warning("Ignoring checkpoint with an invalid iteration name: {}", path)
+                continue
+            numbered.append((iteration, path))
+        return numbered
+
+    def _assert_checkpoint_lineage(self) -> None:
+        if not self._checkpoint_dir_usable():
+            return
+        managed_iteration = self._managed_checkpoint_iteration(Path(self.run.checkpoint).resolve())
+        self._checkpoint_lineage_iteration = managed_iteration
+        if managed_iteration > self.nnet._trainer_iteration:
+            raise RuntimeError(
+                "The checkpoint directory contains newer training state than the loaded checkpoint; "
+                "load its highest-iteration managed checkpoint or resume into a new directory"
+            )
+
+    def _managed_checkpoint_iteration(self, folder: Path) -> int:
+        numbered_iteration = max(
+            (iteration for iteration, _path in self._numbered_checkpoints(folder)),
+            default=0,
+        )
+        latest_path = folder / "latest.pth.tar"
+        if not latest_path.exists():
+            return numbered_iteration
+        latest_iteration = LunaNetwork.checkpoint_trainer_iteration(latest_path)
+        return max(numbered_iteration, latest_iteration)
+
     def _prune_checkpoint_files(self) -> None:
         top_k = self.run.checkpoint_top_k
         if top_k is None or top_k <= 0:
@@ -481,15 +573,7 @@ class Coach:
             return
 
         folder = Path(self.run.checkpoint).resolve()
-        numbered_with_iterations: list[tuple[int, Path]] = []
-        for path in folder.glob("checkpoint_*.pth.tar"):
-            try:
-                iteration = int(path.name.removeprefix("checkpoint_").removesuffix(".pth.tar"))
-            except ValueError:
-                logger.warning("Ignoring checkpoint with an invalid iteration name: {}", path)
-                continue
-            numbered_with_iterations.append((iteration, path))
-        numbered = [path for _, path in sorted(numbered_with_iterations, reverse=True)]
+        numbered = [path for _, path in sorted(self._numbered_checkpoints(folder), reverse=True)]
         for fp in numbered[max(1, int(top_k)) :]:
             try:
                 fp.unlink(missing_ok=True)
@@ -518,11 +602,12 @@ class Coach:
 
         sf_score = self._stockfish_normalized_score(outcome)
         metadata_path = folder / _BEST_EVAL_NAME
-        previous_score = self._previous_best_score(metadata_path)
+        protocol = asdict(stockfish_evaluation_protocol(self.run))
+        previous_score = self._previous_best_score(metadata_path, protocol)
         if sf_score <= previous_score:
             return
         self._atomic_copy(fp, folder / "best.pth.tar")
-        self._write_best_metadata(metadata_path, iteration, sf_score)
+        self._write_best_metadata(metadata_path, iteration, sf_score, protocol)
         logger.info("New best external score {:.3f} at iteration {}", sf_score, iteration)
 
     def _publish_checkpoint(self, iteration: int) -> None:
@@ -534,11 +619,34 @@ class Coach:
             return
 
         ck_name = f"checkpoint_{iteration}.pth.tar"
-        self.nnet._trainer_iteration = iteration
-        self.nnet.save_checkpoint(
-            folder=self.run.checkpoint,
-            filename=ck_name,
-        )
         folder = Path(self.run.checkpoint).resolve()
+        checkpoint_path = folder / ck_name
+        if checkpoint_path.exists():
+            raise FileExistsError(f"Refusing to overwrite immutable numbered checkpoint: {checkpoint_path}")
+        if self._checkpoint_lineage_iteration is None:
+            self._checkpoint_lineage_iteration = self._managed_checkpoint_iteration(folder)
+        numbered_iteration = max(
+            (saved_iteration for saved_iteration, _path in self._numbered_checkpoints(folder)),
+            default=0,
+        )
+        latest_existing = max(self._checkpoint_lineage_iteration, numbered_iteration)
+        if latest_existing >= iteration:
+            raise FileExistsError(
+                f"Refusing non-monotonic checkpoint {checkpoint_path}; "
+                f"directory already contains iteration {latest_existing}"
+            )
+        previous_iteration = self.nnet._trainer_iteration
+        self.nnet._trainer_iteration = iteration
+        numbered_saved = False
+        try:
+            self.nnet.save_checkpoint(
+                folder=self.run.checkpoint,
+                filename=ck_name,
+            )
+            numbered_saved = True
+        finally:
+            if not numbered_saved:
+                self.nnet._trainer_iteration = previous_iteration
         self._atomic_copy(folder / ck_name, folder / "latest.pth.tar")
+        self._checkpoint_lineage_iteration = iteration
         self._prune_checkpoint_files()

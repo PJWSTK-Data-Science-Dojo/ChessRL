@@ -50,7 +50,9 @@ class _PolicyMCTS:
 
 
 def _network_stub() -> LunaNetwork:
-    return object.__new__(LunaNetwork)
+    network = object.__new__(LunaNetwork)
+    network._mcts_inference_compiled = False
+    return network
 
 
 def _engine() -> LunaUciEngine:
@@ -87,6 +89,7 @@ def test_time_management_caps_and_floors_simulation_budget() -> None:
     assert engine._simulation_budget(["movetime", "2025"]) == 100
     assert engine._simulation_budget(["movetime", "1"]) == 8
     assert engine._simulation_budget(["wtime", "3000", "winc", "0"]) == 20
+    assert engine._simulation_budget(["wtime", "3000", "winc", "0", "movestogo", "10"]) == 60
     assert engine._simulation_budget(["nodes", "12"]) == 12
     assert engine._simulation_budget(["nodes", "1"]) == 1
     assert engine._search_limits(["nodes", "12", "movetime", "50"]).deadline is not None
@@ -214,6 +217,25 @@ def test_uci_handshake_and_runtime_options(monkeypatch: pytest.MonkeyPatch) -> N
     assert engine.options.mcts_simulations == 42
     assert engine.options.minimum_simulations == 6
     assert engine.options.estimated_simulation_ms == 2.5
+
+
+def test_uci_warms_once_after_announcing_protocol_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+
+    def record_warmup(self: LunaNetwork, game: ChessGame) -> None:
+        del self, game
+        events.append("warmup")
+
+    engine = _engine()
+    monkeypatch.setattr(LunaNetwork, "warmup_mcts_inference", record_warmup)
+    monkeypatch.setattr(engine, "send", events.append)
+    monkeypatch.setattr("sys.stdin", io.StringIO("uci\nisready\nisready\nquit\n"))
+
+    engine.run()
+
+    assert events.count("warmup") == 1
+    assert events.count("readyok") == 2
+    assert events.index("uciok") < events.index("warmup")
 
 
 def test_stop_interrupts_background_search_and_emits_one_move(
@@ -365,7 +387,7 @@ def test_search_worker_emits_fallback_before_unexpected_error_escapes(monkeypatc
     assert output == ["bestmove 0000"]
 
 
-def test_main_warms_inference_before_running_protocol(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_starts_protocol_without_eager_inference_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
     from luna import uci
 
     network = _network_stub()
@@ -420,5 +442,5 @@ def test_main_warms_inference_before_running_protocol(monkeypatch: pytest.Monkey
     result = uci.main()
 
     assert result == 0
-    assert len(warmed_games) == 1
+    assert warmed_games == []
     assert len(protocol_runs) == 1

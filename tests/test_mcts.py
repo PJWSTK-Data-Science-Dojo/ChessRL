@@ -213,6 +213,29 @@ class TestLatentSearch:
 
         assert sum(1 for probability in probs if probability > 0) == 1
 
+    @pytest.mark.parametrize("temperature", [1e-8, np.nextafter(0.0, 1.0)])
+    def test_puct_tiny_positive_temperature_returns_finite_policy(
+        self,
+        chess_game: ChessGame,
+        temperature: float,
+    ) -> None:
+        board = chess.Board("7k/8/5KQ1/8/8/8/8/8 w - - 0 1")
+        mate_action = move_to_action(chess.Move.from_uci("g6g7"))
+        network = _MateInOneNetwork(chess_game.get_action_size(), mate_action)
+        params = MCTSParams(num_mcts_sims=2, search_mode="puct", dir_noise=False)
+
+        policy = np.asarray(
+            MCTS(chess_game, network, params).get_action_prob(
+                board,
+                temp=temperature,
+                add_exploration_noise=False,
+            )
+        )
+
+        assert np.isfinite(policy).all()
+        assert float(policy.sum()) == pytest.approx(1.0)
+        assert int(np.argmax(policy)) == mate_action
+
     def test_terminal_root_short_circuits_initial_inference(self, chess_game: ChessGame) -> None:
         terminal = chess.Board("7K/6q1/6k1/8/8/8/8/8 w - - 0 1")
 
@@ -291,6 +314,27 @@ class TestBatchedMCTS:
             assert obs.shape == chess_game.get_board_size()
             assert valid.shape == (chess_game.get_action_size(),)
             assert np.count_nonzero(probs[valid == 0]) == 0
+
+    @pytest.mark.parametrize("temperature", [1e-8, np.nextafter(0.0, 1.0)])
+    def test_batch_puct_tiny_positive_temperature_returns_finite_policy(
+        self,
+        chess_game: ChessGame,
+        temperature: float,
+    ) -> None:
+        board = chess.Board("7k/8/5KQ1/8/8/8/8/8 w - - 0 1")
+        mate_action = move_to_action(chess.Move.from_uci("g6g7"))
+        network = _MateInOneNetwork(chess_game.get_action_size(), mate_action)
+        params = MCTSParams(num_mcts_sims=2, search_mode="puct", dir_noise=False)
+
+        policy = BatchedMCTS(chess_game, network, params).search_batch(
+            [board],
+            temp=temperature,
+            add_exploration_noise=False,
+        )[0][0]
+
+        assert np.isfinite(policy).all()
+        assert float(policy.sum()) == pytest.approx(1.0)
+        assert int(np.argmax(policy)) == mate_action
 
     def test_batch_gumbel_actions_and_improved_targets_are_separate(
         self,
@@ -381,6 +425,33 @@ class TestBatchedMCTS:
         assert abs(float(results[1][0].sum()) - 1.0) < 1e-6
         assert network.recurrent_calls == 1
         assert network.recurrent_batch_sizes == [1]
+
+    def test_batch_tree_keeps_native_turns_after_root(
+        self,
+        chess_game: ChessGame,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        network = _MateInOneNetwork(chess_game.get_action_size(), mate_action=0)
+        params = MCTSParams(
+            num_mcts_sims=2,
+            gumbel_max_considered_actions=1,
+            recurrent_policy_topk=None,
+        )
+
+        def reject_recanonicalization(_board: chess.Board, _player: int) -> Never:
+            raise AssertionError("MCTS descendants must retain their native board turn")
+
+        monkeypatch.setattr(chess_game, "get_canonical_form", reject_recanonicalization)
+
+        results = BatchedMCTS(chess_game, network, params).search_batch(
+            [chess_game.get_init_board()],
+            num_sims=2,
+            temp=0,
+            add_exploration_noise=False,
+        )
+
+        assert len(results) == 1
+        assert network.recurrent_calls == 2
 
     def test_batch_exploration_noise_accepts_per_root_flags(
         self,

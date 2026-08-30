@@ -21,7 +21,21 @@ _WIN = 0.5
 _stockfish_module = importlib.import_module("stockfish")
 _StockfishException = cast(type[Exception], _stockfish_module.StockfishException)
 
-SkipReason = Literal["too_few_games", "no_engine", "runtime_error"]
+SkipReason = Literal["too_few_games", "too_many_games", "no_engine", "runtime_error"]
+
+OPENING_SUITE_VERSION = 1
+_OPENING_LINES = (
+    ("e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"),
+    ("e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4"),
+    ("d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6"),
+    ("d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "d7d5"),
+    ("c2c4", "e7e5", "b1c3", "g8f6", "g1f3", "b8c6"),
+    ("g1f3", "d7d5", "g2g3", "g8f6", "f1g2", "g7g6"),
+    ("e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "g8f6"),
+    ("e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"),
+    ("d2d4", "g8f6", "c2c4", "e7e6", "g1f3", "b7b6"),
+    ("d2d4", "f7f5", "g2g3", "g8f6", "f1g2", "g7g6"),
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +58,32 @@ class StockfishEvalSkipped:
 StockfishEvalOutcome = StockfishEvalScores | StockfishEvalSkipped
 
 
+@dataclass(frozen=True)
+class StockfishEvaluationProtocol:
+    """Settings that must stay fixed when comparing external scores."""
+
+    opening_suite_version: int
+    games: int
+    stockfish_elo: int
+    stockfish_depth: int
+    stockfish_path: str | None
+    max_ply: int | None
+    mcts: MCTSParams
+
+
+def stockfish_evaluation_protocol(run: TrainingRunConfig) -> StockfishEvaluationProtocol:
+    """Capture the comparable external-evaluation contract."""
+    return StockfishEvaluationProtocol(
+        opening_suite_version=OPENING_SUITE_VERSION,
+        games=run.stockfish_eval_games,
+        stockfish_elo=run.stockfish_elo,
+        stockfish_depth=run.stockfish_depth,
+        stockfish_path=run.stockfish_path,
+        max_ply=run.stockfish_eval_max_ply,
+        mcts=evaluation_mcts_params(run),
+    )
+
+
 def _stockfish_player(run: TrainingRunConfig) -> StockfishPlayer:
     return StockfishPlayer(
         elo=run.stockfish_elo,
@@ -52,9 +92,22 @@ def _stockfish_player(run: TrainingRunConfig) -> StockfishPlayer:
     )
 
 
+def _evaluation_openings(pair_count: int) -> list[chess.Board]:
+    if pair_count > len(_OPENING_LINES):
+        raise ValueError(f"stockfish_eval_games supports at most {2 * len(_OPENING_LINES)} games")
+    openings: list[chess.Board] = []
+    for line in _OPENING_LINES[:pair_count]:
+        board = chess.Board()
+        for move_text in line:
+            board.push_uci(move_text)
+        openings.append(board)
+    return openings
+
+
 def validate_stockfish_configuration(run: TrainingRunConfig) -> None:
     """Fail before a long run when its configured external benchmark cannot start."""
     try:
+        _evaluation_openings(run.stockfish_eval_games // 2)
         player = _stockfish_player(run)
         player.close()
     except (OSError, ImportError, ValueError, RuntimeError, _StockfishException) as exc:
@@ -108,6 +161,11 @@ def run_stockfish_eval(
             "too_few_games",
             "need at least 2 games after rounding to an even count",
         )
+    try:
+        openings = _evaluation_openings(n_games // 2)
+    except ValueError as exc:
+        logger.warning("Stockfish eval skipped (opening suite): {}", exc)
+        return StockfishEvalSkipped("too_many_games", str(exc))
 
     mcts_params = evaluation_mcts_params(run)
     model_player = ArenaMCTSPlayer(game, nnet, mcts_params)
@@ -121,20 +179,21 @@ def run_stockfish_eval(
 
     mw = dr = sw = 0
     try:
-        for g in range(n_games):
-            model_is_p1 = g % 2 == 0
-            if model_is_p1:
-                arena = Arena(model_player, sf.play, game)
-            else:
-                arena = Arena(sf.play, model_player, game)
-            r = arena.play_game(verbose=False, max_ply=max_ply)
-            out = _score_game_for_model(r, model_is_p1)
-            if out == "model":
-                mw += 1
-            elif out == "sf":
-                sw += 1
-            else:
-                dr += 1
+        for opening in openings:
+            for model_is_p1 in (True, False):
+                sf.new_game()
+                if model_is_p1:
+                    arena = Arena(model_player, sf.play, game)
+                else:
+                    arena = Arena(sf.play, model_player, game)
+                r = arena.play_game(verbose=False, max_ply=max_ply, initial_board=opening)
+                out = _score_game_for_model(r, model_is_p1)
+                if out == "model":
+                    mw += 1
+                elif out == "sf":
+                    sw += 1
+                else:
+                    dr += 1
     except (OSError, ValueError, RuntimeError, _StockfishException) as exc:
         logger.exception("Stockfish eval aborted during games")
         return StockfishEvalSkipped("runtime_error", str(exc))
@@ -145,7 +204,7 @@ def run_stockfish_eval(
     wr = mw / total if total else 0.0
     iter_suffix = f" (iter {iteration})" if iteration is not None else ""
     logger.info(
-        "Stockfish eval{}: model {} — {} — {} SF | MCTS sims={} SF elo={} depth={} games={}",
+        "Stockfish eval{}: model {} — {} — {} SF | MCTS sims={} SF elo={} depth={} games={} openings=v{}",
         iter_suffix,
         mw,
         dr,
@@ -154,6 +213,7 @@ def run_stockfish_eval(
         run.stockfish_elo,
         run.stockfish_depth,
         n_games,
+        OPENING_SUITE_VERSION,
     )
     if wandb.run is not None:
         log_payload = {
@@ -161,6 +221,7 @@ def run_stockfish_eval(
             "stockfish/draws": dr,
             "stockfish/opponent_wins": sw,
             "stockfish/win_rate": wr,
+            "stockfish/opening_suite_version": OPENING_SUITE_VERSION,
         }
         if iteration is not None:
             log_payload["iteration"] = iteration

@@ -97,7 +97,7 @@ class TestFullTrainingIteration:
         # Enable reanalysis
         learner_cfg.reanalyze_mcts_sims = 4
         learner_cfg.reanalyze_prob = 1.0  # Always reanalyze for testing
-        learner_cfg.mixed_value_td_until_step = 0  # Start immediately
+        learner_cfg.reanalyze_start_step = 0  # Start immediately
 
         nnet = LunaNetwork(game, learner_cfg)
         coach = Coach(game, nnet, run_cfg)

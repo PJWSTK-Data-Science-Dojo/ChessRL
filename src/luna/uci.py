@@ -24,7 +24,7 @@ from luna.game.chess_game import ChessGame, mirror_move, move_to_action, player_
 from luna.mcts import MCTS
 from luna.network import LunaNetwork
 
-_TIMED_GO_KEYS = frozenset({"movetime", "wtime", "btime", "winc", "binc"})
+_TIMED_GO_KEYS = frozenset({"movetime", "wtime", "btime", "winc", "binc", "movestogo"})
 _CLOCK_SAFETY_MS = 25
 
 
@@ -55,6 +55,7 @@ class LunaUciEngine:
         self.board = chess.Board()
         self._search_thread: threading.Thread | None = None
         self._search_stop: threading.Event | None = None
+        self._ready = False
 
     @staticmethod
     def send(message: str) -> None:
@@ -106,7 +107,8 @@ class LunaUciEngine:
         if remaining is None:
             return None
         increment = max(0, values.get(f"{side}inc", 0))
-        normal_allocation = max(_CLOCK_SAFETY_MS, remaining // 30 + int(increment * 0.75))
+        moves_to_go = max(1, values.get("movestogo", 30))
+        normal_allocation = max(_CLOCK_SAFETY_MS, remaining // moves_to_go + int(increment * 0.75))
         clock_safe_limit = max(1, remaining - _CLOCK_SAFETY_MS)
         return min(normal_allocation, clock_safe_limit)
 
@@ -264,8 +266,15 @@ class LunaUciEngine:
         self._search_thread = None
         self._search_stop = None
 
+    def _ensure_ready(self) -> None:
+        if self._ready:
+            return
+        self.network.warmup_mcts_inference(self.game)
+        self._ready = True
+
     def _start_search(self, go_tokens: list[str]) -> None:
         self._stop_active_search()
+        self._ensure_ready()
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._search_worker,
@@ -322,6 +331,7 @@ class LunaUciEngine:
                     )
                     self.send("uciok")
                 elif command == "isready":
+                    self._ensure_ready()
                     self.send("readyok")
                 elif command == "ucinewgame":
                     self._stop_active_search()
@@ -348,7 +358,7 @@ class LunaUciEngine:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a Luna checkpoint as a UCI chess engine.")
-    parser.add_argument("--checkpoint", default="./temp/latest.pth.tar")
+    parser.add_argument("--checkpoint", default="./runs/luna-main/latest.pth.tar")
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"), default="cuda")
     parser.add_argument("--cuda-device", type=int, default=None)
     parser.add_argument("--mcts-sims", type=int, default=100)
@@ -373,7 +383,6 @@ def main() -> int:
             compile_inference=args.compile_inference,
             load_optimizer=False,
         )
-        network.warmup_mcts_inference(game)
     except (KeyError, OSError, RuntimeError, ValueError):
         logger.exception("Could not load Luna checkpoint")
         return 2

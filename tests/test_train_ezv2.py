@@ -1,5 +1,6 @@
 """Regression tests for EfficientZeroV2 training loop."""
 
+import math
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -74,7 +75,7 @@ def test_reanalyze_disables_async_prefetch_paths() -> None:
     learner = EzV2LearnerConfig(
         reanalyze_mcts_sims=2,
         reanalyze_prob=1.0,
-        mixed_value_td_until_step=0,
+        reanalyze_start_step=0,
         batch_size=2,
         num_channels=16,
         repr_blocks=1,
@@ -91,7 +92,7 @@ def test_reanalysis_warmup_keeps_plain_replay_prefetch_enabled(
 ) -> None:
     small_learner_config.reanalyze_mcts_sims = 2
     small_learner_config.reanalyze_prob = 1.0
-    small_learner_config.mixed_value_td_until_step = 10
+    small_learner_config.reanalyze_start_step = 10
     network = LunaNetwork(ChessGame(), small_learner_config)
 
     assert network._async_batch_prefetch(upcoming_steps=9)
@@ -108,14 +109,40 @@ def test_zero_replay_workers_disable_background_prefetch(
     assert not network._async_batch_prefetch()
 
 
+def test_recurrent_inference_copies_only_legal_policy_candidates(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(ChessGame(), small_learner_config)
+    latent = torch.zeros(1, small_learner_config.num_channels, 8, 8, device=network.device)
+    legal_mask = np.zeros(ACTION_SIZE, dtype=np.float32)
+    legal_mask[[12, 34]] = 1.0
+
+    result = network.batched_recurrent_inference(
+        latent,
+        [12],
+        valid_masks=[legal_mask],
+        policy_topk=256,
+    )
+
+    assert result.policy_full is None
+    assert result.topk_indices is not None
+    assert result.topk_probs is not None
+    assert result.topk_indices.shape == (1, 2)
+    assert set(result.topk_indices[0]) == {12, 34}
+    assert float(result.topk_probs.sum()) == pytest.approx(1.0)
+
+
 @pytest.mark.parametrize(
     ("field_name", "value", "message"),
     [
-        ("grad_accum_steps", 0, "grad_accum_steps must be positive"),
-        ("dataloader_workers", -1, "dataloader_workers cannot be negative"),
-        ("support_size", 0, "support_size must be an integer of at least 1"),
+        ("grad_accum_steps", 0, "grad_accum_steps must be a positive integer"),
+        ("dataloader_workers", -1, "dataloader_workers must be a non-negative integer"),
+        ("support_size", 0, "support_size must be a positive integer"),
         ("grad_clip_norm", 0.0, "grad_clip_norm must be positive and finite"),
         ("grad_clip_norm", float("inf"), "grad_clip_norm must be positive and finite"),
+        ("lr", float("nan"), "lr must be finite"),
+        ("reanalyze_prob", 1.1, "reanalyze_prob must be between 0 and 1"),
+        ("consistency_loss_weight", float("inf"), "consistency_loss_weight must be finite"),
     ],
 )
 def test_invalid_execution_settings_fail_loudly(
@@ -130,17 +157,23 @@ def test_invalid_execution_settings_fail_loudly(
         LunaNetwork(ChessGame(), small_learner_config)
 
 
-def test_training_rejects_zero_unroll_horizon(
+def test_learner_rejects_zero_unroll_horizon(
     small_learner_config: EzV2LearnerConfig,
 ) -> None:
     small_learner_config.unroll_steps = 0
-    small_learner_config.dataloader_workers = 0
-    network = LunaNetwork(ChessGame(), small_learner_config)
-    replay = PrioritizedReplayBuffer(capacity=2)
-    replay.save_trajectory(_make_trajectory(length=1))
 
-    with pytest.raises(ValueError, match="unroll_steps must be positive"):
-        network.train_ezv2(replay, steps=1)
+    with pytest.raises(ValueError, match="unroll_steps must be a positive integer"):
+        LunaNetwork(ChessGame(), small_learner_config)
+
+
+def test_learner_requires_equal_accumulation_microbatches(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.batch_size = 3
+    small_learner_config.grad_accum_steps = 2
+
+    with pytest.raises(ValueError, match="batch_size must be divisible by grad_accum_steps"):
+        LunaNetwork(ChessGame(), small_learner_config)
 
 
 def test_reported_total_loss_is_invariant_to_identical_gradient_accumulation() -> None:
@@ -151,7 +184,7 @@ def test_reported_total_loss_is_invariant_to_identical_gradient_accumulation() -
         torch.manual_seed(7)
         learner = EzV2LearnerConfig(
             device="cpu",
-            batch_size=1,
+            batch_size=2,
             unroll_steps=1,
             td_steps=1,
             num_channels=16,
@@ -175,6 +208,192 @@ def test_reported_total_loss_is_invariant_to_identical_gradient_accumulation() -
     assert accumulated_microbatches == pytest.approx(single_microbatch, rel=1e-5)
 
 
+def test_accumulation_samples_one_configured_batch_per_optimizer_step(
+    monkeypatch: pytest.MonkeyPatch,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.batch_size = 4
+    small_learner_config.grad_accum_steps = 2
+    small_learner_config.unroll_steps = 1
+    small_learner_config.td_steps = 1
+    small_learner_config.mixed_precision = False
+    small_learner_config.dataloader_workers = 0
+    small_learner_config.lr = 0.0
+    small_learner_config.lr_min = 0.0
+    network = LunaNetwork(ChessGame(), small_learner_config)
+    replay = PrioritizedReplayBuffer(capacity=4)
+    replay.save_trajectory(_make_trajectory(length=1))
+    requested_batch_sizes: list[int] = []
+    original_sample = replay.sample
+
+    def record_sample(
+        batch_size: int,
+        unroll_steps: int,
+    ) -> tuple[list[tuple[Trajectory, int]], np.ndarray, list[int]]:
+        requested_batch_sizes.append(batch_size)
+        return original_sample(batch_size, unroll_steps)
+
+    monkeypatch.setattr(replay, "sample", record_sample)
+
+    network.train_ezv2(replay, steps=2)
+
+    assert requested_batch_sizes == [4, 4]
+
+
+def test_non_finite_gradient_fails_before_parameter_update(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.batch_size = 1
+    small_learner_config.unroll_steps = 1
+    small_learner_config.td_steps = 1
+    small_learner_config.mixed_precision = False
+    small_learner_config.dataloader_workers = 0
+    network = LunaNetwork(ChessGame(), small_learner_config)
+    replay = PrioritizedReplayBuffer(capacity=2)
+    replay.save_trajectory(_make_trajectory(length=1))
+    parameter = next(network.nnet.parameters())
+    original = parameter.detach().clone()
+
+    def inject_non_finite(gradient: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(gradient, float("inf"))
+
+    hook = parameter.register_hook(inject_non_finite)
+    try:
+        with pytest.raises(RuntimeError, match="non-finite"):
+            network.train_ezv2(replay, steps=1)
+    finally:
+        hook.remove()
+
+    torch.testing.assert_close(parameter, original)
+
+
+def test_grad_scaler_retries_transient_overflow_without_counting_skipped_update(
+    monkeypatch: pytest.MonkeyPatch,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.batch_size = 1
+    small_learner_config.unroll_steps = 1
+    small_learner_config.td_steps = 1
+    small_learner_config.mixed_precision = False
+    small_learner_config.dataloader_workers = 1
+    small_learner_config.lr = 1e-3
+    small_learner_config.lr_min = 1e-3
+    network = LunaNetwork(ChessGame(), small_learner_config)
+    network.scaler = GradScaler("cpu", init_scale=8.0, growth_interval=1_000, enabled=True)
+    replay = PrioritizedReplayBuffer(capacity=2)
+    replay.save_trajectory(_make_trajectory(length=1))
+    sample_calls = 0
+    priority_update_calls = 0
+    original_sample = replay.sample
+    original_update_priorities = replay.update_priorities
+
+    def record_sample(
+        batch_size: int,
+        unroll_steps: int,
+    ) -> tuple[list[tuple[Trajectory, int]], np.ndarray, list[int]]:
+        nonlocal sample_calls
+        sample_calls += 1
+        return original_sample(batch_size, unroll_steps)
+
+    def record_priority_update(indices: list[int], td_errors: np.ndarray) -> None:
+        nonlocal priority_update_calls
+        priority_update_calls += 1
+        original_update_priorities(indices, td_errors)
+
+    monkeypatch.setattr(replay, "sample", record_sample)
+    monkeypatch.setattr(replay, "update_priorities", record_priority_update)
+    parameter = next(network.nnet.parameters())
+    gradient_calls = 0
+
+    def inject_one_overflow(gradient: torch.Tensor) -> torch.Tensor:
+        nonlocal gradient_calls
+        gradient_calls += 1
+        if gradient_calls == 1:
+            return torch.full_like(gradient, float("inf"))
+        return gradient
+
+    hook = parameter.register_hook(inject_one_overflow)
+    try:
+        metrics = network.train_ezv2(replay, steps=1)
+    finally:
+        hook.remove()
+
+    assert gradient_calls == 2
+    assert sample_calls == 1
+    assert priority_update_calls == 1
+    assert network._global_step == 1
+    assert network.scaler.get_scale() == pytest.approx(4.0)
+    assert all(math.isfinite(value) for value in metrics.values())
+
+
+def test_grad_scaler_stops_after_bounded_consecutive_overflows(
+    monkeypatch: pytest.MonkeyPatch,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.batch_size = 1
+    small_learner_config.unroll_steps = 1
+    small_learner_config.td_steps = 1
+    small_learner_config.mixed_precision = False
+    small_learner_config.dataloader_workers = 0
+    network = LunaNetwork(ChessGame(), small_learner_config)
+    network.scaler = GradScaler("cpu", init_scale=8.0, growth_interval=1_000, enabled=True)
+    replay = PrioritizedReplayBuffer(capacity=2)
+    replay.save_trajectory(_make_trajectory(length=1))
+    parameter = next(network.nnet.parameters())
+    original = parameter.detach().clone()
+
+    def inject_overflow(gradient: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(gradient, float("inf"))
+
+    def reject_priority_update(_indices: list[int], _td_errors: np.ndarray) -> None:
+        raise AssertionError("A skipped optimizer update must not change replay priorities")
+
+    monkeypatch.setattr("luna.network._MAX_CONSECUTIVE_AMP_SKIPS", 2)
+    monkeypatch.setattr(replay, "update_priorities", reject_priority_update)
+    hook = parameter.register_hook(inject_overflow)
+    try:
+        with pytest.raises(RuntimeError, match="2 consecutive non-finite gradient updates"):
+            network.train_ezv2(replay, steps=1)
+    finally:
+        hook.remove()
+
+    assert network._global_step == 0
+    torch.testing.assert_close(parameter, original)
+
+
+def test_finite_gradient_norm_overflow_fails_before_optimizer_mutation(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.batch_size = 1
+    small_learner_config.unroll_steps = 1
+    small_learner_config.td_steps = 1
+    small_learner_config.mixed_precision = False
+    small_learner_config.dataloader_workers = 0
+    network = LunaNetwork(ChessGame(), small_learner_config)
+    network.scaler = GradScaler("cpu", init_scale=8.0, enabled=True)
+    replay = PrioritizedReplayBuffer(capacity=2)
+    replay.save_trajectory(_make_trajectory(length=1))
+    parameter = next(parameter for parameter in network.nnet.parameters() if parameter.numel() >= 1_000)
+    original_parameters = [item.detach().clone() for item in network.nnet.parameters()]
+    original_lr = network.optimizer.param_groups[0]["lr"]
+
+    def inject_large_finite_gradient(gradient: torch.Tensor) -> torch.Tensor:
+        return torch.full_like(gradient, 1e30)
+
+    hook = parameter.register_hook(inject_large_finite_gradient)
+    try:
+        with pytest.raises(RuntimeError, match="Gradient norm overflowed despite finite gradient elements"):
+            network.train_ezv2(replay, steps=1)
+    finally:
+        hook.remove()
+
+    assert network._global_step == 0
+    assert not network.optimizer.state
+    assert network.optimizer.param_groups[0]["lr"] == original_lr
+    for current, original_item in zip(network.nnet.parameters(), original_parameters):
+        torch.testing.assert_close(current, original_item)
+
+
 def test_reanalysis_restores_training_mode_and_uses_direct_sve(
     monkeypatch: pytest.MonkeyPatch,
     small_learner_config: EzV2LearnerConfig,
@@ -184,7 +403,7 @@ def test_reanalysis_restores_training_mode_and_uses_direct_sve(
     small_learner_config.reanalyze_mcts_sims = 2
     small_learner_config.reanalyze_prob = 1.0
     small_learner_config.reanalyze_policy = True
-    small_learner_config.mixed_value_td_until_step = 0
+    small_learner_config.reanalyze_start_step = 0
     nnet = LunaNetwork(game, small_learner_config)
     replay = PrioritizedReplayBuffer(capacity=4)
     replay.save_trajectory(_make_trajectory(length=1))
@@ -234,6 +453,7 @@ def test_checkpoint_contains_architecture_metadata(
     nnet = LunaNetwork(chess_game, small_learner_config)
     nnet._global_step = 17
     nnet._trainer_iteration = 6
+    nnet._lr_schedule_total_steps = 80
     nnet.scaler = GradScaler("cpu", init_scale=1024.0, growth_interval=123, enabled=True)
     expected_scaler_state = nnet.scaler.state_dict()
     nnet.save_checkpoint(str(tmp_path), "metadata.pth.tar")
@@ -246,6 +466,7 @@ def test_checkpoint_contains_architecture_metadata(
     assert checkpoint["format_version"] == 2
     assert checkpoint["global_step"] == 17
     assert checkpoint["trainer_iteration"] == 6
+    assert checkpoint["lr_schedule_total_steps"] == 80
     assert checkpoint["scaler"] == expected_scaler_state
     assert checkpoint["model_spec"]["action_size"] == chess_game.get_action_size()
     assert checkpoint["model_spec"]["observation_shape"] == list(chess_game.get_board_size())
@@ -259,6 +480,7 @@ def test_checkpoint_contains_architecture_metadata(
     )
     assert restored._global_step == 17
     assert restored._trainer_iteration == 6
+    assert restored._lr_schedule_total_steps == 80
     assert restored._learner.num_channels == small_learner_config.num_channels
     assert restored._learner.recurrent_gradient_scale == pytest.approx(0.4)
 
@@ -266,6 +488,7 @@ def test_checkpoint_contains_architecture_metadata(
     resumed.scaler = GradScaler("cpu", init_scale=32.0, growth_interval=7, enabled=True)
     resumed.load_checkpoint(str(tmp_path), "metadata.pth.tar", load_optimizer=True)
     assert resumed.scaler.state_dict() == expected_scaler_state
+    assert resumed._lr_schedule_total_steps == 80
 
 
 def test_learning_rate_continues_from_checkpoint_global_step(
@@ -283,17 +506,20 @@ def test_learning_rate_continues_from_checkpoint_global_step(
 
     nnet = LunaNetwork(chess_game, small_learner_config)
     nnet._global_step = 7
+    nnet._lr_schedule_total_steps = 20
     nnet.save_checkpoint(str(tmp_path), "resume.pth.tar")
 
     restored = LunaNetwork(chess_game, small_learner_config)
     restored.load_checkpoint(str(tmp_path), "resume.pth.tar", load_optimizer=False)
+    assert restored._lr_schedule_total_steps == 20
     replay = PrioritizedReplayBuffer(capacity=8)
     replay.save_trajectory(_make_trajectory(length=4))
     expected_lr = restored._lr_schedule(step_in_run=8, total_steps=20)
 
-    restored.train_ezv2(replay, steps=1, total_train_steps=20)
+    restored.train_ezv2(replay, steps=1, total_train_steps=40)
 
     assert restored._global_step == 8
+    assert restored._lr_schedule_total_steps == 20
     assert restored.optimizer.param_groups[0]["lr"] == pytest.approx(expected_lr)
 
 
@@ -320,7 +546,10 @@ def test_checkpoint_loader_rejects_legacy_and_mismatched_model_specs(
         network.load_checkpoint(str(tmp_path), mismatch_path.name)
 
 
-@pytest.mark.parametrize("missing_field", ["optimizer", "scaler", "global_step", "trainer_iteration"])
+@pytest.mark.parametrize(
+    "missing_field",
+    ["optimizer", "scaler", "global_step", "trainer_iteration", "lr_schedule_total_steps"],
+)
 def test_checkpoint_loader_rejects_incomplete_v2_state(
     tmp_path: Path,
     chess_game: ChessGame,
@@ -415,10 +644,12 @@ def test_checkpoint_loader_rejects_invalid_training_state_containers_for_inferen
         network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=False)
 
 
+@pytest.mark.parametrize("counter_name", ["global_step", "lr_schedule_total_steps"])
 def test_checkpoint_counter_validation_precedes_model_mutation(
     tmp_path: Path,
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
+    counter_name: str,
 ) -> None:
     network = LunaNetwork(chess_game, small_learner_config)
     valid_path = tmp_path / "valid-counter.pth.tar"
@@ -427,11 +658,117 @@ def test_checkpoint_counter_validation_precedes_model_mutation(
     checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
     first_name = next(iter(checkpoint["state_dict"]))
     checkpoint["state_dict"][first_name] = checkpoint["state_dict"][first_name] + 1
-    checkpoint["global_step"] = -1
-    corrupt_path = tmp_path / "negative-counter.pth.tar"
+    checkpoint[counter_name] = -1
+    corrupt_path = tmp_path / f"negative-{counter_name}.pth.tar"
     torch.save(checkpoint, corrupt_path)
 
     with pytest.raises(ValueError, match="non-negative integer"):
+        network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=False)
+
+    for name, tensor in network.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, original[name])
+
+
+def test_checkpoint_save_rejects_non_finite_model_state_without_creating_file(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    parameter = next(network.nnet.parameters())
+    with torch.no_grad():
+        parameter.view(-1)[0] = float("nan")
+    checkpoint_path = tmp_path / "non-finite-save.pth.tar"
+
+    with pytest.raises(ValueError, match="non-finite value"):
+        network.save_checkpoint(str(tmp_path), checkpoint_path.name)
+
+    assert not checkpoint_path.exists()
+
+
+def test_checkpoint_loader_rejects_non_finite_model_state_before_mutation(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    original = {name: tensor.detach().clone() for name, tensor in network.nnet.state_dict().items()}
+    valid_path = tmp_path / "finite-model.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    first_name = next(iter(checkpoint["state_dict"]))
+    corrupt_tensor = checkpoint["state_dict"][first_name].clone()
+    corrupt_tensor.view(-1)[0] = float("nan")
+    checkpoint["state_dict"][first_name] = corrupt_tensor
+    corrupt_path = tmp_path / "non-finite-model.pth.tar"
+    torch.save(checkpoint, corrupt_path)
+
+    with pytest.raises(ValueError, match=r"non-finite value at checkpoint\.state_dict"):
+        network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=False)
+
+    for name, tensor in network.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, original[name])
+
+
+def test_checkpoint_loader_validates_optimizer_finiteness_for_inference_before_mutation(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    original = {name: tensor.detach().clone() for name, tensor in network.nnet.state_dict().items()}
+    valid_path = tmp_path / "finite-training-state.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    first_name = next(iter(checkpoint["state_dict"]))
+    checkpoint["state_dict"][first_name] = checkpoint["state_dict"][first_name] + 1
+    checkpoint["optimizer"]["param_groups"][0]["lr"] = float("nan")
+    corrupt_path = tmp_path / "non-finite-optimizer.pth.tar"
+    torch.save(checkpoint, corrupt_path)
+
+    with pytest.raises(ValueError, match=r"non-finite value at checkpoint\.optimizer\.param_groups\[0\]\.lr"):
+        network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=False)
+
+    for name, tensor in network.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, original[name])
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("scale", 0.0, "scale must be a positive normal float32"),
+        ("scale", math.ulp(0.0), "scale must be a positive normal float32"),
+        ("growth_factor", 1.0, "growth_factor must be greater than 1"),
+        ("growth_factor", 1.00000001, "growth_factor must be greater than 1"),
+        ("backoff_factor", 1.0, "backoff_factor must be between 0 and 1"),
+        ("backoff_factor", 0.999999999, "backoff_factor must be between 0 and 1"),
+        ("growth_interval", 0, "growth_interval must be positive"),
+        ("growth_interval", 2**31, "growth_interval must fit int32"),
+        ("_growth_tracker", -1, "_growth_tracker must be non-negative"),
+        ("_growth_tracker", 2_000, "_growth_tracker must be less than growth_interval"),
+    ],
+)
+def test_checkpoint_loader_rejects_invalid_scaler_semantics_before_mutation(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    field_name: str,
+    value: float | int,
+    message: str,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    original = {name: tensor.detach().clone() for name, tensor in network.nnet.state_dict().items()}
+    valid_path = tmp_path / "finite-scaler-state.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    first_name = next(iter(checkpoint["state_dict"]))
+    checkpoint["state_dict"][first_name] = checkpoint["state_dict"][first_name] + 1
+    checkpoint["scaler"] = GradScaler("cpu", enabled=True).state_dict()
+    checkpoint["scaler"][field_name] = value
+    corrupt_path = tmp_path / f"invalid-scaler-{field_name}.pth.tar"
+    torch.save(checkpoint, corrupt_path)
+
+    with pytest.raises(ValueError, match=message):
         network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=False)
 
     for name, tensor in network.nnet.state_dict().items():

@@ -196,7 +196,7 @@ def _parser(repository: Path) -> argparse.ArgumentParser:
     parser.add_argument("--template", type=Path, help="Override the upstream config.yml.default path.")
     parser.add_argument("--output", type=Path, help="Override the generated config.yml path.")
     parser.add_argument("--engine", type=Path, default=repository / ".venv/bin/luna-uci")
-    parser.add_argument("--checkpoint", type=Path, default=repository / "temp/latest.pth.tar")
+    parser.add_argument("--checkpoint", type=Path, default=repository / "runs/luna-main/latest.pth.tar")
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"), default="cuda")
     parser.add_argument("--cuda-device", type=int)
     parser.add_argument("--mcts-sims", type=int, default=100)

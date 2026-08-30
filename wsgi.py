@@ -41,12 +41,12 @@ web_secret = os.environ.get("LUNA_WEB_SECRET", "")
 if len(web_secret) < 32:
     raise RuntimeError("LUNA_WEB_SECRET must contain at least 32 characters")
 
-checkpoint_path = Path(os.environ.get("CHECKPOINT_PATH", "./temp/latest.pth.tar"))
+checkpoint_path = Path(os.environ.get("CHECKPOINT_PATH", "./runs/luna-main/latest.pth.tar"))
 engine = LunaEngineService(
     checkpoint_path,
     device=os.environ.get("DEVICE", "cuda"),
     search_simulations=int(os.environ.get("SEARCH_SIMULATIONS", "96")),
-    compile_inference=_environment_bool("COMPILE_INFERENCE", True),
+    compile_inference=_environment_bool("COMPILE_INFERENCE", False),
 )
 app = create_app(
     engine,

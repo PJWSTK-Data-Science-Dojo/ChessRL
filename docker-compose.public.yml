@@ -11,7 +11,7 @@ services:
                 - gpu
     environment:
       DEVICE: cuda
-      COMPILE_INFERENCE: "${COMPILE_INFERENCE:-true}"
+      COMPILE_INFERENCE: "${COMPILE_INFERENCE:-false}"
       SESSION_COOKIE_SECURE: "true"
       LUNA_TRUSTED_HOSTS: "${PUBLIC_HOSTNAME:?Set PUBLIC_HOSTNAME to the named-tunnel hostname},127.0.0.1"
       PROXY_HOPS: "1"

@@ -29,7 +29,7 @@ def _make_trajectory(game: ChessGame, length: int = 30) -> Trajectory:
 
 
 def _make_small_learner() -> EzV2LearnerConfig:
-    return EzV2LearnerConfig(num_channels=32, repr_blocks=2, dyn_blocks=1, proj_dim=64)
+    return EzV2LearnerConfig(num_channels=32, repr_blocks=2, dyn_blocks=1, proj_dim=64, discount=0.997)
 
 
 def bench_self_play(num_games: int = 3, num_sims: int = 5, max_ply: int | None = 80) -> None:

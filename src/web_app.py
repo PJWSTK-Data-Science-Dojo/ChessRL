@@ -17,7 +17,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import chess
 import numpy as np
@@ -610,11 +610,12 @@ def create_app(engine: LunaEngineService | None = None, config: WebAppConfig | N
     def create_game() -> ResponseReturnValue:
         active_engine = _engine()
         payload = _json_body()
-        mode = payload.get("mode", "human")
-        if mode not in {"human", "selfplay"}:
+        mode_value = payload.get("mode", "human")
+        if not isinstance(mode_value, str) or mode_value not in {"human", "selfplay"}:
             raise ApiError(422, "invalid_mode", "Mode must be 'human' or 'selfplay'.")
+        mode = cast(GameMode, mode_value)
         strength = payload.get("strength", "strong")
-        if strength not in active_engine.strengths:
+        if not isinstance(strength, str) or strength not in active_engine.strengths:
             raise ApiError(
                 422,
                 "invalid_strength",
@@ -624,12 +625,12 @@ def create_app(engine: LunaEngineService | None = None, config: WebAppConfig | N
 
         human_color: ColorName | None = None
         if mode == "human":
-            requested_color = payload.get("color", "white")
-            if requested_color == "random":
-                requested_color = secrets.choice(("white", "black"))
-            if requested_color not in {"white", "black"}:
+            color_value = payload.get("color", "white")
+            if color_value == "random":
+                color_value = secrets.choice(("white", "black"))
+            if not isinstance(color_value, str) or color_value not in {"white", "black"}:
                 raise ApiError(422, "invalid_color", "Color must be 'white', 'black', or 'random'.")
-            human_color = requested_color
+            human_color = cast(ColorName, color_value)
 
         record = _registry().create(
             owner_id=_client_id(),
@@ -867,7 +868,7 @@ class WebServeConfig:
     port: int = 5000
     debug: bool = False
     device: str = "cuda"
-    checkpoint: str = "./temp/latest.pth.tar"
+    checkpoint: str = "./runs/luna-main/latest.pth.tar"
     search_simulations: int = 96
     compile_inference: bool = True
 

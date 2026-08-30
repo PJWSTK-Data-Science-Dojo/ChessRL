@@ -1,10 +1,8 @@
 """Training / pipeline profiling helpers (wall-clock phases + optional PyTorch traces).
 
-Typical ``[self_play detail]`` breakdown (small net, batched self-play): ``expand_backup``
-often ~45-55% of MCTS interior (CPU child wiring after each recurrent batch),
-``recurrent_inf`` and ``initial_inf`` ~20-30% each, ``selection`` ~0-5%, ``encode`` small.
-Use this to choose optimizations: top-K policy H2D helps recurrent + expand; Numba helps
-if ``selection`` grows with wide trees.
+Use the ``[self_play detail]`` breakdown to choose optimizations from measurements.
+Recurrent inference often dominates larger models, while selection and expansion become
+better native-extension candidates only when their combined share is substantial.
 """
 
 import json

@@ -5,6 +5,7 @@ runs/
 temp/
 profiles/
 logs/
+wandb/
 content/
 *.pth
 *.pth.tar
@@ -44,6 +45,9 @@ config.yml
 compose.override.yml
 release/
 secrets/
+vendor/stockfish/
+AGENTS.md
+CLAUDE.md
 
 # Editor and operating-system files
 .idea/

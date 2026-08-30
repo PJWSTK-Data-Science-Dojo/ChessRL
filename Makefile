@@ -1,9 +1,11 @@
 ARGS ?=
 TRAIN_ARGS ?=
+CHECKPOINT_DIR ?= ./runs/luna-main
+CHECKPOINT_PATH = $(CHECKPOINT_DIR)/latest.pth.tar
 PUBLIC_ENV ?= .env.public
 RELEASE_DIR ?= ./release
 RELEASE_ID ?=
-RELEASE_SOURCE ?= ./temp/best.pth.tar
+RELEASE_SOURCE ?= $(CHECKPOINT_DIR)/best.pth.tar
 
 WEB_COMPOSE = docker compose --env-file .env -f docker-compose.yml
 PUBLIC_COMPOSE = docker compose --env-file $(PUBLIC_ENV) -f docker-compose.yml -f docker-compose.public.yml
@@ -12,16 +14,26 @@ fmt:
 	uv run --frozen --extra dev ruff format .
 	uv run --frozen --extra dev ruff check --fix .
 
+format-check:
+	uv run --frozen --extra dev ruff format --check .
+
 lint:
 	uv run --frozen --extra dev ruff check .
 
 types:
 	uv run --frozen --extra dev mypy src
 
-check: lint types test
+check: format-check lint types test
 
 test:
-	env -u PYTHONPATH uv run --frozen --extra dev pytest tests/ -v
+	env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run --frozen --extra dev pytest tests/ -v
+
+audit:
+	@audit_requirements=$$(mktemp); \
+	trap 'rm -f "$$audit_requirements"' EXIT; \
+	uv export --frozen --no-dev --extra perf --extra web --no-hashes \
+		--no-emit-project --output-file "$$audit_requirements" >/dev/null; \
+	uvx --from pip-audit==2.10.1 pip-audit --requirement "$$audit_requirements"
 
 bench:
 	uv run --frozen python tests/bench_throughput.py $(ARGS)
@@ -44,6 +56,7 @@ train:
 		--run.stockfish-eval-every 25 \
 		--run.stockfish-eval-games 8 \
 		--run.stockfish-elo 1320 \
+		--run.checkpoint "$(CHECKPOINT_DIR)" \
 		--run.checkpoint-top-k 3 \
 		--learner.device cuda \
 		--learner.cuda-device 0 \
@@ -60,11 +73,12 @@ train:
 		--learner.compile-inference \
 		--learner.reanalyze-mcts-sims 16 \
 		--learner.reanalyze-prob 0.25 \
-		--learner.mixed-value-td-until-step 15000 \
+		--learner.reanalyze-start-step 15000 \
 		$(TRAIN_ARGS) $(ARGS)
 
 resume:
-	$(MAKE) train TRAIN_ARGS="--load-model --load-checkpoint-dir ./temp/ --load-checkpoint-file latest.pth.tar $(TRAIN_ARGS)"
+	$(MAKE) train CHECKPOINT_DIR="$(CHECKPOINT_DIR)" \
+		TRAIN_ARGS='--load-model --load-checkpoint-dir "$(CHECKPOINT_DIR)" --load-checkpoint-file latest.pth.tar $(TRAIN_ARGS)'
 
 # Short end-to-end run with phase timings and a compact profiler trace.
 profile-smoke:
@@ -76,6 +90,7 @@ profile-smoke:
 		--run.max-ply 40 \
 		--run.train-steps-per-iter 12 \
 		--run.stockfish-eval-every 0 \
+		--run.checkpoint "" \
 		--run.profile \
 		--run.profile-torch-steps 8 \
 		--run.profile-dir ./profiles \
@@ -89,13 +104,13 @@ profile-smoke:
 		$(ARGS)
 
 serve:
-	uv run --frozen python src/web_app.py --checkpoint ./temp/latest.pth.tar $(ARGS)
+	uv run --frozen python src/web_app.py --checkpoint "$(CHECKPOINT_PATH)" $(ARGS)
 
 serve-cpu:
-	uv run --frozen python src/web_app.py --checkpoint ./temp/latest.pth.tar --device cpu --search-simulations 25 --no-compile-inference $(ARGS)
+	uv run --frozen python src/web_app.py --checkpoint "$(CHECKPOINT_PATH)" --device cpu --search-simulations 25 --no-compile-inference $(ARGS)
 
 serve-mps:
-	uv run --frozen python src/web_app.py --checkpoint ./temp/latest.pth.tar --device mps --search-simulations 50 --no-compile-inference $(ARGS)
+	uv run --frozen python src/web_app.py --checkpoint "$(CHECKPOINT_PATH)" --device mps --search-simulations 50 --no-compile-inference $(ARGS)
 
 release-web-model:
 	@test -n "$(RELEASE_ID)" || { echo "RELEASE_ID is required, for example RELEASE_ID=iteration-400" >&2; exit 2; }
@@ -140,13 +155,13 @@ web-public-logs:
 	$(PUBLIC_COMPOSE) logs --follow --tail=100 luna-web cloudflared
 
 uci:
-	uv run --frozen luna-uci --checkpoint ./temp/latest.pth.tar $(ARGS)
+	uv run --frozen luna-uci --checkpoint "$(CHECKPOINT_PATH)" $(ARGS)
 
 lichess-config:
-	uv run --frozen luna-lichess-config $(ARGS)
+	uv run --frozen luna-lichess-config --checkpoint "$(abspath $(CHECKPOINT_PATH))" $(ARGS)
 
 eval-stockfish:
-	uv run --frozen python src/eval_vs_stockfish.py --checkpoint ./temp/latest.pth.tar $(ARGS)
+	uv run --frozen python src/eval_vs_stockfish.py --checkpoint "$(CHECKPOINT_PATH)" $(ARGS)
 
 test-pipeline-cpu:
 	uv run --frozen python src/main.py \
@@ -157,6 +172,7 @@ test-pipeline-cpu:
 		--run.max-ply 32 \
 		--run.train-steps-per-iter 4 \
 		--run.stockfish-eval-every 0 \
+		--run.checkpoint "" \
 		--learner.device cpu \
 		--learner.batch-size 4 \
 		--learner.num-channels 16 \
@@ -169,7 +185,7 @@ test-pipeline-cpu:
 test-pipeline-mps:
 	$(MAKE) test-pipeline-cpu ARGS="--learner.device mps $(ARGS)"
 
-.PHONY: bench check eval-stockfish fmt lichess-config lint profile-smoke release-web-model resume serve \
-	serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train types uci verify-web-model \
-	web-build web-config web-down web-logs web-public-config web-public-down web-public-logs \
-	web-public-up web-up
+.PHONY: audit bench check eval-stockfish fmt format-check lichess-config lint profile-smoke \
+	release-web-model resume serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps \
+	train types uci verify-web-model web-build web-config web-down web-logs web-public-config \
+	web-public-down web-public-logs web-public-up web-up

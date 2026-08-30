@@ -270,6 +270,17 @@ class EZV2Networks(nn.Module):
         scalar_value = _support_to_scalar(value_logits, self.support_size)
         return latent, log_policy, scalar_value
 
+    def initial_inference_for_training(
+        self,
+        observation: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the latent state, log policy, and raw value logits for loss computation."""
+        obs_4d = self._obs_to_planes(observation)
+        latent = _scale_latent(self.representation(obs_4d))
+        policy_logits, value_logits = self.prediction(latent, valid_mask)
+        return latent, F.log_softmax(policy_logits, dim=1), value_logits
+
     def recurrent_inference(
         self,
         latent: torch.Tensor,

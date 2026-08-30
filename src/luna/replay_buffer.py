@@ -5,6 +5,8 @@ collating a sampled batch. This keeps a long self-play window practical without
 changing the learner's numerical precision.
 """
 
+from threading import RLock
+
 import numpy as np
 
 
@@ -120,16 +122,19 @@ class PrioritizedReplayBuffer:
         self.beta_increment = beta_increment
         self._tree = _SumTree(capacity)
         self._max_priority = 1.0
+        self._lock = RLock()
 
     @property
     def size(self) -> int:
-        return self._tree.size
+        with self._lock:
+            return self._tree.size
 
     def save_trajectory(self, trajectory: Trajectory) -> None:
         """Store a trajectory, giving each position the current max priority."""
-        for pos_idx in range(trajectory.game_length):
-            priority = self._max_priority**self.alpha
-            self._tree.add(priority, (trajectory, pos_idx))
+        with self._lock:
+            for pos_idx in range(trajectory.game_length):
+                priority = self._max_priority**self.alpha
+                self._tree.add(priority, (trajectory, pos_idx))
 
     def sample(self, batch_size: int, unroll_steps: int) -> tuple[list[tuple[Trajectory, int]], np.ndarray, list[int]]:
         """Sample positions with importance weights and indices for priority updates."""
@@ -137,7 +142,11 @@ class PrioritizedReplayBuffer:
             raise ValueError("batch_size must be positive")
         if unroll_steps < 0:
             raise ValueError("unroll_steps cannot be negative")
-        if self.size == 0:
+        with self._lock:
+            return self._sample_locked(batch_size)
+
+    def _sample_locked(self, batch_size: int) -> tuple[list[tuple[Trajectory, int]], np.ndarray, list[int]]:
+        if self._tree.size == 0:
             raise ValueError("Cannot sample an empty replay buffer")
         self.beta = min(1.0, self.beta + self.beta_increment)
 
@@ -165,7 +174,7 @@ class PrioritizedReplayBuffer:
             priorities[i] = max(prio, 1e-8)
 
         probs = priorities / (total + 1e-8)
-        weights = (self.size * probs) ** (-self.beta)
+        weights = (self._tree.size * probs) ** (-self.beta)
         weights /= weights.max() + 1e-8
         return batch, weights.astype(np.float32), indices
 
@@ -173,12 +182,13 @@ class PrioritizedReplayBuffer:
         """Update priorities based on absolute TD errors."""
         if len(indices) != len(td_errors):
             raise ValueError("indices and td_errors must have the same length")
-        for idx, err in zip(indices, td_errors):
-            if not 0 <= idx < self.capacity:
-                raise IndexError(f"Replay index out of range: {idx}")
-            if not np.isfinite(err):
-                raise ValueError("TD errors must be finite")
-            raw_priority = abs(float(err)) + 1e-6
-            priority = raw_priority**self.alpha
-            self._max_priority = max(self._max_priority, raw_priority)
-            self._tree.update(idx, priority)
+        with self._lock:
+            for idx, err in zip(indices, td_errors):
+                if not 0 <= idx < self.capacity:
+                    raise IndexError(f"Replay index out of range: {idx}")
+                if not np.isfinite(err):
+                    raise ValueError("TD errors must be finite")
+                raw_priority = abs(float(err)) + 1e-6
+                priority = raw_priority**self.alpha
+                self._max_priority = max(self._max_priority, raw_priority)
+                self._tree.update(idx, priority)

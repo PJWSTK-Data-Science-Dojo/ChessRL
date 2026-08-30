@@ -16,7 +16,7 @@ The two supported serving paths and their isolation boundary are captured in the
 ## Deployment invariants
 
 - Deploy only a numbered checkpoint that has completed external evaluation. Do not
-  mount the live training `temp/` directory or publish `latest.pth.tar`.
+  mount the live training directory or publish `latest.pth.tar`.
 - Keep Gunicorn at one worker. Multiple workers duplicate both the model and game state.
 - Do not run the standalone Lichess UCI process and the web process independently on
   one accelerator. Their locks are process-local, so they can contend for compute and
@@ -34,7 +34,7 @@ checks it before a scheduled benchmark. Follow the preflight in
 engine binary.
 
 No checkpoint is bundled with the repository or container image. After external
-evaluation has promoted `temp/best.pth.tar`, create a versioned release copy with an ID
+evaluation has promoted `runs/luna-main/best.pth.tar`, create a versioned release copy with an ID
 that identifies the evaluated iteration:
 
 ```bash
@@ -54,7 +54,7 @@ To publish another evaluated numbered snapshot explicitly, override the source:
 ```bash
 make release-web-model \
   RELEASE_ID=iteration-425 \
-  RELEASE_SOURCE=./temp/checkpoint_425.pth.tar
+  RELEASE_SOURCE=./runs/luna-main/checkpoint_425.pth.tar
 ```
 
 Only use that override after the named snapshot has passed the fixed external benchmark.
@@ -85,8 +85,9 @@ make web-logs
 The image is built from `uv.lock` with `uv sync --frozen --no-dev --extra perf --extra
 web`. The locked uv environment is copied into the non-root runtime image. The minimal
 C++ toolchain retained in the runtime is required by PyTorch's trusted runtime code
-generation when compiled inference is enabled. The checkpoint is a single read-only
-bind mount rather than part of the build context.
+generation when compiled inference is enabled explicitly. It is disabled by default so
+an unmeasured compilation phase cannot prevent the worker from becoming healthy. The
+checkpoint is a single read-only bind mount rather than part of the build context.
 
 Stop the private stack with:
 
@@ -165,8 +166,10 @@ The overlay removes the private stack's loopback port publication, pins
 `cloudflare/cloudflared` release `2026.8.2` and its multi-platform manifest digest,
 enables the accelerator for Luna, forces secure cookies, and requires trusted-host
 configuration. The application is reachable only through the tunnel's internal Compose
-network. Review upstream releases and image digests deliberately before changing any
-pin; do not use floating tags.
+network. Compiled inference remains disabled unless `COMPILE_INFERENCE=true` is set
+after measuring cold startup and steady-state latency on the deployment host. Review
+upstream releases and image digests deliberately before changing any pin; do not use
+floating tags.
 
 Configure Cloudflare WAF rate-limiting rules for the expensive mutation routes under
 `/api/v1/games/`, especially `moves`, `hint`, and `engine-move`. Use a short block
@@ -225,18 +228,20 @@ change rather than a model-file mutation.
 | `CLOUDFLARED_GID` | public | GID that owns the tunnel token file |
 | `DEVICE` | private | Inference backend; public overlay selects CUDA |
 | `SEARCH_SIMULATIONS` | no | Base web search budget, minimum 8 |
-| `COMPILE_INFERENCE` | no | Enable compiled inference on a supported host |
+| `COMPILE_INFERENCE` | no | Opt into compiled inference after measuring cold startup; public default is off |
 | `THREADS` | no | HTTP concurrency in the single Gunicorn worker |
-| `TIMEOUT` | no | Gunicorn request timeout in seconds |
+| `TIMEOUT` | no | Gunicorn worker-liveness timeout; not an HTTP request deadline |
 | `PROXY_HOPS` | no | Number of trusted reverse proxies; public overlay fixes this to one |
 | `HSTS_MAX_AGE_SECONDS` | no | HSTS duration; enabled by the public overlay |
 | `WEB_CPU_LIMIT` | no | Compose CPU limit for the web container |
 | `WEB_MEMORY_LIMIT` | no | Compose memory limit for the web container |
 | `WEB_PIDS_LIMIT` | no | Compose process limit for the web container |
 
-The public template keeps the request timeout below common managed-proxy limits. Search
-budgets still need measurement on the actual host; reduce them if worst-case moves
-approach the timeout.
+With Gunicorn's threaded worker, `TIMEOUT` monitors worker liveness; it does not impose
+a per-request deadline. Luna's search deadline and the browser request timeout bound
+normal move requests. Keep both below the edge proxy's request limit, and measure search
+budgets on the actual host. If compiled inference is enabled, `TIMEOUT` and the health
+check start period must also accommodate measured cold worker startup.
 
 ## Security and operational checks
 

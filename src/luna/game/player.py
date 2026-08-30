@@ -17,6 +17,8 @@ class _StockfishEngine(Protocol):
 
     def get_best_move(self) -> str | None: ...
 
+    def send_ucinewgame_command(self) -> None: ...
+
     def send_quit_command(self) -> None: ...
 
 
@@ -62,6 +64,9 @@ class StockfishPlayer:
             raise RuntimeError("Stockfish returned no move for a non-terminal position")
         move = move_from_uci(board, uci_move.strip())
         return move_to_action(move)
+
+    def new_game(self) -> None:
+        self.stockfish.send_ucinewgame_command()
 
     def close(self) -> None:
         self.stockfish.send_quit_command()
