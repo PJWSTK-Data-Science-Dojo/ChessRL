@@ -19,6 +19,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import wandb
 from loguru import logger
+from torch._inductor import config as torch_inductor_config
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 
 from luna.config import EzV2LearnerConfig, MCTSParams, validate_learner_config
@@ -66,6 +67,10 @@ _PreparedBatch = tuple[dict[str, np.ndarray], np.ndarray, list[int]]
 _RUNTIME_LEARNER_FIELDS = frozenset({"device", "cuda_device", "compile_inference", "compile_training"})
 _MAX_CONSECUTIVE_AMP_SKIPS = 16
 _GRAD_SCALER_FIELDS = frozenset({"scale", "growth_factor", "backoff_factor", "growth_interval", "_growth_tracker"})
+
+
+def _configure_dynamic_cudagraphs() -> None:
+    torch_inductor_config.triton.cudagraph_skip_dynamic_graphs = True
 
 
 def _clone_state_to_cpu(value: object) -> object:
@@ -311,7 +316,11 @@ class LunaNetwork:
                         "torch.compile disabled: device capability < 7.0 (Volta+). Run without --compile-inference.",
                     )
                 else:
-                    logger.info("Compiling MCTS inference paths with torch.compile (reduce-overhead)")
+                    _configure_dynamic_cudagraphs()
+                    logger.info(
+                        "Compiling MCTS inference paths with torch.compile "
+                        "(reduce-overhead; dynamic CUDA Graphs skipped)"
+                    )
                     self._mcts_initial_inference = torch.compile(
                         self._mcts_initial_inference,
                         mode="reduce-overhead",

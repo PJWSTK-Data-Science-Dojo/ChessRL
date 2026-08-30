@@ -8,11 +8,12 @@ import chess
 import numpy as np
 import pytest
 import torch
+from torch._inductor import config as torch_inductor_config
 from torch.amp import GradScaler
 
 from luna.config import EzV2LearnerConfig, MCTSParams, TrainingRunConfig
 from luna.game.chess_game import ACTION_SIZE, OBS_PLANES, ChessGame
-from luna.network import LunaNetwork, _scale_gradient
+from luna.network import LunaNetwork, _configure_dynamic_cudagraphs, _scale_gradient
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 
 
@@ -38,6 +39,14 @@ def test_scale_gradient_preserves_forward_and_scales_backward(scale: float) -> N
 
     assert source.grad is not None
     torch.testing.assert_close(source.grad, upstream * scale)
+
+
+def test_dynamic_cudagraphs_are_skipped_for_compiled_mcts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch_inductor_config.triton, "cudagraph_skip_dynamic_graphs", False)
+
+    _configure_dynamic_cudagraphs()
+
+    assert torch_inductor_config.triton.cudagraph_skip_dynamic_graphs is True
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
