@@ -35,7 +35,19 @@ make profile-smoke
 Start a new training run with the maintained single-accelerator preset:
 
 ```bash
+command -v stockfish
+printf 'uci\nquit\n' | stockfish | rg '^uciok$'
 make train
+```
+
+The locked `stockfish` Python package is an engine controller, not the Stockfish
+executable. Install a current binary from the
+[official Stockfish download](https://stockfishchess.org/download/) before using the
+maintained preset. Its startup preflight deliberately stops the run if the scheduled
+external benchmark cannot launch. For a binary outside `PATH`, pass an absolute path:
+
+```bash
+make train ARGS='--run.stockfish-path /absolute/path/to/stockfish'
 ```
 
 All preset values remain overrideable because `ARGS` is appended last:
@@ -59,10 +71,11 @@ Use `uv run python src/main.py --help` for the complete Tyro-generated option re
 Training writes format-v2 files under `./temp/`:
 
 - `checkpoint_<iteration>.pth.tar` is an immutable numbered snapshot. Retention is controlled by `--run.checkpoint-top-k`.
-- `latest.pth.tar` is atomically updated after every completed training iteration. Use it for resume, the GUI, UCI, and Lichess.
+- `latest.pth.tar` is atomically updated after every completed training iteration. Use it for resume and local testing, not as a public deployment artifact.
 - `best.pth.tar` is created or replaced only when a numbered checkpoint improves the external Stockfish benchmark score. It is not a synonym for “newest.”
 
 Checkpoints and evaluation metadata are runtime artifacts and are ignored by Git. No pretrained weights are bundled.
+Public serving uses a read-only, versioned copy of an evaluated checkpoint plus its SHA-256 digest; `make release-web-model RELEASE_ID=<id>` creates that release without overwriting an existing ID.
 
 ## Play in the browser
 
@@ -87,7 +100,8 @@ The JSON API is namespaced under `/api/v1`:
 | `POST` | `/api/v1/games/<id>/hint` | Analyze the human position |
 | `POST` | `/api/v1/games/<id>/undo` | Rewind one completed human turn |
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for Gunicorn, Docker, health checks, and reverse-proxy guidance.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for immutable model releases, the hardened uv-based container, and accelerator hosting through an outbound Cloudflare named tunnel. Public mode publishes no host port and requires no inbound firewall rule.
+The deployment topology is also available as an [editable Excalidraw diagram](docs/public-serving.excalidraw).
 
 ## UCI and Lichess
 
@@ -100,7 +114,9 @@ make uci ARGS='--device cuda --mcts-sims 96 --compile-inference'
 The adapter supports the standard handshake, positions from FEN or move lists, clock-aware and interruptible `go`, restricted `go searchmoves`, and runtime search options. Diagnostics go to stderr so stdout remains protocol-safe.
 
 For a challenge-driven Lichess Bot API setup, including token-safe configuration generation, follow [LICHESS.md](LICHESS.md).
-After preparing the upstream bridge and exporting `LICHESS_TOKEN`, `make lichess-config` runs the secure generator with its standard paths.
+After preparing the upstream bridge, `make lichess-config` writes a credential-free configuration. Export `LICHESS_BOT_TOKEN` only when starting the bridge.
+
+The standalone Lichess engine and web service must not run independently on one accelerator. Each process loads its own model and owns only a process-local inference lock; use separate serving capacity until a shared inference owner is implemented.
 
 ## Evaluate
 
@@ -113,7 +129,11 @@ uv run python src/eval_vs_stockfish.py \
   --run.stockfish-depth 10
 ```
 
-Set `--run.stockfish-path` when Stockfish is not discoverable. Periodic training evaluation is controlled by `--run.stockfish-eval-every`; set it to `0` to disable. Alternating colors and fixed settings make comparisons more useful, but a small match is still a noisy estimate.
+Set `--run.stockfish-path` when the executable is not discoverable. Elo limiting defaults
+to Stockfish's supported floor of 1320; keep Elo, depth, engine build, and search
+settings fixed when comparing checkpoints. Periodic training evaluation is
+controlled by `--run.stockfish-eval-every`; set it to `0` to disable. Alternating colors
+make comparisons more useful, but a small match is still a noisy estimate.
 
 ## Training flow
 
@@ -138,6 +158,11 @@ make bench               # throughput benchmark
 make profile-smoke       # bounded end-to-end profile
 make test-pipeline-cpu   # short CPU training smoke test
 make test-pipeline-mps   # short MPS training smoke test
+make release-web-model RELEASE_ID=<id>  # immutable evaluated web artifact
+make web-config          # validate private Compose configuration
+make web-up              # start loopback-only container deployment
+make web-public-config   # validate GPU + named-tunnel deployment
+make web-public-up       # start public named-tunnel deployment
 ```
 
 If CUDA is requested but unavailable, verify the environment first:
@@ -154,7 +179,6 @@ Install the PyTorch build appropriate for the host using the official PyTorch in
 src/main.py                    training entry point
 src/web_app.py                 Flask app factory and interactive API
 src/eval_vs_stockfish.py       standalone external evaluation
-src/play_vs_model.py           terminal player
 src/luna/config.py             typed configuration
 src/luna/coach.py              self-play/training/checkpoint orchestration
 src/luna/network.py            learner, inference, and checkpoint I/O

@@ -1,19 +1,27 @@
 """Tests for Coach self-play (e.g. max ply truncation, batched self-play)."""
 
+from collections.abc import Sequence
+from pathlib import Path
+
 import chess
 import numpy as np
 import pytest
 
 from luna.coach import Coach
-from luna.config import TrainingRunConfig
+from luna.config import EzV2LearnerConfig, MCTSParams, TrainingRunConfig
 from luna.game.arena import Arena
-from luna.game.chess_game import move_to_action
+from luna.game.chess_game import ChessGame, move_to_action
+from luna.game.stockfish_eval import StockfishEvalScores, StockfishEvalSkipped
 from luna.network import LunaNetwork
+from luna.profiling import SelfPlayMCTSTimings
 
 
 class TestMaxPlyTruncation:
-    def test_execute_episode_stops_at_max_ply_with_zero_draw_reward(self, chess_game, small_learner_config):
-
+    def test_execute_episode_stops_at_max_ply_with_zero_draw_reward(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
         nnet = LunaNetwork(chess_game, small_learner_config)
         run = TrainingRunConfig(
             num_mcts_sims=2,
@@ -32,7 +40,11 @@ class TestMaxPlyTruncation:
 
 
 class TestBatchedSelfPlay:
-    def test_execute_episodes_batched_returns_trajectories(self, chess_game, small_learner_config):
+    def test_execute_episodes_batched_returns_trajectories(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
         nnet = LunaNetwork(chess_game, small_learner_config)
         run = TrainingRunConfig(
             num_mcts_sims=2,
@@ -54,17 +66,23 @@ class TestBatchedSelfPlay:
 
 def test_gumbel_selfplay_executes_proposal_but_stores_improved_target(
     monkeypatch: pytest.MonkeyPatch,
-    chess_game,
-    small_learner_config,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
 ) -> None:
     target_action = move_to_action(chess.Move.from_uci("d2d4"))
     proposed_action = move_to_action(chess.Move.from_uci("e2e4"))
 
     class _Search:
-        def __init__(self, _game, _network, _params) -> None:
+        def __init__(self, _game: ChessGame, _network: LunaNetwork, _params: MCTSParams) -> None:
             self.last_action = proposed_action
 
-        def search_latent(self, _board, temp, *, add_exploration_noise):
+        def search_latent(
+            self,
+            _board: chess.Board,
+            temp: float,
+            *,
+            add_exploration_noise: bool | None,
+        ) -> tuple[np.ndarray, float]:
             assert temp == 1.0
             assert add_exploration_noise is True
             policy = np.zeros(chess_game.get_action_size(), dtype=np.float32)
@@ -87,19 +105,31 @@ def test_gumbel_selfplay_executes_proposal_but_stores_improved_target(
 
 def test_batched_gumbel_selfplay_routes_per_root_exploration_and_proposals(
     monkeypatch: pytest.MonkeyPatch,
-    chess_game,
-    small_learner_config,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
 ) -> None:
     target_action = move_to_action(chess.Move.from_uci("d2d4"))
     proposed_action = move_to_action(chess.Move.from_uci("e2e4"))
 
     class _BatchedSearch:
-        def __init__(self, game, _network, _params, timings=None) -> None:
+        def __init__(
+            self,
+            game: ChessGame,
+            _network: LunaNetwork,
+            _params: MCTSParams,
+            timings: SelfPlayMCTSTimings | None = None,
+        ) -> None:
             del timings
             self.game = game
             self.last_actions: list[int | None] = []
 
-        def search_batch(self, boards, temp, *, add_exploration_noise):
+        def search_batch(
+            self,
+            boards: list[chess.Board],
+            temp: float,
+            *,
+            add_exploration_noise: bool | Sequence[bool] | None,
+        ) -> list[tuple[np.ndarray, float, np.ndarray, np.ndarray]]:
             assert temp == 1.0
             assert add_exploration_noise == [True]
             self.last_actions = [proposed_action]
@@ -137,8 +167,8 @@ def test_batched_gumbel_selfplay_routes_per_root_exploration_and_proposals(
 
 
 class TestArenaMaxPly:
-    def test_play_game_returns_draw_when_max_ply_reached(self, chess_game):
-        def pick_first(canonical_board):
+    def test_play_game_returns_draw_when_max_ply_reached(self, chess_game: ChessGame) -> None:
+        def pick_first(canonical_board: chess.Board) -> int:
             valids = chess_game.get_valid_moves(canonical_board, 1)
             return int(np.argmax(valids))
 
@@ -147,7 +177,11 @@ class TestArenaMaxPly:
         assert result == 0.0
 
 
-def test_checkpoint_retention_keeps_top_k(chess_game, small_learner_config, tmp_path) -> None:
+def test_checkpoint_retention_keeps_top_k(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    tmp_path: Path,
+) -> None:
     run = TrainingRunConfig(
         num_mcts_sims=2,
         dir_noise=False,
@@ -164,5 +198,33 @@ def test_checkpoint_retention_keeps_top_k(chess_game, small_learner_config, tmp_
     assert not (tmp_path / "checkpoint_1.pth.tar").is_file()
     assert (tmp_path / "checkpoint_2.pth.tar").is_file()
     assert (tmp_path / "checkpoint_3.pth.tar").is_file()
+
+
+def test_corrupt_best_evaluation_metadata_fails_loudly(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    run = TrainingRunConfig(checkpoint=str(tmp_path), stockfish_eval_every=0)
+    coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), run)
+    coach._publish_checkpoint(1)
+    (tmp_path / "best_eval.json").write_text("not-json", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="external-evaluation metadata"):
+        coach._update_best_from_stockfish(1, StockfishEvalScores(model_wins=1, draws=1, stockfish_wins=0))
     assert (tmp_path / "latest.pth.tar").is_file()
+    assert not (tmp_path / "best.pth.tar").exists()
+
+
+def test_configured_external_evaluation_failure_stops_promotion(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    run = TrainingRunConfig(checkpoint=str(tmp_path))
+    coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), run)
+
+    with pytest.raises(RuntimeError, match=r"External evaluation did not complete.*no_engine"):
+        coach._update_best_from_stockfish(1, StockfishEvalSkipped("no_engine", "binary not found"))
+
     assert not (tmp_path / "best.pth.tar").exists()

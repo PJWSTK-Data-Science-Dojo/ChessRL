@@ -36,7 +36,7 @@
         <section class="lobby view" id="lobbyView" aria-labelledby="lobbyTitle">
             <div class="hero-copy">
                 <p class="eyebrow">Neural search · zero handcrafted evaluation</p>
-                <h1 id="lobbyTitle">Enter Luna’s<br><em>chess observatory.</em></h1>
+                <h1 id="lobbyTitle" tabindex="-1">Enter Luna’s<br><em>chess observatory.</em></h1>
                 <p class="hero-summary">
                     Challenge a self-learning engine or watch two search trees collide.
                     Every move is calculated live from the loaded neural checkpoint.
@@ -107,7 +107,7 @@
             <div class="game-topline">
                 <div>
                     <p class="eyebrow" id="modeEyebrow">Live encounter</p>
-                    <h1 id="gameTitle">You <span>vs</span> Luna</h1>
+                    <h1 id="gameTitle" tabindex="-1">You <span>vs</span> Luna</h1>
                 </div>
                 <button class="quiet-action" id="newMissionButton" type="button">
                     <span aria-hidden="true">←</span> New mission
@@ -159,11 +159,21 @@
                     </div>
 
                     <div class="board-shell" id="boardShell">
-                        <div id="chessboard" class="chessboard" role="grid" aria-label="Interactive chessboard"></div>
+                        <div id="chessboard" class="chessboard" role="grid" aria-label="Interactive chessboard" aria-describedby="boardHelp"></div>
+                        <p class="sr-only" id="boardHelp">Use the arrow keys to move between squares. Press Enter or Space to select a piece and its destination.</p>
                         <div class="board-thinking" id="boardThinking" hidden aria-live="polite">
                             <div class="search-radar" aria-hidden="true"><i></i><span></span></div>
                             <strong>Luna is calculating</strong>
                             <small>Exploring latent continuations…</small>
+                        </div>
+                        <div class="game-result" id="resultOverlay" hidden role="status" aria-live="assertive">
+                            <p class="eyebrow">Mission complete</p>
+                            <h2 id="resultHeadline">Game over</h2>
+                            <p id="resultReason">The encounter has ended.</p>
+                            <div>
+                                <button type="button" id="rematchButton">Run it back</button>
+                                <button type="button" id="resultLobbyButton">New mission</button>
+                            </div>
                         </div>
                     </div>
 

@@ -5,30 +5,34 @@ Self-play uses a sliding pool of up to ``parallel_games`` episodes with
 periodic Stockfish matches provide an external, fixed-opponent benchmark.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import shutil
 import time
-from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
+from typing import Never
 
 import numpy as np
+import wandb
 from loguru import logger
 from tqdm import tqdm
 
-try:
-    import wandb
-except ImportError:
-    wandb = None  # type: ignore
-
-from .config import TrainingRunConfig
-from .game.chess_game import ChessGame
-from .game.stockfish_eval import StockfishEvalOutcome, StockfishEvalScores, StockfishEvalSkipped
-from .mcts import MCTS, BatchedMCTS
-from .network import LunaNetwork
-from .profiling import IterProfileStats, SelfPlayMCTSTimings, write_iter_summaries_json
-from .replay_buffer import PrioritizedReplayBuffer, Trajectory
+from luna.config import TrainingRunConfig
+from luna.game.chess_game import ChessGame
+from luna.game.stockfish_eval import (
+    StockfishEvalOutcome,
+    StockfishEvalScores,
+    StockfishEvalSkipped,
+    run_stockfish_eval,
+    validate_stockfish_configuration,
+)
+from luna.mcts import MCTS, BatchedMCTS
+from luna.network import LunaNetwork
+from luna.profiling import IterProfileStats, SelfPlayMCTSTimings, write_iter_summaries_json
+from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 
 _BEST_EVAL_NAME = "best_eval.json"
 
@@ -66,20 +70,14 @@ class Coach:
         self._profile_mcts_timings: SelfPlayMCTSTimings | None = None
         self._profile_sp_env_s: float = 0.0
 
-        # Initialize WandB if project name provided
-        if wandb_project and wandb is not None:
+        if wandb_project:
             wandb.init(
                 project=wandb_project,
                 config=asdict(run),
                 tags=["chess", "ezv2"],
             )
             logger.info("WandB initialized for project: {}", wandb_project)
-        elif wandb_project and wandb is None:
-            logger.warning("WandB project specified but wandb not installed. Install with: uv add wandb")
 
-    # ------------------------------------------------------------------
-    # Single-game self-play fallback
-    # ------------------------------------------------------------------
     def execute_episode(self) -> Trajectory:
         """Run one self-play game using latent MCTS, collecting a full trajectory."""
         mcts = MCTS(self.game, self.nnet, self.run)
@@ -148,9 +146,6 @@ class Coach:
                     terminal_value_for_next_player=0.0,
                 )
 
-    # ------------------------------------------------------------------
-    # Batched parallel self-play
-    # ------------------------------------------------------------------
     def execute_episodes_batched(self, num_episodes: int) -> list[Trajectory]:
         """Run ``num_episodes`` self-play games using batched parallel MCTS.
 
@@ -167,21 +162,8 @@ class Coach:
         with tqdm(total=num_episodes, desc="Self Play (batched)") as pbar:
             return self._run_self_play_pool(num_episodes, pool_size, pbar)
 
-    def _run_self_play_pool(self, num_episodes: int, pool_size: int, pbar: tqdm) -> list[Trajectory]:
-        """Execute self-play with sliding game pool for batched MCTS inference.
-
-        Maintains a pool of up to pool_size active episodes, refilling finished games
-        immediately to keep GPU batches full. Uses BatchedMCTS to amortize network overhead
-        across parallel positions.
-
-        Args:
-            num_episodes: Total episodes to generate.
-            pool_size: Max concurrent games in the pool.
-            pbar: Progress bar for tracking completion.
-
-        Returns:
-            List of completed game trajectories with (obs, policy, reward) per timestep.
-        """
+    def _run_self_play_pool(self, num_episodes: int, pool_size: int, pbar: tqdm[Never]) -> list[Trajectory]:
+        """Keep the inference batch full by replacing each finished game immediately."""
         mcts_timings = self._profile_mcts_timings if self.run.profile else None
         bmcts = BatchedMCTS(self.game, self.nnet, self.run, timings=mcts_timings)
         p = pool_size
@@ -324,13 +306,27 @@ class Coach:
             valids=valids_list,
         )
 
-    # ------------------------------------------------------------------
-    # Main training loop
-    # ------------------------------------------------------------------
     def learn(self) -> None:
         """Full EZV2 training loop: self-play -> store in replay -> train from replay -> evaluate."""
         train_steps_per_iter = self.run.train_steps_per_iter
         total_train_steps = self.run.num_iters * train_steps_per_iter
+
+        start_iteration = self.nnet._trainer_iteration + 1
+        if start_iteration > self.run.num_iters:
+            logger.info(
+                "Checkpoint is already at iteration {}; requested total is {}. Nothing to train.",
+                self.nnet._trainer_iteration,
+                self.run.num_iters,
+            )
+            return
+        if start_iteration > 1:
+            logger.info("Resuming training at iteration {} of {}", start_iteration, self.run.num_iters)
+
+        evaluation_interval = self.run.stockfish_eval_every
+        if evaluation_interval > 0:
+            next_evaluation = ((start_iteration + evaluation_interval - 1) // evaluation_interval) * evaluation_interval
+            if next_evaluation <= self.run.num_iters:
+                validate_stockfish_configuration(self.run)
 
         self.nnet.warmup_mcts_inference(self.game)
 
@@ -346,17 +342,6 @@ class Coach:
                 self.run.profile_tensorboard_logdir,
                 self.run.profile_with_stack,
             )
-
-        start_iteration = self.nnet._trainer_iteration + 1
-        if start_iteration > self.run.num_iters:
-            logger.info(
-                "Checkpoint is already at iteration {}; requested total is {}. Nothing to train.",
-                self.nnet._trainer_iteration,
-                self.run.num_iters,
-            )
-            return
-        if start_iteration > 1:
-            logger.info("Resuming training at iteration {} of {}", start_iteration, self.run.num_iters)
 
         for i in range(start_iteration, self.run.num_iters + 1):
             logger.info("Starting Iter #{} ...", i)
@@ -425,7 +410,7 @@ class Coach:
             stats.train_s = time.perf_counter() - t0
             logger.info("Training done: {}", loss_info)
 
-            if wandb is not None and wandb.run is not None:
+            if wandb.run is not None:
                 wandb.log(
                     {
                         "iteration": i,
@@ -438,8 +423,6 @@ class Coach:
             stats.checkpoint_publish_s = time.perf_counter() - t0
 
             if self.run.stockfish_eval_every > 0 and i % self.run.stockfish_eval_every == 0:
-                from .game.stockfish_eval import run_stockfish_eval
-
                 sf_outcome = run_stockfish_eval(self.game, self.nnet, self.run, iteration=i)
                 self._update_best_from_stockfish(i, sf_outcome)
 
@@ -459,8 +442,33 @@ class Coach:
 
         total = scores.model_wins + scores.draws + scores.stockfish_wins
         if total <= 0:
-            return float("-inf")
+            raise ValueError("A completed Stockfish evaluation must contain at least one game")
         return (scores.model_wins + 0.5 * scores.draws) / float(total)
+
+    @staticmethod
+    def _previous_best_score(metadata_path: Path) -> float:
+        if not metadata_path.exists():
+            return float("-inf")
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            score: object = payload["score"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise RuntimeError(f"Could not read external-evaluation metadata: {metadata_path}") from exc
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            raise RuntimeError(f"External-evaluation score is not numeric: {metadata_path}")
+        return float(score)
+
+    @staticmethod
+    def _write_best_metadata(metadata_path: Path, iteration: int, score: float) -> None:
+        temporary = metadata_path.with_name(f".{metadata_path.name}.tmp-{os.getpid()}")
+        try:
+            temporary.write_text(
+                json.dumps({"iteration": iteration, "score": score}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, metadata_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _checkpoint_dir_usable(self) -> bool:
         return bool(str(self.run.checkpoint).strip())
@@ -499,31 +507,22 @@ class Coach:
 
     def _update_best_from_stockfish(self, iteration: int, outcome: StockfishEvalOutcome) -> None:
         if isinstance(outcome, StockfishEvalSkipped):
-            return
-        if not isinstance(outcome, StockfishEvalScores):
-            return
+            raise RuntimeError(f"External evaluation did not complete ({outcome.reason}): {outcome.message}")
         if not self._checkpoint_dir_usable():
             return
 
         folder = Path(self.run.checkpoint).resolve()
         fp = folder / f"checkpoint_{iteration}.pth.tar"
         if not fp.is_file():
-            return
+            raise FileNotFoundError(f"Evaluated checkpoint is missing: {fp}")
 
         sf_score = self._stockfish_normalized_score(outcome)
         metadata_path = folder / _BEST_EVAL_NAME
-        previous_score = float("-inf")
-        with suppress(FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            previous_score = float(json.loads(metadata_path.read_text(encoding="utf-8"))["score"])
+        previous_score = self._previous_best_score(metadata_path)
         if sf_score <= previous_score:
             return
         self._atomic_copy(fp, folder / "best.pth.tar")
-        temporary_metadata = metadata_path.with_name(f".{metadata_path.name}.tmp-{os.getpid()}")
-        temporary_metadata.write_text(
-            json.dumps({"iteration": iteration, "score": sf_score}, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary_metadata, metadata_path)
+        self._write_best_metadata(metadata_path, iteration, sf_score)
         logger.info("New best external score {:.3f} at iteration {}", sf_score, iteration)
 
     def _publish_checkpoint(self, iteration: int) -> None:
@@ -539,7 +538,6 @@ class Coach:
         self.nnet.save_checkpoint(
             folder=self.run.checkpoint,
             filename=ck_name,
-            extra_state={"trainer_iteration": iteration},
         )
         folder = Path(self.run.checkpoint).resolve()
         self._atomic_copy(folder / ck_name, folder / "latest.pth.tar")

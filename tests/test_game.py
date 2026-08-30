@@ -13,6 +13,7 @@ from luna.game.chess_game import (
     PIECE_PLANES_PER_POSITION,
     PLANES_PER_POSITION,
     SIDE_TO_MOVE_PLANE,
+    ChessGame,
     action_to_move,
     board_to_numpy,
     move_to_action,
@@ -27,7 +28,7 @@ def _piece_plane(history_index: int, color: chess.Color, piece_type: chess.Piece
 class TestObservationEncoding:
     """Verify the temporal 119-plane representation and auxiliary state."""
 
-    def test_shape_dtype_range_and_initial_position(self, chess_game):
+    def test_shape_dtype_range_and_initial_position(self, chess_game: ChessGame) -> None:
         board = chess_game.get_init_board()
         observation = board_to_numpy(board)
 
@@ -48,7 +49,7 @@ class TestObservationEncoding:
         history_tail = observation[:, :, PLANES_PER_POSITION : HISTORY_LENGTH * PLANES_PER_POSITION]
         assert np.count_nonzero(history_tail) == 0
 
-    def test_current_and_previous_positions_are_distinct(self):
+    def test_current_and_previous_positions_are_distinct(self) -> None:
         board = chess.Board()
         board.push_uci("e2e4")
         observation = board_to_numpy(board)
@@ -65,7 +66,7 @@ class TestObservationEncoding:
         assert observation[chess.square_rank(chess.E3), chess.square_file(chess.E3), EN_PASSANT_PLANE] == 1.0
         assert np.all(observation[:, :, SIDE_TO_MOVE_PLANE] == 0.0)
 
-    def test_piece_colors_use_separate_binary_planes(self):
+    def test_piece_colors_use_separate_binary_planes(self) -> None:
         board = chess.Board("4k3/8/8/3p4/4P3/8/8/4K3 w - - 17 42")
         observation = board_to_numpy(board)
         white_pawns = _piece_plane(0, chess.WHITE, chess.PAWN)
@@ -77,7 +78,7 @@ class TestObservationEncoding:
         assert observation[:, :, black_pawns].sum() == 1.0
         assert np.allclose(observation[:, :, HALFMOVE_CLOCK_PLANE], 0.17)
 
-    def test_repetition_planes_are_temporal(self):
+    def test_repetition_planes_are_temporal(self) -> None:
         board = chess.Board()
         for uci in ["g1f3", "g8f6", "f3g1", "f6g8"]:
             board.push_uci(uci)
@@ -92,7 +93,7 @@ class TestObservationEncoding:
         assert np.all(observation[:, :, current_thrice] == 0.0)
         assert np.all(observation[:, :, previous_twice] == 0.0)
 
-    def test_black_canonical_observation_preserves_history(self, chess_game):
+    def test_black_canonical_observation_preserves_history(self, chess_game: ChessGame) -> None:
         board = chess.Board()
         board.push_uci("e2e4")
         canonical = chess_game.get_canonical_form(board, -1)
@@ -115,12 +116,12 @@ class TestObservationEncoding:
 class TestRewardPerspective:
     """Verify exact outcomes relative to the requested player."""
 
-    def test_ongoing_game_returns_none(self, chess_game):
+    def test_ongoing_game_returns_none(self, chess_game: ChessGame) -> None:
         board = chess_game.get_init_board()
         assert chess_game.get_game_outcome(board, 1) is None
         assert chess_game.get_game_outcome(board, -1) is None
 
-    def test_checkmate_perspective(self, chess_game):
+    def test_checkmate_perspective(self, chess_game: ChessGame) -> None:
         """Scholars mate: white wins. After Qf7# it is black's turn but game is over."""
         board = chess.Board()
         for uci in ["e2e4", "e7e5", "d1h5", "b8c6", "f1c4", "g8f6", "h5f7"]:
@@ -130,7 +131,7 @@ class TestRewardPerspective:
         assert chess_game.get_game_outcome(board, 1) == 1.0
         assert chess_game.get_game_outcome(board, -1) == -1.0
 
-    def test_claimable_repetition_is_an_exact_draw(self, chess_game):
+    def test_claimable_repetition_is_an_exact_draw(self, chess_game: ChessGame) -> None:
         board = chess.Board()
         for uci in ["g1f3", "g8f6", "f3g1", "f6g8"] * 2:
             board.push_uci(uci)
@@ -138,7 +139,7 @@ class TestRewardPerspective:
         assert board.can_claim_threefold_repetition()
         assert chess_game.get_game_outcome(board, 1) == 0.0
 
-    def test_black_canonical_form_preserves_repetition_history(self, chess_game):
+    def test_black_canonical_form_preserves_repetition_history(self, chess_game: ChessGame) -> None:
         board = chess.Board()
         for uci in ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"]:
             board.push_uci(uci)
@@ -151,10 +152,21 @@ class TestRewardPerspective:
 
 
 class TestValidMoves:
-    def test_initial_position_has_20_moves(self, chess_game):
+    def test_initial_position_has_20_moves(self, chess_game: ChessGame) -> None:
         board = chess_game.get_init_board()
         valids = chess_game.get_valid_moves(board, 1)
         assert int(valids.sum()) == 20
+
+
+def test_player_turn_contract_raises_explicit_error(chess_game: ChessGame) -> None:
+    board = chess_game.get_init_board()
+
+    with pytest.raises(ValueError, match="does not match the side to move"):
+        chess_game.get_valid_moves(board, -1)
+    with pytest.raises(ValueError, match="does not match the side to move"):
+        chess_game.get_canonical_form(board, -1)
+    with pytest.raises(ValueError, match="does not match the side to move"):
+        chess_game.get_next_state(board, -1, move_to_action(chess.Move.from_uci("e2e4")))
 
 
 @pytest.mark.parametrize(
@@ -166,7 +178,11 @@ class TestValidMoves:
         ("a7a8b", chess.BISHOP),
     ],
 )
-def test_action_encoding_with_promotions(uci, expected_piece, chess_game):
+def test_action_encoding_with_promotions(
+    uci: str,
+    expected_piece: chess.PieceType,
+    chess_game: ChessGame,
+) -> None:
     """Action encoding roundtrip preserves from/to/promotion."""
     board = chess.Board("8/P7/8/8/8/8/8/4K2k w - - 0 1")
 
@@ -184,7 +200,7 @@ def test_action_encoding_with_promotions(uci, expected_piece, chess_game):
 
 
 @pytest.mark.parametrize("suffix", ["q", "n", "r", "b"])
-def test_black_promotion_roundtrip_uses_canonical_action(suffix, chess_game):
+def test_black_promotion_roundtrip_uses_canonical_action(suffix: str, chess_game: ChessGame) -> None:
     board = chess.Board("4k2K/8/8/8/8/8/p7/8 b - - 0 1")
     move = chess.Move.from_uci(f"a2a1{suffix}")
     canonical_move = chess.Move.from_uci(f"a7a8{suffix}")
@@ -198,6 +214,6 @@ def test_black_promotion_roundtrip_uses_canonical_action(suffix, chess_game):
 
 
 @pytest.mark.parametrize("action", [-1, 4288])
-def test_action_decoder_rejects_out_of_range_indices(action):
+def test_action_decoder_rejects_out_of_range_indices(action: int) -> None:
     with pytest.raises(ValueError, match="Action index"):
         action_to_move(action)

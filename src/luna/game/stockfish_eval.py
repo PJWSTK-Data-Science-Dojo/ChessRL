@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
+import chess
+import wandb
 from loguru import logger
 
-from ..config import MCTSParams, TrainingRunConfig, evaluation_mcts_params
-from ..mcts import MCTS
-from ..network import LunaNetwork
-from .arena import Arena
-from .chess_game import ChessGame
-from .player import StockfishPlayer
-
-try:
-    import wandb
-except ImportError:
-    wandb = None  # type: ignore[misc, assignment]
+from luna.config import MCTSParams, TrainingRunConfig, evaluation_mcts_params
+from luna.game.arena import Arena
+from luna.game.chess_game import ChessGame
+from luna.game.player import StockfishPlayer
+from luna.mcts import MCTS
+from luna.network import LunaNetwork
 
 _WIN = 0.5
+_stockfish_module = importlib.import_module("stockfish")
+_StockfishException = cast(type[Exception], _stockfish_module.StockfishException)
 
 SkipReason = Literal["too_few_games", "no_engine", "runtime_error"]
 
@@ -44,13 +44,30 @@ class StockfishEvalSkipped:
 StockfishEvalOutcome = StockfishEvalScores | StockfishEvalSkipped
 
 
+def _stockfish_player(run: TrainingRunConfig) -> StockfishPlayer:
+    return StockfishPlayer(
+        elo=run.stockfish_elo,
+        depth=run.stockfish_depth,
+        path=run.stockfish_path,
+    )
+
+
+def validate_stockfish_configuration(run: TrainingRunConfig) -> None:
+    """Fail before a long run when its configured external benchmark cannot start."""
+    try:
+        player = _stockfish_player(run)
+        player.close()
+    except (OSError, ImportError, ValueError, RuntimeError, _StockfishException) as exc:
+        raise RuntimeError(f"Stockfish benchmark preflight failed: {exc}") from exc
+
+
 class ArenaMCTSPlayer:
     """Callable player: one MCTS instance, greedy policy (matches batched arena)."""
 
     def __init__(self, game: ChessGame, nnet: LunaNetwork, mcts_params: MCTSParams) -> None:
         self._mcts = MCTS(game, nnet, mcts_params)
 
-    def __call__(self, canonical_board) -> int:
+    def __call__(self, canonical_board: chess.Board) -> int:
         self._mcts.search_latent(
             canonical_board,
             temp=0.0,
@@ -77,12 +94,7 @@ def run_stockfish_eval(
     *,
     iteration: int | None = None,
 ) -> StockfishEvalOutcome:
-    """Play ``run.stockfish_eval_games`` games vs Stockfish (alternating colors).
-
-    Uses :func:`~luna.config.evaluation_mcts_params` for MCTS (no exploration noise).
-    Returns :class:`StockfishEvalScores` on success, or :class:`StockfishEvalSkipped` if the
-    run could not complete (too few games, engine missing, or error during games).
-    """
+    """Run a balanced fixed-settings benchmark or report an expected engine failure."""
     n_games = run.stockfish_eval_games
     if n_games < 1:
         logger.warning("stockfish_eval_games < 1; skipping Stockfish eval.")
@@ -102,19 +114,10 @@ def run_stockfish_eval(
     max_ply = run.stockfish_eval_max_ply
 
     try:
-        sf = StockfishPlayer(
-            elo=run.stockfish_elo,
-            skill_level=run.stockfish_skill_level,
-            depth=run.stockfish_depth,
-            think_time=run.stockfish_think_time,
-            path=run.stockfish_path,
-        )
-    except (OSError, ImportError, ValueError, RuntimeError) as exc:
+        sf = _stockfish_player(run)
+    except (OSError, ImportError, ValueError, RuntimeError, _StockfishException) as exc:
         logger.warning("Stockfish eval skipped (engine): {}", exc)
         return StockfishEvalSkipped("no_engine", str(exc))
-    except Exception as exc:
-        logger.exception("Stockfish eval skipped (unexpected error starting engine)")
-        return StockfishEvalSkipped("no_engine", f"{type(exc).__name__}: {exc}")
 
     mw = dr = sw = 0
     try:
@@ -132,15 +135,17 @@ def run_stockfish_eval(
                 sw += 1
             else:
                 dr += 1
-    except Exception as exc:
+    except (OSError, ValueError, RuntimeError, _StockfishException) as exc:
         logger.exception("Stockfish eval aborted during games")
         return StockfishEvalSkipped("runtime_error", str(exc))
+    finally:
+        sf.close()
 
     total = mw + dr + sw
     wr = mw / total if total else 0.0
     iter_suffix = f" (iter {iteration})" if iteration is not None else ""
     logger.info(
-        "Stockfish eval{}: model {} — {} — {} SF | MCTS sims={} SF elo={} depth={} think_ms={} games={}",
+        "Stockfish eval{}: model {} — {} — {} SF | MCTS sims={} SF elo={} depth={} games={}",
         iter_suffix,
         mw,
         dr,
@@ -148,10 +153,9 @@ def run_stockfish_eval(
         mcts_params.num_mcts_sims,
         run.stockfish_elo,
         run.stockfish_depth,
-        run.stockfish_think_time,
         n_games,
     )
-    if wandb is not None and wandb.run is not None:
+    if wandb.run is not None:
         log_payload = {
             "stockfish/model_wins": mw,
             "stockfish/draws": dr,

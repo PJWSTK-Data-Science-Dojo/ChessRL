@@ -4,29 +4,62 @@ services:
       context: .
       dockerfile: Dockerfile.web
     init: true
+    read_only: true
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-5000}:5000"
+      - "127.0.0.1:${PORT:-5000}:5000"
     environment:
       HOST: 0.0.0.0
       PORT: 5000
       DEVICE: "${DEVICE:-cpu}"
-      CHECKPOINT_PATH: /app/temp/latest.pth.tar
+      CHECKPOINT_PATH: /app/models/luna.pth.tar
+      MODEL_SHA256: "${MODEL_SHA256:?Set MODEL_SHA256 to the evaluated checkpoint digest}"
       SEARCH_SIMULATIONS: "${SEARCH_SIMULATIONS:-96}"
       COMPILE_INFERENCE: "${COMPILE_INFERENCE:-false}"
       LUNA_WEB_SECRET: "${LUNA_WEB_SECRET:?Set LUNA_WEB_SECRET in .env}"
       SESSION_COOKIE_SECURE: "${SESSION_COOKIE_SECURE:-true}"
+      LUNA_TRUSTED_HOSTS: "${LUNA_TRUSTED_HOSTS:-localhost,127.0.0.1}"
+      PROXY_HOPS: "${PROXY_HOPS:-0}"
+      HSTS_MAX_AGE_SECONDS: "${HSTS_MAX_AGE_SECONDS:-0}"
       THREADS: "${THREADS:-4}"
       TIMEOUT: "${TIMEOUT:-180}"
       GRACEFUL_TIMEOUT: "${GRACEFUL_TIMEOUT:-30}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     volumes:
-      - ./temp:/app/temp:ro
+      - type: bind
+        source: "${MODEL_PATH:?Set MODEL_PATH to an immutable evaluated checkpoint copy}"
+        target: /app/models/luna.pth.tar
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=${WEB_TMPFS_SIZE:-2g},mode=1777
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
+    pids_limit: "${WEB_PIDS_LIMIT:-256}"
+    cpus: "${WEB_CPU_LIMIT:-4.0}"
+    mem_limit: "${WEB_MEMORY_LIMIT:-16g}"
+    stop_grace_period: 45s
     restart: unless-stopped
+    networks:
+      - origin
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:5000/api/v1/health"]
+      test:
+        - CMD
+        - /opt/venv/bin/python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/v1/health', timeout=5).close()"
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 120s
+
+networks:
+  origin:
+    internal: true

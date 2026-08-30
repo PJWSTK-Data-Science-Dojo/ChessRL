@@ -8,50 +8,55 @@ Both algorithms share the same single-game and batched tree semantics.
 
 from __future__ import annotations
 
+import importlib
 import math
 import time
-from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Collection, Sequence
+from typing import TYPE_CHECKING, cast
 
 import chess
 import numpy as np
 import torch
 
-from .config import MCTSParams
-from .game.chess_game import ChessGame
-from .profiling import SelfPlayMCTSTimings
+from luna.config import MCTSParams
+from luna.game.chess_game import ChessGame
+from luna.profiling import SelfPlayMCTSTimings
 
 if TYPE_CHECKING:
-    from .network import LunaNetwork
+    from luna.network import LunaNetwork
 
+_PuctArgmax = Callable[[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray], int]
+
+
+def _puct_argmax_impl(
+    exploration_scale: float,
+    actions: np.ndarray,
+    priors: np.ndarray,
+    visits: np.ndarray,
+    vsum: np.ndarray,
+) -> int:
+    n = visits.shape[0]
+    ucb = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        visit_count = visits[i]
+        if visit_count == 0.0:
+            ucb[i] = exploration_scale * priors[i]
+        else:
+            q_value = vsum[i] / visit_count
+            ucb[i] = q_value + exploration_scale * priors[i] / (1.0 + visit_count)
+    best_index = 0
+    best_value = ucb[0]
+    for i in range(1, n):
+        if ucb[i] > best_value:
+            best_value = ucb[i]
+            best_index = i
+    return int(actions[best_index])
+
+
+_puct_argmax_numba: _PuctArgmax = _puct_argmax_impl
 try:
-    from numba import njit
-
-    @njit(cache=True)
-    def _puct_argmax_numba(
-        exploration_scale: float,
-        actions: np.ndarray,
-        priors: np.ndarray,
-        visits: np.ndarray,
-        vsum: np.ndarray,
-    ) -> int:
-        n = visits.shape[0]
-        ucb = np.empty(n, dtype=np.float64)
-        for i in range(n):
-            vi = visits[i]
-            if vi == 0.0:
-                ucb[i] = exploration_scale * priors[i]
-            else:
-                q = vsum[i] / vi
-                ucb[i] = q + exploration_scale * priors[i] / (1.0 + vi)
-        bi = 0
-        bv = ucb[0]
-        for i in range(1, n):
-            if ucb[i] > bv:
-                bv = ucb[i]
-                bi = i
-        return int(actions[bi])
-
+    numba_module = importlib.import_module("numba")
+    _puct_argmax_numba = cast(_PuctArgmax, numba_module.njit(cache=True)(_puct_argmax_impl))
     _NUMBA_PUCT = True
 except (AttributeError, ImportError):
     # Numba is an optional acceleration. Some valid environments expose an
@@ -97,19 +102,7 @@ def _puct_best_action(cpuct: float, pb_c_base: float, node: _LatentNode) -> int:
 
 
 class _LatentNode:
-    """A node in the latent MCTS tree.
-
-    Attributes:
-        board: Chess board position at this node (None for unexpanded nodes)
-        latent: Hidden state representation
-        children: Child nodes indexed by action
-        expanded: Whether node has been expanded
-        prior: Prior probability from parent's policy
-        reward: Reward received when transitioning to this node
-        value_sum: Sum of backed-up values
-        visit_count: Number of times this node was visited
-        total_child_visits: Sum of visit counts across all children
-    """
+    """Search node whose edge reward is represented from its parent perspective."""
 
     __slots__ = (
         "board",
@@ -133,7 +126,7 @@ class _LatentNode:
         self.reward = 0.0
         self.raw_value = 0.0
         self.terminal = False
-        self.board = board  # Chess position at this node
+        self.board = board
         self.latent: torch.Tensor | None = None
         self.children: dict[int, _LatentNode] = {}
         self.expanded = False
@@ -349,9 +342,6 @@ class MCTS:
         self.last_action: int | None = None
         self.last_simulations = 0
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     def get_action_prob(
         self,
         canonical_board: chess.Board,
@@ -374,6 +364,7 @@ class MCTS:
         *,
         add_exploration_noise: bool | None = None,
         should_stop: Callable[[], bool] | None = None,
+        allowed_root_actions: Collection[int] | None = None,
     ) -> tuple[list[float], float]:
         """Run latent search and return ``(policy_target, root_value)``.
 
@@ -382,6 +373,8 @@ class MCTS:
         completed-Q training target; at zero temperature it is a one-hot view of
         that proposal. Exploration defaults to ``temp > 0`` but can be controlled
         independently when a caller needs both a target and deterministic action.
+        ``allowed_root_actions`` intersects the legal root mask without affecting
+        legal actions at recurrent nodes.
         """
         self.last_action = None
         self.last_simulations = 0
@@ -395,17 +388,22 @@ class MCTS:
         if terminal_value is not None:
             return [0.0] * self.game.get_action_size(), float(terminal_value)
 
-        valids = self.game.get_valid_moves(canonical_board, 1)
-        obs = self.game.to_array(canonical_board)
-        pi_np, root_prediction, latent = self.nnet.predict_with_latent(obs, valids)
-
-        valid_indices = np.flatnonzero(valids)
         action_size = self.game.get_action_size()
-
+        valids = self.game.get_valid_moves(canonical_board, 1)
+        if allowed_root_actions is not None:
+            root_mask = np.zeros(action_size, dtype=valids.dtype)
+            for action in allowed_root_actions:
+                if not 0 <= action < action_size:
+                    raise ValueError(f"Root action must be in [0, {action_size}), got {action}")
+                root_mask[action] = 1
+            valids *= root_mask
+        valid_indices = np.flatnonzero(valids)
         if len(valid_indices) == 0:
             return [0.0] * action_size, 0.0
 
-        # Store the root board position for legal move tracking in children
+        obs = self.game.to_array(canonical_board)
+        pi_np, root_prediction, latent = self.nnet.predict_with_latent(obs, valids)
+
         root = _LatentNode(prior=0.0, board=canonical_board.copy())
         root.latent = latent
         root.raw_value = float(root_prediction)
@@ -448,7 +446,8 @@ class MCTS:
         root_value = float(q_sum.sum() / max(total_visits, 1))
 
         if self.params.search_mode == "gumbel":
-            assert gumbel_state is not None
+            if gumbel_state is None:
+                raise RuntimeError("Gumbel search state was not initialized")
             self.last_action = gumbel_state.proposed_action(root)
             if temp == 0:
                 probs = [0.0] * action_size
@@ -478,20 +477,7 @@ class MCTS:
         return probs, root_value
 
     def _latent_simulate(self, node: _LatentNode, root_action: int | None = None) -> float:
-        """Recursively simulate one MCTS path from node to leaf and backup value.
-
-        Implements the core MCTS loop:
-        1. Select best child via PUCT (exploration + exploitation)
-        2. If leaf, expand with recurrent_predict (dynamics + prediction)
-        3. Backup negated value (two-player zero-sum alternating)
-
-        Args:
-            node: Current node to simulate from.
-            root_action: Optional action imposed by root Sequential Halving.
-
-        Returns:
-            Value of the selected continuation from ``node``'s perspective.
-        """
+        """Simulate one path and return its value from ``node``'s perspective."""
         if not node.expanded or not node.children:
             return 0.0
 
@@ -512,7 +498,7 @@ class MCTS:
                     child.board = canonical_child
                     if terminal_value is None:
                         child_valid_mask = self.game.get_valid_moves(canonical_child, 1)
-                except (ValueError, AssertionError) as exc:
+                except ValueError as exc:
                     raise RuntimeError(f"MCTS selected invalid action {best_action} at {node.board.fen()}") from exc
 
             child.expanded = True
@@ -523,7 +509,6 @@ class MCTS:
                 child.terminal = True
                 q = child.reward
             else:
-                # Recurrent inference with legal move masking (if available).
                 pi_np, value, reward, next_latent = self.nnet.recurrent_predict(
                     node.latent, best_action, valid_mask=child_valid_mask
                 )
@@ -551,18 +536,10 @@ class MCTS:
         return q
 
 
-# ======================================================================
-# Batched parallel MCTS for self-play
-# ======================================================================
-
-
 class _PendingExpansion:
-    """Tracks a leaf that needs NN evaluation before backprop."""
-
     __slots__ = ("ancestors", "child")
 
     def __init__(self, ancestors: list[_LatentNode], child: _LatentNode) -> None:
-        """ancestors = [root, ..., parent] along the path to the unexpanded *child*."""
         self.ancestors = ancestors
         self.child = child
 
@@ -588,16 +565,7 @@ def _backup_latent_path(ancestors: list[_LatentNode], leaf: _LatentNode, q_leaf:
 
 
 class BatchedMCTS:
-    """Run MCTS for N games in parallel, batching all leaf expansions into one GPU call.
-
-    Each simulation step:
-      1. For each game, select a leaf via tree traversal (CPU)
-      2. Batch all pending leaf latents into one recurrent_inference call (GPU)
-      3. Backpropagate results into each tree (CPU)
-
-    This turns N*sims individual GPU calls into N*sims / batch_factor calls,
-    massively improving GPU utilisation.
-    """
+    """Batch leaf expansion across independent search trees."""
 
     def __init__(
         self,
@@ -670,25 +638,37 @@ class BatchedMCTS:
             tm.encode_s += time.perf_counter() - t0
             t0 = time.perf_counter()
 
-        inference_valid_batch = valid_batch.copy()
-        for i, outcome in enumerate(root_outcomes):
-            if outcome is not None:
-                inference_valid_batch[i].fill(1.0)
-        policies_np, root_predictions, latents = self.nnet.batched_initial_inference(
-            obs_batch,
-            inference_valid_batch,
-        )
+        active_indices = [i for i, outcome in enumerate(root_outcomes) if outcome is None]
+        policies_np = np.zeros((N, action_size), dtype=np.float32)
+        root_predictions = np.zeros(N, dtype=np.float32)
+        root_latents: list[torch.Tensor | None] = [None] * N
+        if active_indices:
+            active_policies, active_predictions, active_latents = self.nnet.batched_initial_inference(
+                obs_batch[active_indices],
+                valid_batch[active_indices],
+            )
+            for batch_index, root_index in enumerate(active_indices):
+                policies_np[root_index] = active_policies[batch_index]
+                root_predictions[root_index] = float(np.asarray(active_predictions[batch_index]).item())
+                root_latents[root_index] = active_latents[batch_index : batch_index + 1]
 
         if tm is not None:
             tm.initial_inf_s += time.perf_counter() - t0
 
         roots: list[_LatentNode] = []
         for i in range(N):
-            # Store root board position for legal move tracking
             root = _LatentNode(prior=0.0, board=canonical_boards[i].copy())
-            root.latent = latents[i : i + 1]
-            root.raw_value = float(np.asarray(root_predictions[i]).item())
+            root_outcome = root_outcomes[i]
+            root.raw_value = float(root_outcome) if root_outcome is not None else float(root_predictions[i])
             root.expanded = True
+            if root_outcome is not None:
+                roots.append(root)
+                continue
+
+            root_latent = root_latents[i]
+            if root_latent is None:
+                raise RuntimeError("Initial inference returned no latent state for a non-terminal root")
+            root.latent = root_latent
 
             valid_indices = np.flatnonzero(valid_batch[i])
             pi = policies_np[i]
@@ -745,10 +725,12 @@ class BatchedMCTS:
                 if result is not None:
                     ancestors, child, action = result
                     parent_node = ancestors[-1]
+                    parent_latent = parent_node.latent
+                    if parent_latent is None:
+                        raise RuntimeError("Selected a parent node without a latent state")
                     pending.append(_PendingExpansion(ancestors, child))
-                    parent_latents.append(parent_node.latent)  # type: ignore[arg-type]
+                    parent_latents.append(parent_latent)
                     pending_actions.append(action)
-                    # Store parent board (may be None for early root children)
                     parent_boards.append(parent_node.board)
 
             if tm is not None:
@@ -760,7 +742,6 @@ class BatchedMCTS:
             if tm is not None:
                 t_rec = time.perf_counter()
 
-            # Compute child boards and valid masks in one pass (avoid redundant computation)
             child_boards_list: list[chess.Board | None] = []
             valid_masks_list: list[np.ndarray | None] = []
             terminal_values: list[float | None] = []
@@ -776,7 +757,7 @@ class BatchedMCTS:
                         )
                         valid_masks_list.append(child_valid_mask)
                         terminal_values.append(terminal_value)
-                    except (ValueError, AssertionError) as exc:
+                    except ValueError as exc:
                         raise RuntimeError(
                             f"Batched MCTS selected invalid action {action} at {parent_board.fen()}"
                         ) from exc
@@ -848,7 +829,8 @@ class BatchedMCTS:
             else:
                 idx_bt = rb.topk_indices
                 prob_bt = rb.topk_probs
-                assert idx_bt is not None and prob_bt is not None
+                if idx_bt is None or prob_bt is None:
+                    raise RuntimeError("Sparse recurrent inference returned no policy candidates")
                 k_w = idx_bt.shape[1]
                 for output_index, pending_index in enumerate(inference_indices):
                     pe = pending[pending_index]
@@ -896,7 +878,8 @@ class BatchedMCTS:
 
             if self.params.search_mode == "gumbel" and root.children:
                 gumbel_state = gumbel_states[i]
-                assert gumbel_state is not None
+                if gumbel_state is None:
+                    raise RuntimeError("Gumbel search state was not initialized")
                 proposed_action = gumbel_state.proposed_action(root)
                 self.last_actions[i] = proposed_action
                 if temp == 0:
@@ -926,20 +909,7 @@ class BatchedMCTS:
     def _select_leaf(
         self, root: _LatentNode, cpuct: float, root_action: int | None = None
     ) -> tuple[list[_LatentNode], _LatentNode, int] | None:
-        """Traverse tree via PUCT until reaching unexpanded node.
-
-        Repeatedly selects highest PUCT-scored child until finding a node without
-        children (either terminal or unexpanded). This is the selection phase of MCTS.
-
-        Args:
-            root: Root node to start traversal.
-            cpuct: PUCT exploration constant (used only in PUCT mode).
-            root_action: Optional action imposed by root Sequential Halving.
-
-        Returns:
-            Tuple of (ancestors, leaf, action) where ancestors is [root, ..., parent]
-            such that leaf is a child of ancestors[-1], or None if no expansion possible.
-        """
+        """Return the first unexpanded edge reachable under the selection policy."""
         if not root.expanded or not root.children:
             return None
 

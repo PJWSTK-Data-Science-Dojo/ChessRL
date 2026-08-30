@@ -17,42 +17,46 @@ class MCTSParams:
     the exact legal-move count, so every legal action is retained; ``None`` copies
     the full policy vector.
 
-    CLI speed knobs (no code changes): raise ``parallel_games`` until memory-bound;
-    lower ``num_mcts_sims`` / ``max_ply`` for wall time, and use
-    ``evaluation_num_mcts_sims`` to give external evaluation a separate search budget.
     """
 
-    # Number of MCTS simulations per move during self-play
-    # AlphaZero used 800, but 50-200 is practical for training runs
-    # Higher = stronger tactical play but slower iteration time
     num_mcts_sims: int = 50
+    """Maximum simulations per move; search cost grows approximately linearly with this budget."""
 
-    # Gumbel MuZero is substantially more simulation-efficient than visit-count
-    # PUCT at the small search budgets used during self-play.
     search_mode: Literal["gumbel", "puct"] = "gumbel"
-    gumbel_max_considered_actions: int = 16
-    gumbel_scale: float = 1.0
-    gumbel_value_scale: float = 0.1
-    gumbel_maxvisit_init: float = 50.0
+    """Root selection algorithm; Gumbel search is intended for the small self-play budgets used here."""
 
-    # MuZero PUCT initialization constant (c1 in the dynamic exploration term).
+    gumbel_max_considered_actions: int = 16
+    """Maximum root candidates admitted to Sequential Halving."""
+
+    gumbel_scale: float = 1.0
+    """Scale of the sampled Gumbel logits at the root."""
+
+    gumbel_value_scale: float = 0.1
+    """Contribution of completed action values to Gumbel policy improvement."""
+
+    gumbel_maxvisit_init: float = 50.0
+    """Visit-count normalization constant used by completed-Q policy improvement."""
+
     cpuct: float = 1.25
-    # MuZero c2 constant; exploration grows logarithmically with parent visits.
+    """Initial exploration weight for classic MuZero PUCT."""
+
     pb_c_base: float = 19_652.0
+    """PUCT base controlling how exploration grows with parent visits."""
 
     dir_noise: bool = True
+    """Inject root exploration noise during self-play; evaluation disables it explicitly."""
 
-    # Dirichlet noise alpha for root exploration (AlphaZero)
-    # Lower values = more concentrated noise
-    # 0.3 is appropriate for chess (~35 legal moves average)
-    # Formula from paper: alpha = 10/n where n is typical branching factor
     dir_alpha: float = 0.3
-    dir_fraction: float = 0.25
+    """Dirichlet concentration for PUCT root noise."""
 
-    # Board games optimize the undiscounted game outcome.
+    dir_fraction: float = 0.25
+    """Fraction of the root prior replaced by Dirichlet noise."""
+
     discount: float = 1.0
+    """Discount for latent rewards; chess uses its undiscounted terminal outcome."""
 
     recurrent_policy_topk: int | None = 256
+    """Host-transfer width for recurrent policies; legal actions are always retained."""
 
 
 @dataclass
@@ -68,37 +72,82 @@ class TrainingRunConfig(MCTSParams):
     """
 
     num_iters: int = 100
-    num_episodes: int = 20
-    parallel_games: int = 8
-    temp_threshold: int = 15
-    evaluation_num_mcts_sims: int | None = None
-    train_steps_per_iter: int = 200
-    replay_capacity: int = 100_000
-    per_alpha: float = 0.6
-    per_beta: float = 0.4
-    checkpoint: str = "./temp/"
-    #: Keep the newest ``checkpoint_<iter>.pth.tar`` files. ``0`` or ``None``
-    #: disables pruning and keeps every numbered checkpoint.
-    checkpoint_top_k: int | None = 3
-    max_ply: int | None = None
-    profile: bool = False
-    profile_dir: str = "./profiles"
-    profile_summary_json: str = "iter_timings.json"
-    profile_torch_steps: int = 0
-    profile_torch_iter: int = 1
-    profile_export_chrome: bool = True
-    profile_tensorboard_logdir: str | None = None
-    profile_with_stack: bool = False
+    """Number of self-play and learning iterations."""
 
-    # Stockfish benchmark (set to 0 to disable). 50 ≈ rare enough vs iteration cost on long runs.
+    num_episodes: int = 20
+    """Self-play games generated per iteration."""
+
+    parallel_games: int = 8
+    """Games advanced together to batch network inference."""
+
+    temp_threshold: int = 15
+    """Ply after which self-play switches to deterministic action selection."""
+
+    evaluation_num_mcts_sims: int | None = None
+    """Independent external-evaluation budget; the self-play budget is used when unset."""
+
+    train_steps_per_iter: int = 200
+    """Optimizer steps performed after each self-play collection phase."""
+
+    replay_capacity: int = 100_000
+    """Maximum number of positions retained in prioritized replay."""
+
+    per_alpha: float = 0.6
+    """Priority exponent; zero reduces sampling to uniform replay."""
+
+    per_beta: float = 0.4
+    """Initial importance-sampling correction exponent."""
+
+    checkpoint: str = "./temp/"
+    """Directory for versioned training-state checkpoints."""
+
+    checkpoint_top_k: int | None = 3
+    """Numbered checkpoints to retain; zero or ``None`` disables pruning."""
+
+    max_ply: int | None = None
+    """Optional self-play safety bound that scores unfinished games as draws."""
+
+    profile: bool = False
+    """Collect iteration phase timings."""
+
+    profile_dir: str = "./profiles"
+    """Directory for profiler artifacts."""
+
+    profile_summary_json: str = "iter_timings.json"
+    """Filename for the iteration timing summary inside the profile directory."""
+
+    profile_torch_steps: int = 0
+    """Optimizer steps captured by the PyTorch profiler; zero disables capture."""
+
+    profile_torch_iter: int = 1
+    """Training iteration on which to capture the profiler trace."""
+
+    profile_export_chrome: bool = True
+    """Export a Chrome-compatible trace when profiling is active."""
+
+    profile_tensorboard_logdir: str | None = None
+    """Optional TensorBoard trace destination."""
+
+    profile_with_stack: bool = False
+    """Capture Python stacks in traces at additional profiling cost."""
+
     stockfish_eval_every: int = 50
+    """Checkpoint-evaluation interval; zero disables Stockfish evaluation."""
+
     stockfish_eval_games: int = 20
-    stockfish_elo: int = 1000
-    stockfish_skill_level: int = 10
+    """Even number of alternating-color games in each external evaluation."""
+
+    stockfish_elo: int = 1320
+    """Fixed UCI Elo for the external benchmark; 1320 is Stockfish's supported floor."""
+
     stockfish_depth: int = 10
-    stockfish_think_time: int = 30
+    """Maximum Stockfish search depth per move."""
+
     stockfish_path: str | None = None
+    """Optional explicit Stockfish executable path."""
+
     stockfish_eval_max_ply: int | None = None
+    """Optional evaluation-game safety bound; unfinished games score as draws."""
 
 
 def evaluation_mcts_params(run: TrainingRunConfig) -> MCTSParams:
@@ -126,42 +175,97 @@ class EzV2LearnerConfig:
     """Optimizer, architecture, unroll training, and loss weights for :class:`LunaNetwork`."""
 
     lr: float = 2e-4
+    """Peak AdamW learning rate after warm-up."""
+
     lr_min: float = 1e-5
+    """Final learning rate reached by cosine decay."""
+
     lr_warmup_steps: int = 1_000
+    """Optimizer steps used for linear learning-rate warm-up."""
+
     weight_decay: float = 1e-4
+    """Decoupled AdamW weight decay."""
+
     batch_size: int = 32
+    """Replay positions consumed by one optimizer step before accumulation splitting."""
+
     num_channels: int = 64
-    # Chess reward/value targets are bounded to {-1, 0, 1}; three bins are exact.
+    """Hidden channel width shared by the latent model trunks."""
+
     support_size: int = 1
+    """Half-width of categorical value and reward support; one exactly represents chess outcomes."""
+
     repr_blocks: int = 4
+    """Residual blocks in the observation representation trunk."""
+
     dyn_blocks: int = 2
+    """Residual blocks applied after each latent transition."""
+
     proj_dim: int = 256
+    """Projection width used by the consistency objective."""
+
     mixed_precision: bool = True
-    # CUDA autocast precision. bfloat16 is preferred for its training stability;
-    # unsupported devices automatically fall back to float16.
+    """Use accelerator autocast and gradient scaling when supported."""
+
     amp_dtype: str = "bfloat16"
+    """Preferred CUDA autocast dtype; unsupported bfloat16 hosts fall back to float16."""
+
     unroll_steps: int = 5
+    """Latent transition steps supervised from each replay position."""
+
     td_steps: int = 10
+    """Bootstrap horizon for alternating-sign value targets."""
+
     discount: float = 1.0
+    """Target discount; chess uses the undiscounted terminal outcome."""
+
     policy_loss_weight: float = 1.0
+    """Relative weight of search-policy cross-entropy."""
+
     value_loss_weight: float = 0.25
+    """Relative weight of categorical value prediction."""
+
     reward_loss_weight: float = 1.0
+    """Relative weight of categorical latent-reward prediction."""
+
     consistency_loss_weight: float = 2.0
-    device: str = "cuda"  # "cuda", "mps", or "cpu"
-    cuda_device: int | None = None  # Specific CUDA device index (only used if device="cuda")
+    """Relative weight of latent SimSiam consistency."""
+
+    device: str = "cuda"
+    """Learner backend: ``cuda``, ``mps``, or ``cpu``."""
+
+    cuda_device: int | None = None
+    """CUDA device index; the current default device is used when unset."""
+
     compile_inference: bool = False
+    """Compile the MCTS inference paths after model construction."""
+
     compile_training: bool = False
+    """Compile the unrolled training forward pass."""
+
     grad_accum_steps: int = 1
+    """Microbatches combined into each optimizer step."""
+
     grad_clip_norm: float = 5.0
-    # MuZero scales gradients flowing through each recurrent dynamics step to
-    # prevent long unrolls from dominating representation learning.
+    """Maximum global gradient norm before the optimizer update."""
+
     recurrent_gradient_scale: float = 0.5
+    """Scale applied to gradients crossing each recurrent dynamics edge."""
+
     dataloader_workers: int = 2
-    # Search-based value / reanalysis (EZ-V2 Sec. 4.4). Disabled when reanalyze_mcts_sims == 0.
+    """Replay-prefetch threads; zero keeps sampling on the training thread."""
+
     reanalyze_mcts_sims: int = 0
+    """Search budget for replay reanalysis; zero disables reanalysis."""
+
     reanalyze_prob: float = 0.25
+    """Fraction of sampled replay positions eligible for reanalysis."""
+
     reanalyze_policy: bool = True
+    """Refresh policy targets together with values during reanalysis."""
+
     mixed_value_td_until_step: int = 5000
+    """Optimizer step through which reanalyzed values mix with TD targets."""
 
 
 @dataclass

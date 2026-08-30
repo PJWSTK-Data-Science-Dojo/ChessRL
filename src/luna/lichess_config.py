@@ -46,7 +46,6 @@ def load_template(path: Path) -> dict[str, Any]:
 def build_config(
     template: Mapping[str, Any],
     *,
-    token: str,
     repository: Path,
     engine_path: Path,
     checkpoint: Path,
@@ -58,8 +57,6 @@ def build_config(
     compile_inference: bool,
 ) -> dict[str, Any]:
     """Return a configured copy of the current lichess-bot template."""
-    if not token or token != token.strip() or any(character.isspace() for character in token):
-        raise LichessConfigurationError("LICHESS_TOKEN must contain one non-empty token without whitespace.")
     if device not in {"cuda", "mps", "cpu"}:
         raise LichessConfigurationError(f"Unsupported inference device: {device}")
     if cuda_device is not None and cuda_device < 0:
@@ -89,7 +86,9 @@ def build_config(
     correspondence = _mapping_section(config, "correspondence")
     matchmaking = _mapping_section(config, "matchmaking")
 
-    config["token"] = token
+    # Current lichess-bot releases read LICHESS_BOT_TOKEN before this field.
+    # Keeping the generated file secret-free prevents accidental credential copies.
+    config["token"] = ""
     config["url"] = "https://lichess.org/"
     config["move_overhead"] = 250
     config["max_takebacks_accepted"] = 0
@@ -141,7 +140,7 @@ def build_config(
             "max_simultaneous_games_per_user": 1,
             "variants": ["standard"],
             "time_controls": ["blitz", "rapid", "classical"],
-            "modes": ["casual", "rated"],
+            "modes": ["casual"],
         }
     )
     challenge.pop("bullet_requires_increment", None)
@@ -180,9 +179,10 @@ def write_private_config(config: Mapping[str, Any], output: Path, *, force: bool
             os.fsync(stream.fileno())
         os.replace(temporary_path, output)
         output.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except BaseException:
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise LichessConfigurationError(f"Could not write private configuration: {output}") from exc
+    finally:
         temporary_path.unlink(missing_ok=True)
-        raise
 
 
 def _parser(repository: Path) -> argparse.ArgumentParser:
@@ -208,19 +208,16 @@ def _parser(repository: Path) -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entry point; the OAuth token is accepted only through the environment."""
+    """Generate a credential-free config for an environment-authenticated bridge."""
     repository = Path(__file__).resolve().parents[2]
     args = _parser(repository).parse_args(argv)
     bot_directory = args.lichess_bot_dir.resolve()
     template_path = (args.template or bot_directory / "config.yml.default").resolve()
     output_path = (args.output or bot_directory / "config.yml").expanduser().absolute()
-    token = os.environ.get("LICHESS_TOKEN", "")
-
     try:
         template = load_template(template_path)
         config = build_config(
             template,
-            token=token,
             repository=repository,
             engine_path=args.engine,
             checkpoint=args.checkpoint,
@@ -239,6 +236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Wrote private lichess-bot configuration to {output_path}")
     print(f"Engine: {args.engine.resolve()}")
     print(f"Checkpoint: {args.checkpoint.resolve()}")
+    print("Credential: provide LICHESS_BOT_TOKEN only to the running lichess-bot process")
     return 0
 
 

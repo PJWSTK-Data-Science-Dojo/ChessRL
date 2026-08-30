@@ -13,6 +13,8 @@ import secrets
 import threading
 import time
 import uuid
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -20,14 +22,21 @@ from typing import Any, Literal
 import chess
 import numpy as np
 import tyro
-from flask import Flask, current_app, jsonify, request, send_from_directory, session
+from flask import Flask, Response, current_app, jsonify, make_response, request, send_from_directory, session
+from flask.typing import ResponseReturnValue
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from loguru import logger
 from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 API_PREFIX = "/api/v1"
 GAME_TTL_SECONDS = 12 * 60 * 60
 MAX_GAMES = 512
 MAX_GAMES_PER_SESSION = 8
+MAX_PENDING_SEARCHES = 2
+SEARCH_ADMISSION_TIMEOUT_SECONDS = 1.0
+SEARCH_DEADLINE_SECONDS = 75.0
 
 ColorName = Literal["white", "black"]
 GameMode = Literal["human", "selfplay"]
@@ -52,6 +61,30 @@ class EngineDecision:
     evaluation_white: float
     think_time_ms: int
     simulations: int
+
+
+@dataclass(frozen=True)
+class WebAppConfig:
+    """Security and proxy policy for one web process."""
+
+    trusted_hosts: tuple[str, ...] = ()
+    proxy_hops: int = 0
+    hsts_max_age_seconds: int = 0
+    rate_limit_storage_uri: str = "memory://"
+
+
+def parse_exact_trusted_hosts(value: str) -> tuple[str, ...]:
+    """Parse a required comma-separated list without wildcard trust patterns."""
+    hosts = tuple(host.strip() for host in value.split(",") if host.strip())
+    if not hosts:
+        raise RuntimeError("LUNA_TRUSTED_HOSTS must contain at least one exact host")
+    if any(host.startswith(".") or "*" in host or "://" in host or "/" in host for host in hosts):
+        raise RuntimeError("LUNA_TRUSTED_HOSTS accepts exact host names only")
+    return hosts
+
+
+class EngineBusyError(RuntimeError):
+    """Raised when the bounded inference queue has no capacity."""
 
 
 class LunaEngineService:
@@ -84,6 +117,7 @@ class LunaEngineService:
         self.checkpoint_name = checkpoint.name
         self.device = device
         self._inference_lock = threading.Lock()
+        self._search_slots = threading.BoundedSemaphore(MAX_PENDING_SEARCHES)
         self.strengths: dict[str, StrengthProfile] = {
             "quick": StrengthProfile(
                 name="Quick scan",
@@ -101,6 +135,8 @@ class LunaEngineService:
                 description="The deepest search and the longest think time.",
             ),
         }
+        if compile_inference:
+            self.network.warmup_mcts_inference(self.game)
 
     def analyze(self, board: chess.Board, strength: str) -> EngineDecision:
         """Search ``board`` without mutating it and return the best legal move."""
@@ -122,16 +158,24 @@ class LunaEngineService:
             discount=1.0,
             recurrent_policy_topk=256,
         )
-        started = time.perf_counter()
+        started = time.monotonic()
+        deadline = started + SEARCH_DEADLINE_SECONDS
         search = MCTS(self.game, self.network, params)
-        with self._inference_lock:
-            probabilities, root_value = search.search_latent(
-                canonical_board,
-                num_sims=profile.simulations,
-                temp=1.0,
-                add_exploration_noise=False,
-            )
-        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        admitted = self._search_slots.acquire(timeout=SEARCH_ADMISSION_TIMEOUT_SECONDS)
+        if not admitted:
+            raise EngineBusyError("The inference queue is full")
+        try:
+            with self._inference_lock:
+                probabilities, root_value = search.search_latent(
+                    canonical_board,
+                    num_sims=profile.simulations,
+                    temp=1.0,
+                    add_exploration_noise=False,
+                    should_stop=lambda: time.monotonic() >= deadline,
+                )
+        finally:
+            self._search_slots.release()
+        elapsed_ms = round((time.monotonic() - started) * 1000)
 
         if search.last_action is None:
             raise RuntimeError("Search returned no legal continuation")
@@ -147,7 +191,7 @@ class LunaEngineService:
             confidence=float(probabilities[action]),
             evaluation_white=float(np.clip(evaluation_white, -1.0, 1.0)),
             think_time_ms=elapsed_ms,
-            simulations=profile.simulations,
+            simulations=search.last_simulations,
         )
 
 
@@ -165,6 +209,7 @@ class GameRecord:
     updated_at: float = field(default_factory=time.time)
     last_engine_move: str | None = None
     last_think_time_ms: int | None = None
+    last_simulations: int | None = None
     last_evaluation_white: float | None = None
     last_confidence: float | None = None
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -247,12 +292,35 @@ class GameRegistry:
 class ApiError(Exception):
     """An expected API failure with a stable machine-readable code."""
 
-    def __init__(self, status: int, code: str, message: str, details: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
         self.details = details
+        self.headers = dict(headers or {})
+
+
+@contextmanager
+def _locked_game(record: GameRecord) -> Iterator[None]:
+    if not record.lock.acquire(blocking=False):
+        raise ApiError(
+            429,
+            "game_busy",
+            "Another request is already changing this game. Please retry shortly.",
+            headers={"Retry-After": "2"},
+        )
+    try:
+        yield
+    finally:
+        record.lock.release()
 
 
 def _color_name(color: chess.Color) -> ColorName:
@@ -286,6 +354,31 @@ def _json_body() -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ApiError(400, "invalid_json", "Send a JSON object as the request body.")
     return payload
+
+
+def _require_revision(payload: Mapping[str, Any], record: GameRecord) -> None:
+    revision = payload.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int):
+        raise ApiError(400, "missing_revision", "Include the current integer game revision.")
+    current_revision = len(record.board.move_stack)
+    if revision != current_revision:
+        raise ApiError(
+            409,
+            "stale_position",
+            "The position changed before this request was processed. Refresh the game and try again.",
+            {"current_revision": current_revision},
+        )
+
+
+def _search_api_error(error: EngineBusyError | RuntimeError | ValueError) -> ApiError:
+    if isinstance(error, EngineBusyError):
+        return ApiError(
+            429,
+            "engine_busy",
+            "Luna is calculating for another player. Please retry shortly.",
+            headers={"Retry-After": "2"},
+        )
+    return ApiError(500, "search_failed", "Luna could not complete the search. Please try again.")
 
 
 def _history(board: chess.Board) -> list[dict[str, Any]]:
@@ -356,6 +449,7 @@ def _game_payload(record: GameRecord, engine: LunaEngineService) -> dict[str, An
     profile = engine.strengths[record.strength]
     return {
         "id": record.game_id,
+        "revision": len(record.board.move_stack),
         "mode": record.mode,
         "human_color": record.human_color,
         "strength": {
@@ -378,6 +472,7 @@ def _game_payload(record: GameRecord, engine: LunaEngineService) -> dict[str, An
         "engine": {
             "last_move": record.last_engine_move,
             "think_time_ms": record.last_think_time_ms,
+            "simulations": record.last_simulations,
             "evaluation_white": record.last_evaluation_white,
             "confidence": record.last_confidence,
         },
@@ -391,14 +486,49 @@ def _apply_engine_move(record: GameRecord, engine: LunaEngineService) -> EngineD
     record.board.push(decision.move)
     record.last_engine_move = decision.move.uci()
     record.last_think_time_ms = decision.think_time_ms
+    record.last_simulations = decision.simulations
     record.last_evaluation_white = decision.evaluation_white
     record.last_confidence = decision.confidence
     record.updated_at = time.time()
     return decision
 
 
-def create_app(engine: LunaEngineService | None = None) -> Flask:
-    """Build the Flask application; ``engine`` may be injected by tests."""
+def _configure_security(application: Flask, config: WebAppConfig) -> None:
+    if config.proxy_hops < 0:
+        raise ValueError("proxy_hops cannot be negative")
+    if config.hsts_max_age_seconds < 0:
+        raise ValueError("hsts_max_age_seconds cannot be negative")
+    if config.proxy_hops:
+        application.__dict__["wsgi_app"] = ProxyFix(
+            application.wsgi_app,
+            x_for=config.proxy_hops,
+            x_proto=config.proxy_hops,
+            x_host=config.proxy_hops,
+        )
+    if config.trusted_hosts:
+        application.config["TRUSTED_HOSTS"] = list(config.trusted_hosts)
+
+
+def _secure_response(response: Response, config: WebAppConfig) -> Response:
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src-elem 'self'; "
+        "style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
+        "font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    )
+    response.headers["Permissions-Policy"] = "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    if request.path.startswith(API_PREFIX):
+        response.headers["Cache-Control"] = "no-store"
+    if config.hsts_max_age_seconds:
+        response.headers["Strict-Transport-Security"] = f"max-age={config.hsts_max_age_seconds}; includeSubDomains"
+    return response
+
+
+def create_app(engine: LunaEngineService | None = None, config: WebAppConfig | None = None) -> Flask:
+    """Build an isolated web process around a verified inference service."""
+    web_config = config or WebAppConfig()
     application = Flask(__name__, static_folder="static", static_url_path="/static")
     application.config.update(
         SECRET_KEY=os.environ.get("LUNA_WEB_SECRET", secrets.token_hex(32)),
@@ -406,34 +536,54 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
     )
+    _configure_security(application, web_config)
     application.extensions["luna_engine"] = engine
     application.extensions["luna_games"] = GameRegistry()
+    limiter = Limiter(
+        key_func=get_remote_address,
+        app=application,
+        default_limits=["120 per minute"],
+        headers_enabled=False,
+        storage_uri=web_config.rate_limit_storage_uri,
+        retry_after="delta-seconds",
+    )
+
+    @application.after_request
+    def add_security_headers(response: Response) -> Response:
+        return _secure_response(response, web_config)
 
     @application.errorhandler(ApiError)
-    def handle_api_error(error: ApiError):
+    def handle_api_error(error: ApiError) -> Response:
         payload: dict[str, Any] = {"error": {"code": error.code, "message": error.message}}
         if error.details is not None:
             payload["error"]["details"] = error.details
-        return jsonify(payload), error.status
+        response = make_response(jsonify(payload), error.status)
+        response.headers.update(error.headers)
+        return response
 
     @application.errorhandler(HTTPException)
-    def handle_http_error(error: HTTPException):
+    def handle_http_error(error: HTTPException) -> ResponseReturnValue:
         if not request.path.startswith(API_PREFIX):
-            return error
+            return error.get_response()
         code = error.name.lower().replace(" ", "_")
-        return jsonify({"error": {"code": code, "message": error.description}}), error.code
+        message = "Request limit reached. Please wait before trying again." if error.code == 429 else error.description
+        response = make_response(jsonify({"error": {"code": code, "message": message}}), error.code or 500)
+        if error.code == 429:
+            response.headers["Retry-After"] = "60"
+        return response
 
     @application.errorhandler(Exception)
-    def handle_unexpected_error(error: Exception):
+    def handle_unexpected_error(error: Exception) -> ResponseReturnValue:
         logger.opt(exception=error).error("Unhandled web request failure")
         return jsonify({"error": {"code": "internal_error", "message": "Luna encountered an unexpected error."}}), 500
 
     @application.route("/")
-    def index():
+    def index() -> Response:
         return send_from_directory(Path(application.root_path), "index.html")
 
     @application.get(f"{API_PREFIX}/health")
-    def health():
+    @limiter.exempt
+    def health() -> Response:
         active_engine = _engine()
         return jsonify(
             {
@@ -455,7 +605,9 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
         )
 
     @application.post(f"{API_PREFIX}/games")
-    def create_game():
+    @limiter.limit("20 per minute")
+    @limiter.limit("8 per minute", key_func=_client_id)
+    def create_game() -> ResponseReturnValue:
         active_engine = _engine()
         payload = _json_body()
         mode = payload.get("mode", "human")
@@ -489,27 +641,34 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
             if record.mode == "human" and record.human_color == "black":
                 try:
                     _apply_engine_move(record, active_engine)
-                except Exception:
+                except (EngineBusyError, RuntimeError, ValueError) as exc:
                     _registry().delete(record.game_id, record.owner_id)
-                    logger.exception("Could not calculate the opening move")
-                    raise ApiError(500, "search_failed", "Luna could not calculate a move. Please try again.") from None
+                    if not isinstance(exc, EngineBusyError):
+                        logger.exception("Could not calculate the opening move")
+                    raise _search_api_error(exc) from None
             response = _game_payload(record, active_engine)
         return jsonify({"data": response}), 201
 
     @application.get(f"{API_PREFIX}/games/<game_id>")
-    def game_state(game_id: str):
+    def game_state(game_id: str) -> Response:
         active_engine = _engine()
         record = _registry().get(game_id, _client_id())
-        with record.lock:
+        with _locked_game(record):
             return jsonify({"data": _game_payload(record, active_engine)})
 
     @application.delete(f"{API_PREFIX}/games/<game_id>")
-    def delete_game(game_id: str):
-        _registry().delete(game_id, _client_id())
+    def delete_game(game_id: str) -> ResponseReturnValue:
+        registry = _registry()
+        owner_id = _client_id()
+        record = registry.get(game_id, owner_id)
+        with _locked_game(record):
+            registry.delete(game_id, owner_id)
         return "", 204
 
     @application.post(f"{API_PREFIX}/games/<game_id>/moves")
-    def human_move(game_id: str):
+    @limiter.limit("30 per minute")
+    @limiter.limit("20 per minute", key_func=_client_id)
+    def human_move(game_id: str) -> Response:
         active_engine = _engine()
         record = _registry().get(game_id, _client_id())
         payload = _json_body()
@@ -517,7 +676,8 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
         if not isinstance(move_text, str):
             raise ApiError(400, "missing_move", "Provide a move in UCI notation.")
 
-        with record.lock:
+        with _locked_game(record):
+            _require_revision(payload, record)
             if record.mode != "human" or record.human_color is None:
                 raise ApiError(409, "wrong_mode", "Moves can only be submitted in a human game.")
             if record.board.is_game_over(claim_draw=True):
@@ -549,27 +709,38 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
             analytics = (
                 record.last_engine_move,
                 record.last_think_time_ms,
+                record.last_simulations,
                 record.last_evaluation_white,
                 record.last_confidence,
             )
             human_san = record.board.san(move)
             record.board.push(move)
             engine_decision: EngineDecision | None = None
+            search_succeeded = False
             try:
                 if not record.board.is_game_over(claim_draw=True):
                     engine_decision = _apply_engine_move(record, active_engine)
-            except Exception:
-                record.board = previous
-                (
-                    record.last_engine_move,
-                    record.last_think_time_ms,
-                    record.last_evaluation_white,
-                    record.last_confidence,
-                ) = analytics
-                logger.exception("Engine search failed after human move in game {}", record.game_id)
-                raise ApiError(
-                    500, "search_failed", "Luna could not calculate a reply. Your move was not applied."
-                ) from None
+                search_succeeded = True
+            except (EngineBusyError, RuntimeError, ValueError) as exc:
+                if not isinstance(exc, EngineBusyError):
+                    logger.exception("Engine search failed after a human move")
+                error = _search_api_error(exc)
+                error.message = (
+                    "Luna is busy; your move was not applied. Please retry shortly."
+                    if isinstance(exc, EngineBusyError)
+                    else "Luna could not calculate a reply. Your move was not applied."
+                )
+                raise error from None
+            finally:
+                if not search_succeeded:
+                    record.board = previous
+                    (
+                        record.last_engine_move,
+                        record.last_think_time_ms,
+                        record.last_simulations,
+                        record.last_evaluation_white,
+                        record.last_confidence,
+                    ) = analytics
 
             events: list[dict[str, Any]] = [{"actor": "human", "move": move.uci(), "san": human_san}]
             if engine_decision is not None:
@@ -584,10 +755,14 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
             return jsonify({"data": _game_payload(record, active_engine), "events": events})
 
     @application.post(f"{API_PREFIX}/games/<game_id>/engine-move")
-    def selfplay_move(game_id: str):
+    @limiter.limit("24 per minute")
+    @limiter.limit("16 per minute", key_func=_client_id)
+    def selfplay_move(game_id: str) -> Response:
         active_engine = _engine()
         record = _registry().get(game_id, _client_id())
-        with record.lock:
+        payload = _json_body()
+        with _locked_game(record):
+            _require_revision(payload, record)
             if record.mode != "selfplay":
                 raise ApiError(409, "wrong_mode", "Engine stepping is only available in observatory mode.")
             if record.board.is_game_over(claim_draw=True):
@@ -595,10 +770,11 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
             previous = record.board.copy(stack=True)
             try:
                 decision = _apply_engine_move(record, active_engine)
-            except Exception:
+            except (EngineBusyError, RuntimeError, ValueError) as exc:
                 record.board = previous
-                logger.exception("Self-play search failed in game {}", record.game_id)
-                raise ApiError(500, "search_failed", "Luna could not calculate the next move.") from None
+                if not isinstance(exc, EngineBusyError):
+                    logger.exception("Self-play search failed")
+                raise _search_api_error(exc) from None
             return jsonify(
                 {
                     "data": _game_payload(record, active_engine),
@@ -614,10 +790,14 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
             )
 
     @application.post(f"{API_PREFIX}/games/<game_id>/hint")
-    def hint(game_id: str):
+    @limiter.limit("12 per minute")
+    @limiter.limit("6 per minute", key_func=_client_id)
+    def hint(game_id: str) -> Response:
         active_engine = _engine()
         record = _registry().get(game_id, _client_id())
-        with record.lock:
+        payload = _json_body()
+        with _locked_game(record):
+            _require_revision(payload, record)
             if record.mode != "human" or record.human_color is None:
                 raise ApiError(409, "wrong_mode", "Hints are only available while playing Luna.")
             if record.board.is_game_over(claim_draw=True):
@@ -626,12 +806,14 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
                 raise ApiError(409, "not_your_turn", "Hints are available on your turn.")
             try:
                 decision = active_engine.analyze(record.board, record.strength)
-            except Exception:
-                logger.exception("Hint search failed in game {}", record.game_id)
-                raise ApiError(500, "search_failed", "Luna could not calculate a hint.") from None
+            except (EngineBusyError, RuntimeError, ValueError) as exc:
+                if not isinstance(exc, EngineBusyError):
+                    logger.exception("Hint search failed")
+                raise _search_api_error(exc) from None
             record.last_evaluation_white = decision.evaluation_white
             record.last_confidence = decision.confidence
             record.last_think_time_ms = decision.think_time_ms
+            record.last_simulations = decision.simulations
             return jsonify(
                 {
                     "data": {
@@ -640,15 +822,20 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
                         "confidence": decision.confidence,
                         "evaluation_white": decision.evaluation_white,
                         "think_time_ms": decision.think_time_ms,
+                        "simulations": decision.simulations,
                     }
                 }
             )
 
     @application.post(f"{API_PREFIX}/games/<game_id>/undo")
-    def undo(game_id: str):
+    @limiter.limit("30 per minute")
+    @limiter.limit("20 per minute", key_func=_client_id)
+    def undo(game_id: str) -> Response:
         active_engine = _engine()
         record = _registry().get(game_id, _client_id())
-        with record.lock:
+        payload = _json_body()
+        with _locked_game(record):
+            _require_revision(payload, record)
             history = _history(record.board)
             if not _can_undo(record, history) or record.human_color is None:
                 raise ApiError(409, "nothing_to_undo", "There is no completed player move to undo.")
@@ -663,15 +850,13 @@ def create_app(engine: LunaEngineService | None = None) -> Flask:
                 raise RuntimeError("Undo invariant violated")
             record.last_engine_move = None
             record.last_think_time_ms = None
+            record.last_simulations = None
             record.last_evaluation_white = None
             record.last_confidence = None
             record.updated_at = time.time()
             return jsonify({"data": _game_payload(record, active_engine)})
 
     return application
-
-
-app = create_app()
 
 
 @dataclass
@@ -701,9 +886,9 @@ def main() -> None:
         logger.exception("Luna web server refused to start: the checkpoint could not be loaded")
         raise SystemExit(2) from None
 
-    app.extensions["luna_engine"] = engine
+    application = create_app(engine)
     logger.info("Luna web interface ready at http://{}:{}", cfg.host, cfg.port)
-    app.run(host=cfg.host, port=cfg.port, debug=cfg.debug)
+    application.run(host=cfg.host, port=cfg.port, debug=cfg.debug)
 
 
 if __name__ == "__main__":

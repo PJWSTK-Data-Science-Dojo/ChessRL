@@ -4,6 +4,7 @@ import chess
 import pytest
 import torch
 
+from luna.config import EzV2LearnerConfig
 from luna.ezv2_networks import (
     EZV2Networks,
     _flatten_spatial_policy,
@@ -11,11 +12,15 @@ from luna.ezv2_networks import (
     action_index_to_planes,
     scalar_to_support,
 )
-from luna.game.chess_game import OBS_PLANES
+from luna.game.chess_game import OBS_PLANES, ChessGame
 
 
 @pytest.mark.parametrize("network_type", ["initial", "recurrent"])
-def test_network_output_shapes(network_type, chess_game, small_learner_config):
+def test_network_output_shapes(
+    network_type: str,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
     """All networks produce correct output tensor shapes."""
     nnet = EZV2Networks(chess_game, small_learner_config)
     action_size = chess_game.get_action_size()
@@ -38,7 +43,7 @@ def test_network_output_shapes(network_type, chess_game, small_learner_config):
         assert v.shape == (2,)
 
 
-def test_support_transform_roundtrip():
+def test_support_transform_roundtrip() -> None:
     support_size = 5
     values = torch.tensor([0.0, 1.0, -1.0, 3.5, -4.9])
     encoded = scalar_to_support(values, support_size)
@@ -50,7 +55,7 @@ def test_support_transform_roundtrip():
     assert torch.allclose(values.clamp(-support_size, support_size), recovered, atol=0.1)
 
 
-def test_action_spatial_encoding():
+def test_action_spatial_encoding() -> None:
     actions = torch.tensor([0, 4095, 100])
     planes = action_index_to_planes(actions, torch.device("cpu"))
     assert planes.shape == (3, 5, 8, 8)
@@ -58,7 +63,7 @@ def test_action_spatial_encoding():
     assert planes[0, 1].sum().item() == 1.0
 
 
-def test_spatial_policy_head_preserves_action_layout():
+def test_spatial_policy_head_preserves_action_layout() -> None:
     raw_logits = torch.zeros(1, 88, 8, 8)
 
     normal_action = chess.E2 * 64 + chess.E4

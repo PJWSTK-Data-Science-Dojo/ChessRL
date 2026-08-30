@@ -1,4 +1,4 @@
-"""python-chess luna wrapper with spatial action encoding.
+"""Chess rules, temporal observations, and spatial action encoding.
 
 Action encoding (4288 total):
     indices   0..4095  -- normal moves + queen promotions: from_square * 64 + to_square
@@ -109,15 +109,17 @@ def action_to_move(action: int) -> chess.Move:
     return chess.Move(from_sq, to_sq)
 
 
-def action_to_planes(action: int) -> tuple[int, int]:
-    """Decompose an action index into (from_square, to_square)."""
-    move = action_to_move(action)
-    return move.from_square, move.to_square
-
-
 def player_from_turn(turn: bool) -> int:
     """1 for white, -1 for black."""
     return 1 if turn else -1
+
+
+def _validate_player_turn(board: chess.Board, player: int) -> None:
+    expected_player = player_from_turn(board.turn)
+    if player != expected_player:
+        raise ValueError(
+            f"Player {player} does not match the side to move ({expected_player}) in position {board.fen()}"
+        )
 
 
 def mirror_move(move: chess.Move) -> chess.Move:
@@ -143,7 +145,7 @@ def mirror_board(board: chess.Board) -> chess.Board:
 
 
 class ChessGame:
-    """python-chess wrapper."""
+    """Rules adapter used by training, search, and protocol front ends."""
 
     def __init__(self, *, claim_draw: bool = True) -> None:
         # Self-play claims available draws to bound repeated trajectories. Protocol
@@ -177,7 +179,7 @@ class ChessGame:
         automatically. Any other illegal action raises instead of silently executing a
         different move and corrupting replay data.
         """
-        assert player_from_turn(board.turn) == player
+        _validate_player_turn(board, player)
         try:
             move: chess.Move | None = action_to_move(action)
         except ValueError:
@@ -185,16 +187,12 @@ class ChessGame:
         if move is not None and not board.turn:
             move = mirror_move(move)
 
-        # Try to execute the move
         if move is None or move not in board.legal_moves:
-            # Fallback 1: Try queen promotion if it's a pawn-to-back-rank move
             if move is not None and move.promotion is None:
                 promo_move = chess.Move(move.from_square, move.to_square, promotion=chess.QUEEN)
                 if promo_move in board.legal_moves:
                     move = promo_move
 
-            # An illegal model action indicates a masking/encoding defect. Failing fast
-            # protects the action/observation alignment required by latent dynamics.
             if move is None or move not in board.legal_moves:
                 raise ValueError(f"Illegal action {action} for position {board.fen()}")
 
@@ -203,7 +201,7 @@ class ChessGame:
         return (board, player_from_turn(board.turn))
 
     def get_valid_moves(self, board: chess.Board, player: int) -> np.ndarray:
-        assert player_from_turn(board.turn) == player
+        _validate_player_turn(board, player)
         acts = np.zeros(self.get_action_size(), dtype=np.float32)
         for move in board.legal_moves:
             canonical_move = move if player == 1 else mirror_move(move)
@@ -225,17 +223,10 @@ class ChessGame:
         return 1.0 if winner_int == player else -1.0
 
     def get_canonical_form(self, board: chess.Board, player: int) -> chess.Board:
-        assert player_from_turn(board.turn) == player
+        _validate_player_turn(board, player)
         if board.turn:
             return board
-        else:
-            return mirror_board(board)
-
-    def get_symmetries(self, board: chess.Board, pi: list | np.ndarray) -> list[tuple]:
-        return [(board, pi)]
-
-    def string_representation(self, board: chess.Board) -> str:
-        return board.fen()
+        return mirror_board(board)
 
     @staticmethod
     def display(board: chess.Board) -> None:

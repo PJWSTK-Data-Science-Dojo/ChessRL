@@ -1,30 +1,54 @@
-FROM python:3.12-slim
+FROM ghcr.io/astral-sh/uv:0.9.15@sha256:4c1ad814fe658851f50ff95ecd6948673fffddb0d7994bdb019dcb58227abd52 AS uv
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+FROM python:3.12-slim-bookworm@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579 AS builder
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_NO_CACHE=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_DOWNLOADS=never
+
+WORKDIR /app
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+COPY pyproject.toml uv.lock README.md ./
+COPY src/ ./src/
+
+RUN uv sync --frozen --no-dev --no-editable --extra perf --extra web
+
+FROM python:3.12-slim-bookworm@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579 AS runtime
+
+ENV CUDA_CACHE_PATH=/tmp/cuda-cache \
+    HOME=/home/luna \
+    NUMBA_CACHE_DIR=/tmp/numba-cache \
+    PATH=/opt/venv/bin:$PATH \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/src
+    TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor-cache \
+    TRITON_CACHE_DIR=/tmp/triton-cache \
+    XDG_CACHE_HOME=/tmp/cache
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --uid 10001 luna
+    && apt-get install --yes --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY requirements-web.txt ./
-RUN pip install --no-cache-dir --requirement requirements-web.txt
+RUN groupadd --gid 10001 luna \
+    && useradd --create-home --uid 10001 --gid luna luna \
+    && install --directory --owner=luna --group=luna /app/models
 
+COPY --from=builder /opt/venv /opt/venv
 COPY src/ ./src/
 COPY wsgi.py gunicorn.conf.py ./
+COPY --chmod=755 scripts/docker-web-entrypoint.sh /usr/local/bin/luna-web-entrypoint
 
-RUN mkdir --parents /app/temp \
-    && chown --recursive luna:luna /app
-
-USER luna
+USER 10001:10001
 
 EXPOSE 5000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
-    CMD curl --fail --silent http://127.0.0.1:5000/api/v1/health >/dev/null || exit 1
+    CMD ["/opt/venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/v1/health', timeout=5).close()"]
 
+ENTRYPOINT ["luna-web-entrypoint"]
 CMD ["gunicorn", "--config", "gunicorn.conf.py", "wsgi:app"]

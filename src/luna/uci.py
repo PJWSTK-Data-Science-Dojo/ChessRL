@@ -11,6 +11,7 @@ import shlex
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import chess
@@ -18,10 +19,13 @@ import numpy as np
 import torch
 from loguru import logger
 
-from .config import MCTSParams
-from .game.chess_game import ChessGame, mirror_move, move_to_action, player_from_turn
-from .mcts import MCTS
-from .network import LunaNetwork
+from luna.config import MCTSParams
+from luna.game.chess_game import ChessGame, mirror_move, move_to_action, player_from_turn
+from luna.mcts import MCTS
+from luna.network import LunaNetwork
+
+_TIMED_GO_KEYS = frozenset({"movetime", "wtime", "btime", "winc", "binc"})
+_CLOCK_SAFETY_MS = 25
 
 
 @dataclass
@@ -31,6 +35,14 @@ class UciOptions:
     mcts_simulations: int
     minimum_simulations: int = 8
     estimated_simulation_ms: float = 4.0
+
+
+@dataclass(frozen=True)
+class SearchLimits:
+    """A simulation cap and optional hard wall-clock boundary."""
+
+    simulations: int
+    deadline: float | None
 
 
 class LunaUciEngine:
@@ -72,35 +84,66 @@ class LunaUciEngine:
                 board.push(move)
         self.board = board
 
-    def _simulation_budget(self, go_tokens: list[str]) -> int:
+    @staticmethod
+    def _go_values(go_tokens: list[str]) -> dict[str, int]:
         values: dict[str, int] = {}
-        for index in range(0, len(go_tokens) - 1):
-            if go_tokens[index] in {"movetime", "wtime", "btime", "winc", "binc", "nodes"}:
+        for index, token in enumerate(go_tokens):
+            if token in _TIMED_GO_KEYS or token == "nodes":
+                if index + 1 >= len(go_tokens):
+                    raise ValueError(f"go {token} requires an integer value")
                 try:
-                    values[go_tokens[index]] = int(go_tokens[index + 1])
-                except ValueError:
-                    continue
+                    values[token] = int(go_tokens[index + 1])
+                except ValueError as exc:
+                    raise ValueError(f"go {token} requires an integer value") from exc
+        return values
 
+    def _allocated_time_ms(self, values: dict[str, int]) -> int | None:
+        if "movetime" in values:
+            return max(1, values["movetime"] - _CLOCK_SAFETY_MS)
+
+        side = "w" if self.board.turn == chess.WHITE else "b"
+        remaining = values.get(f"{side}time")
+        if remaining is None:
+            return None
+        increment = max(0, values.get(f"{side}inc", 0))
+        normal_allocation = max(_CLOCK_SAFETY_MS, remaining // 30 + int(increment * 0.75))
+        clock_safe_limit = max(1, remaining - _CLOCK_SAFETY_MS)
+        return min(normal_allocation, clock_safe_limit)
+
+    def _search_limits(self, go_tokens: list[str]) -> SearchLimits:
+        values = self._go_values(go_tokens)
         maximum = max(1, self.options.mcts_simulations)
         minimum = min(maximum, max(1, self.options.minimum_simulations))
+        budget_ms = self._allocated_time_ms(values)
+        deadline = None if budget_ms is None else time.monotonic() + budget_ms / 1_000
         if "nodes" in values:
-            return min(maximum, max(minimum, values["nodes"]))
+            simulations = min(maximum, max(1, values["nodes"]))
+            return SearchLimits(simulations=simulations, deadline=deadline)
 
-        if "movetime" in values:
-            budget_ms = max(1, values["movetime"] - 25)
-        else:
-            side = "w" if self.board.turn == chess.WHITE else "b"
-            remaining = values.get(f"{side}time")
-            increment = values.get(f"{side}inc", 0)
-            if remaining is None:
-                return self.options.mcts_simulations
-            # Reserve most of the clock and spend increment aggressively. The UCI
-            # bridge remains the final authority and can enforce a hard process limit.
-            budget_ms = max(25, remaining // 30 + int(increment * 0.75))
-
+        if budget_ms is None:
+            return SearchLimits(simulations=maximum, deadline=None)
         estimated = max(self.options.estimated_simulation_ms, 0.1)
         affordable = int(budget_ms / estimated)
-        return min(maximum, max(minimum, affordable))
+        simulations = min(maximum, max(minimum, affordable))
+        return SearchLimits(simulations=simulations, deadline=deadline)
+
+    def _simulation_budget(self, go_tokens: list[str]) -> int:
+        return self._search_limits(go_tokens).simulations
+
+    @staticmethod
+    def _stop_callback(
+        stop_event: threading.Event | None,
+        deadline: float | None,
+    ) -> Callable[[], bool] | None:
+        if stop_event is None and deadline is None:
+            return None
+
+        def should_stop() -> bool:
+            externally_stopped = stop_event is not None and stop_event.is_set()
+            timed_out = deadline is not None and time.monotonic() >= deadline
+            return externally_stopped or timed_out
+
+        return should_stop
 
     def _searchmove_actions(self, go_tokens: list[str]) -> set[int] | None:
         """Return canonical action IDs requested by UCI ``searchmoves``.
@@ -145,6 +188,9 @@ class LunaUciEngine:
         if self.board.is_game_over(claim_draw=False):
             self.send("bestmove 0000")
             return
+        infinite = any(token.lower() == "infinite" for token in go_tokens)
+        if infinite and stop_event is None:
+            raise ValueError("go infinite requires an interruptible search context")
 
         restricted_actions = self._searchmove_actions(go_tokens)
         if restricted_actions is not None and not restricted_actions:
@@ -152,34 +198,39 @@ class LunaUciEngine:
             self.send("bestmove 0000")
             return
 
-        simulations = self._simulation_budget(go_tokens)
+        limits = self._search_limits(go_tokens)
         current_player = player_from_turn(self.board.turn)
         canonical = self.game.get_canonical_form(self.board, current_player)
         params = MCTSParams(
-            num_mcts_sims=simulations,
+            num_mcts_sims=limits.simulations,
             dir_noise=False,
             recurrent_policy_topk=256,
         )
-        started = time.perf_counter()
+        started = time.monotonic()
         search = MCTS(self.game, self.network, params)
-        policy, value = search.search_latent(
+        _policy, value = search.search_latent(
             canonical,
             temp=1.0,
             add_exploration_noise=False,
-            should_stop=stop_event.is_set if stop_event is not None else None,
+            should_stop=self._stop_callback(stop_event, limits.deadline),
+            allowed_root_actions=restricted_actions,
         )
-        if restricted_actions is None:
-            if search.last_action is None:
-                raise RuntimeError("Search returned no legal continuation")
-            action = search.last_action
-        else:
-            action = max(restricted_actions, key=lambda candidate: float(policy[candidate]))
+        search_elapsed_ms = max(1, int((time.monotonic() - started) * 1_000))
+        if infinite:
+            if stop_event is None:
+                raise RuntimeError("Infinite search lost its stop event")
+            stop_event.wait()
+        if search.last_action is None:
+            raise RuntimeError("Search returned no legal continuation")
+        action = search.last_action
+        if restricted_actions is not None and action not in restricted_actions:
+            raise RuntimeError("Search returned an action outside the requested root moves")
         next_board, _ = self.game.get_next_state(self.board, current_player, action)
         move = next_board.peek()
-        elapsed_ms = max(1, int((time.perf_counter() - started) * 1_000))
-        completed_simulations = int(getattr(search, "last_simulations", simulations))
+        elapsed_ms = max(1, int((time.monotonic() - started) * 1_000)) if infinite else search_elapsed_ms
+        completed_simulations = int(getattr(search, "last_simulations", limits.simulations))
         if completed_simulations > 0:
-            observed_simulation_ms = elapsed_ms / completed_simulations
+            observed_simulation_ms = search_elapsed_ms / completed_simulations
             self.options.estimated_simulation_ms = max(
                 0.1,
                 0.8 * self.options.estimated_simulation_ms + 0.2 * observed_simulation_ms,
@@ -192,12 +243,16 @@ class LunaUciEngine:
         self.send(f"bestmove {move.uci()}")
 
     def _search_worker(self, go_tokens: list[str], stop_event: threading.Event) -> None:
+        search_finished = False
         try:
             self.search(go_tokens, stop_event)
-        except Exception as exc:
+            search_finished = True
+        except (AssertionError, RuntimeError, ValueError) as exc:
             logger.exception("UCI search failed")
             self.send(f"info string error {type(exc).__name__}: {exc}")
-            self.send("bestmove 0000")
+        finally:
+            if not search_finished:
+                self.send("bestmove 0000")
 
     def _stop_active_search(self) -> None:
         thread = self._search_thread
@@ -249,9 +304,9 @@ class LunaUciEngine:
             line = raw_line.strip()
             if not line:
                 continue
-            tokens = shlex.split(line)
-            command, arguments = tokens[0].lower(), tokens[1:]
             try:
+                tokens = shlex.split(line)
+                command, arguments = tokens[0].lower(), tokens[1:]
                 if command == "uci":
                     self.send("id name Luna ChessRL")
                     self.send("id author ChessRL contributors")
@@ -283,10 +338,10 @@ class LunaUciEngine:
                 elif command == "quit":
                     self._stop_active_search()
                     return
-            except Exception as exc:
+            except (RuntimeError, ValueError) as exc:
                 logger.exception("UCI command failed: {}", line)
                 self.send(f"info string error {type(exc).__name__}: {exc}")
-                if command == "go":
+                if line.split(maxsplit=1)[0].lower() == "go":
                     self.send("bestmove 0000")
         self._stop_active_search()
 
@@ -318,7 +373,8 @@ def main() -> int:
             compile_inference=args.compile_inference,
             load_optimizer=False,
         )
-    except Exception:
+        network.warmup_mcts_inference(game)
+    except (KeyError, OSError, RuntimeError, ValueError):
         logger.exception("Could not load Luna checkpoint")
         return 2
     engine = LunaUciEngine(

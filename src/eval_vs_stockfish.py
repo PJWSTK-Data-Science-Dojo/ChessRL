@@ -2,7 +2,7 @@
 
 Example:
     uv run python src/eval_vs_stockfish.py --checkpoint ./temp/latest.pth.tar \\
-      --run.stockfish-eval-games 10 --run.stockfish-elo 1200
+      --run.stockfish-eval-games 10 --run.stockfish-elo 1320
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from loguru import logger
 
 from luna.config import EzV2LearnerConfig, TrainingRunConfig
 from luna.game.chess_game import ChessGame as Game
-from luna.game.stockfish_eval import StockfishEvalScores, StockfishEvalSkipped, run_stockfish_eval
+from luna.game.stockfish_eval import StockfishEvalScores, run_stockfish_eval
 from luna.network import LunaNetwork
 
 
@@ -56,7 +56,6 @@ def main() -> int:
     out = run_stockfish_eval(game, nnet, cfg.run, iteration=None)
     if isinstance(out, StockfishEvalScores):
         return 0
-    assert isinstance(out, StockfishEvalSkipped)
     if out.reason == "too_few_games":
         logger.error("Stockfish eval skipped: {} — set --run.stockfish-eval-games to an even number ≥ 2.", out.message)
         return 3

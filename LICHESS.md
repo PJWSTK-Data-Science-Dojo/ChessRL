@@ -20,11 +20,9 @@ test -x .venv/bin/luna-uci
 test -f temp/latest.pth.tar
 
 git clone https://github.com/lichess-bot-devs/lichess-bot.git ../lichess-bot
-python3 -m venv ../lichess-bot/venv
-../lichess-bot/venv/bin/python -m pip install -r ../lichess-bot/requirements.txt
 ```
 
-The UCI executable and checkpoint are recorded as absolute paths, so the two repositories can live anywhere. Luna loads `temp/latest.pth.tar`; every new game therefore starts with the latest atomically published model.
+The bridge runs through `uv run --with-requirements`, so it does not need a separately managed environment. The UCI executable and checkpoint are recorded as absolute paths, so the two repositories can live anywhere. Luna loads `temp/latest.pth.tar`; every new game therefore starts with the latest atomically published model.
 
 Smoke-test the engine before connecting it to an account:
 
@@ -44,15 +42,15 @@ Create a fresh Lichess account that has played no games. While signed into that 
 Read the token without echoing it or placing it in shell history:
 
 ```bash
-read -rsp 'Lichess bot token: ' LICHESS_TOKEN && printf '\n'
-export LICHESS_TOKEN
+read -rsp 'Lichess bot token: ' LICHESS_BOT_TOKEN && printf '\n'
+export LICHESS_BOT_TOKEN
 ```
 
-Never paste the token into a command, commit it, attach it to an issue, or include it in logs.
+Never paste the token into a command, config file, commit, issue, or log. The maintained bridge reads `LICHESS_BOT_TOKEN` directly from its process environment.
 
 ## 3. Generate `config.yml`
 
-The generator reads the checked-out upstream `config.yml.default` with PyYAML, retains unknown upstream fields, and writes an owner-only file atomically:
+The generator reads the checked-out upstream `config.yml.default` with PyYAML, retains unknown upstream fields, and writes an owner-only, credential-free file atomically:
 
 ```bash
 uv run luna-lichess-config \
@@ -63,11 +61,10 @@ uv run luna-lichess-config \
   --estimated-sim-ms 4 \
   --compile-inference
 
-unset LICHESS_TOKEN
 stat -c '%a %n' ../lichess-bot/config.yml
 ```
 
-The mode reported by `stat` must be `600`. The generator never prints the token and refuses to overwrite an existing config unless `--force` is supplied.
+The mode reported by `stat` must be `600`. The generated `token` field is deliberately empty; authentication comes only from `LICHESS_BOT_TOKEN` when the bridge runs. The generator refuses to overwrite an existing config unless `--force` is supplied.
 
 Useful options:
 
@@ -79,7 +76,7 @@ Useful options:
 - `--estimated-sim-ms FLOAT` converts available move time into a simulation budget.
 - `--compile-inference` enables compiled inference after its initial warm-up.
 
-The generated challenge policy accepts standard chess in rated or casual mode and permits only one active game and one game per challenger. Bullet is disabled because safe neural-search latency depends on the host and cannot be enforced reliably for every human challenge. Edit the generated YAML only if you understand the current
+The generated challenge policy starts with casual standard chess and permits only one active game and one game per challenger. Bullet is disabled because safe neural-search latency depends on the host and cannot be enforced reliably for every human challenge. Enable rated games only after sustained casual testing shows legal moves, stable clocks, and clean restarts. Edit the generated YAML only if you understand the current
 [`lichess-bot` configuration schema](https://github.com/lichess-bot-devs/lichess-bot/blob/master/config.yml.default).
 
 ## 4. Convert and run the account
@@ -88,14 +85,14 @@ The first invocation upgrades the unused account permanently:
 
 ```bash
 cd ../lichess-bot
-./venv/bin/python lichess-bot.py -u
+uv run --no-project --with-requirements requirements.txt python lichess-bot.py -u
 ```
 
 For every later start, omit `-u`:
 
 ```bash
 cd ../lichess-bot
-./venv/bin/python lichess-bot.py
+uv run --no-project --with-requirements requirements.txt python lichess-bot.py
 ```
 
 Open the bot profile on Lichess and send it a direct challenge. Both human and bot challenges are enabled by default.
@@ -104,17 +101,18 @@ Open the bot profile on Lichess and send it a direct challenge. Both human and b
 
 Start with incremented blitz while measuring real search time. Luna uses the smaller of the configured maximum and the amount affordable from the UCI clock. `--estimated-sim-ms` should be a conservative measured value, including Python and tree-search overhead.
 
-If the bot moves too slowly, increase `--estimated-sim-ms` or reduce `--mcts-sims`. If it consistently has unused time, lower the estimate gradually. Compiled inference can make the first search slower while compilation completes, so warm the engine before accepting short challenges.
+If the bot moves too slowly, increase `--estimated-sim-ms` or reduce `--mcts-sims`. If it consistently has unused time, lower the estimate gradually. Luna warms compiled inference before announcing UCI readiness, so bridge startup can take longer but timed moves do not absorb compilation. Disable `--compile-inference` if startup cannot complete reliably on the host.
 
 The generated config disables pondering and reserves 250 ms of bridge overhead. Those settings favor clock safety over squeezing out one more search batch.
 
 ## Operations and security
 
-- Revoke the OAuth token immediately if `config.yml` is exposed. Generate a new token, rerun the configurator with `--force`, then unset the environment variable.
-- Keep `config.yml` outside this repository. It contains a live credential even though its permissions are restricted.
+- Revoke the OAuth token immediately if its process environment, shell, or secret store is exposed. Generate a new token before restarting the bridge.
+- Keep `config.yml` outside this repository. It contains host-specific executable and checkpoint paths even though it contains no credential.
 - Run only one bridge process for the account. Duplicate processes can race over the same event stream.
 - Use `Ctrl+C` for a clean shutdown. The upstream bridge owns network retries and rate-limit handling.
 - Retain `latest.pth.tar` while the bot is online. A newly spawned engine cannot start without it.
+- Run `unset LICHESS_BOT_TOKEN` when the bridge stops if the current shell will remain open.
 
 For protocol diagnostics, run the bridge with `-v`; check that Luna answers `uci`, `isready`, `position`, clocked `go`, and restricted `go searchmoves` commands. Do not share logs until you have checked them for account or filesystem information.
 

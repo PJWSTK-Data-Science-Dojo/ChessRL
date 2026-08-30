@@ -29,6 +29,37 @@ make test-pipeline-mps
 
 Use `uv run python src/main.py --help`, `uv run python src/web_app.py --help`, and `uv run luna-uci --help` for the live CLI contract.
 
+## Python engineering rules
+
+### Toolchain
+
+- Use `uv` exclusively for dependency and environment management. Never use pip, Poetry, or Conda in commands, scripts, containers, or documentation.
+- Format and lint with Ruff: `uv run ruff format` and `uv run ruff check --fix`. Do not introduce Black, Flake8, isort, or Pylint.
+- Run mypy in strict mode and fix the underlying type contract. Do not use `# type: ignore` or `# noqa` to silence a checker.
+- Run tests with `uv run pytest`. Keep tests fast, independent, and focused on one behavior using Arrange–Act–Assert structure.
+
+### Types and APIs
+
+- Annotate every function signature. Use modern Python syntax such as `str | None`, built-in generic types, `match`, `tomllib`, and `Self` where they improve clarity.
+- Prefer frozen dataclasses or Pydantic models for structured data that crosses an API boundary. Do not pass growing dictionaries with undocumented keys between subsystems.
+- Never use mutable default arguments. Prefer absolute imports grouped as standard library, third party, then `luna` modules.
+- Use intention-revealing names. Classes are nouns and methods are verbs. Keep functions focused on one abstraction level; fewer than 20 lines and at most three arguments are design targets, not reasons to create single-use wrappers.
+- Do not return `None` as a hidden error or as a substitute for an empty collection. `None` remains valid when it is the explicit domain value, such as an ongoing chess outcome, or the natural return of a mutating command.
+
+### Errors, documentation, and structure
+
+- Raise specific exceptions with actionable context. Never return error flags, swallow failures, use bare `except`, or catch `Exception` only to continue silently.
+- Follow Google docstring conventions for public APIs with non-obvious constraints or semantics. Omit docstrings on trivial private helpers and omit `Args` or `Returns` sections that only repeat annotations.
+- Comments explain why a constraint exists, never what the following statement does. Do not add banner comments, commented-out code, unsolicited demo blocks, debug prints, placeholder TODOs, or self-congratulatory prose.
+- Apply DRY, YAGNI, and KISS together. Delete verified dead code. Do not add a factory, manager, handler, compatibility shim, version branch, configuration hook, or custom stdlib replacement for one use case.
+- Match the surrounding module while moving touched code toward these rules. Avoid unrelated refactors whose risk is larger than their measured benefit.
+
+### Security
+
+- Read secrets from the environment or a gitignored private file. Never hardcode, print, log, persist in generated artifacts, or commit tokens, credentials, personal data, or private paths.
+- Validate boundary inputs and fail loudly on contract violations. Avoid defensive defaults that turn malformed internal data into plausible output.
+- Keep code, comments, and log messages professional and emoji-free.
+
 ## Core files
 
 | File | Responsibility |

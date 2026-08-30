@@ -1,5 +1,7 @@
 """Shared test fixtures for ChessRL test suite."""
 
+from typing import Protocol
+
 import numpy as np
 import pytest
 
@@ -8,8 +10,12 @@ from luna.game.chess_game import ChessGame
 from luna.replay_buffer import Trajectory
 
 
+class TrajectoryFactory(Protocol):
+    def __call__(self, length: int = 10) -> Trajectory: ...
+
+
 @pytest.fixture
-def small_learner_config():
+def small_learner_config() -> EzV2LearnerConfig:
     """Minimal model config for fast CPU tests."""
     return EzV2LearnerConfig(
         device="cpu",
@@ -22,13 +28,13 @@ def small_learner_config():
 
 
 @pytest.fixture
-def chess_game():
+def chess_game() -> ChessGame:
     """ChessGame instance."""
     return ChessGame()
 
 
 @pytest.fixture
-def make_trajectory():
+def make_trajectory() -> TrajectoryFactory:
     """Factory for creating test trajectories."""
 
     def _make(length: int = 10) -> Trajectory:

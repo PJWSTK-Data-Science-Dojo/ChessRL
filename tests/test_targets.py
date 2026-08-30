@@ -1,19 +1,21 @@
 """Tests for target generation module."""
 
 import numpy as np
+import pytest
 
 from luna.game.chess_game import ACTION_SIZE, OBS_PLANES
 from luna.targets import build_unroll_targets, collate_batch, compute_target_value
+from tests.conftest import TrajectoryFactory
 
 
 class TestComputeTargetValue:
-    def test_terminal_position(self, make_trajectory):
+    def test_terminal_position(self, make_trajectory: TrajectoryFactory) -> None:
         traj = make_trajectory(length=5)
         traj.rewards = np.array([0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         val = compute_target_value(traj, pos_idx=4, td_steps=5, discount=1.0)
         assert abs(val - 1.0) < 1e-6
 
-    def test_bootstrap(self, make_trajectory):
+    def test_bootstrap(self, make_trajectory: TrajectoryFactory) -> None:
         traj = make_trajectory(length=10)
         traj.rewards = np.zeros(10, dtype=np.float32)
         traj.root_values = np.array([0.0] * 5 + [1.0] * 5, dtype=np.float32)
@@ -22,7 +24,7 @@ class TestComputeTargetValue:
 
 
 class TestBuildUnrollTargets:
-    def test_output_shapes(self, make_trajectory):
+    def test_output_shapes(self, make_trajectory: TrajectoryFactory) -> None:
         traj = make_trajectory(length=10)
         targets = build_unroll_targets(traj, pos_idx=0, unroll_steps=3, td_steps=5)
         assert len(targets["target_values"]) == 4
@@ -34,7 +36,7 @@ class TestBuildUnrollTargets:
         assert len(targets["consistency_mask"]) == 3
         assert len(targets["value_mask"]) == 4
 
-    def test_past_end_padding(self, make_trajectory):
+    def test_past_end_padding(self, make_trajectory: TrajectoryFactory) -> None:
         traj = make_trajectory(length=3)
         targets = build_unroll_targets(traj, pos_idx=1, unroll_steps=5, td_steps=3)
         assert len(targets["target_values"]) == 6
@@ -44,7 +46,7 @@ class TestBuildUnrollTargets:
         assert targets["value_mask"] == [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
 
 
-def test_collation(make_trajectory):
+def test_collation(make_trajectory: TrajectoryFactory) -> None:
     traj = make_trajectory(length=10)
     samples = [build_unroll_targets(traj, i, unroll_steps=3, td_steps=5) for i in range(4)]
     collated = collate_batch(samples)
@@ -59,7 +61,21 @@ def test_collation(make_trajectory):
     assert collated["value_mask"].shape == (4, 4)
 
 
-def test_bootstrap_value_override_respects_two_player_perspective(make_trajectory):
+def test_collation_rejects_empty_batch() -> None:
+    with pytest.raises(ValueError, match="empty target batch"):
+        collate_batch([])
+
+
+def test_collation_rejects_policy_horizon_mismatch(make_trajectory: TrajectoryFactory) -> None:
+    trajectory = make_trajectory(length=10)
+    target = build_unroll_targets(trajectory, 0, unroll_steps=3, td_steps=5)
+    target["target_policies"] = target["target_policies"][:-1]
+
+    with pytest.raises(ValueError, match="Policy targets must have shape"):
+        collate_batch([target])
+
+
+def test_bootstrap_value_override_respects_two_player_perspective(make_trajectory: TrajectoryFactory) -> None:
     traj = make_trajectory(length=10)
     traj.root_values = np.zeros(10, dtype=np.float32)
     traj.rewards = np.zeros(10, dtype=np.float32)
@@ -68,7 +84,7 @@ def test_bootstrap_value_override_respects_two_player_perspective(make_trajector
     assert abs(val - (-0.99)) < 1e-5
 
 
-def test_current_position_sve_override_directly_replaces_td_target(make_trajectory):
+def test_current_position_sve_override_directly_replaces_td_target(make_trajectory: TrajectoryFactory) -> None:
     traj = make_trajectory(length=10)
     traj.rewards = np.ones(10, dtype=np.float32)
     traj.root_values = np.full(10, -0.75, dtype=np.float32)

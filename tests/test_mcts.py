@@ -1,12 +1,14 @@
 """Tests for MCTS search (single-game and batched)."""
 
+from typing import Never
+
 import chess
 import numpy as np
 import pytest
 import torch
 
-from luna.config import MCTSParams
-from luna.game.chess_game import move_to_action
+from luna.config import EzV2LearnerConfig, MCTSParams
+from luna.game.chess_game import ChessGame, move_to_action
 from luna.mcts import (
     MCTS,
     BatchedMCTS,
@@ -50,7 +52,12 @@ class _MateInOneNetwork:
     ) -> tuple[np.ndarray, float, torch.Tensor]:
         return self._policy()[0], 0.0, torch.zeros((1, 1, 1, 1))
 
-    def recurrent_predict(self, *_args, **_kwargs):
+    def recurrent_predict(
+        self,
+        _latent: torch.Tensor,
+        _action: int,
+        _valid_mask: np.ndarray | None = None,
+    ) -> Never:
         self.recurrent_calls += 1
         raise AssertionError("terminal transitions must not call recurrent inference")
 
@@ -96,7 +103,11 @@ class _MateInOneNetwork:
 
 
 class TestLatentSearch:
-    def test_returns_valid_policy(self, chess_game, small_learner_config):
+    def test_returns_valid_policy(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
         nnet = LunaNetwork(chess_game, small_learner_config)
         params = MCTSParams(num_mcts_sims=3, dir_noise=False, recurrent_policy_topk=None)
         mcts = MCTS(chess_game, nnet, params)
@@ -111,7 +122,44 @@ class TestLatentSearch:
         valid = chess_game.get_valid_moves(canonical, 1)
         assert np.count_nonzero(np.asarray(probs)[valid == 0]) == 0
 
-    def test_get_action_prob_uses_latent_search(self, chess_game, small_learner_config):
+    def test_allowed_root_actions_constrain_only_root_policy(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
+        network = LunaNetwork(chess_game, small_learner_config)
+        search = MCTS(
+            chess_game,
+            network,
+            MCTSParams(num_mcts_sims=3, dir_noise=False, recurrent_policy_topk=None),
+        )
+        allowed = {
+            move_to_action(chess.Move.from_uci("e2e4")),
+            move_to_action(chess.Move.from_uci("d2d4")),
+        }
+
+        policy, _value = search.search_latent(
+            chess_game.get_init_board(),
+            num_sims=3,
+            allowed_root_actions=allowed,
+        )
+
+        assert search.last_action in allowed
+        assert {int(action) for action in np.flatnonzero(policy)} <= allowed
+        assert abs(sum(policy) - 1.0) < 1e-6
+
+        with pytest.raises(ValueError, match="Root action must be"):
+            search.search_latent(
+                chess_game.get_init_board(),
+                num_sims=1,
+                allowed_root_actions={chess_game.get_action_size()},
+            )
+
+    def test_get_action_prob_uses_latent_search(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
         nnet = LunaNetwork(chess_game, small_learner_config)
         params = MCTSParams(num_mcts_sims=3, dir_noise=False, recurrent_policy_topk=None)
         mcts = MCTS(chess_game, nnet, params)
@@ -124,7 +172,11 @@ class TestLatentSearch:
         assert len(p_latent) == len(p_get)
         assert abs(sum(p_get) - 1.0) < 1e-5
 
-    def test_gumbel_action_and_improved_target_are_separate(self, chess_game, small_learner_config):
+    def test_gumbel_action_and_improved_target_are_separate(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
         nnet = LunaNetwork(chess_game, small_learner_config)
         params = MCTSParams(num_mcts_sims=3, dir_noise=False, recurrent_policy_topk=None)
         mcts = MCTS(chess_game, nnet, params)
@@ -143,7 +195,11 @@ class TestLatentSearch:
         assert np.count_nonzero(action_policy) == 1
         assert int(np.argmax(action_policy)) == first_action
 
-    def test_puct_temp_zero_remains_one_hot(self, chess_game, small_learner_config):
+    def test_puct_temp_zero_remains_one_hot(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
         nnet = LunaNetwork(chess_game, small_learner_config)
         params = MCTSParams(
             num_mcts_sims=3,
@@ -157,11 +213,15 @@ class TestLatentSearch:
 
         assert sum(1 for probability in probs if probability > 0) == 1
 
-    def test_terminal_root_short_circuits_initial_inference(self, chess_game):
+    def test_terminal_root_short_circuits_initial_inference(self, chess_game: ChessGame) -> None:
         terminal = chess.Board("7K/6q1/6k1/8/8/8/8/8 w - - 0 1")
 
         class _NoInference:
-            def predict_with_latent(self, *_args, **_kwargs):
+            def predict_with_latent(
+                self,
+                _observation: np.ndarray,
+                _valid: np.ndarray,
+            ) -> Never:
                 raise AssertionError("terminal roots must not call initial inference")
 
         policy, value = MCTS(chess_game, _NoInference(), MCTSParams()).search_latent(terminal)
@@ -169,7 +229,10 @@ class TestLatentSearch:
         assert not any(policy)
         assert value == -1.0
 
-    def test_mate_in_one_uses_exact_terminal_value_without_recurrent_inference(self, chess_game):
+    def test_mate_in_one_uses_exact_terminal_value_without_recurrent_inference(
+        self,
+        chess_game: ChessGame,
+    ) -> None:
         board = chess.Board("7k/8/5KQ1/8/8/8/8/8 w - - 0 1")
         mate_action = move_to_action(chess.Move.from_uci("g6g7"))
         network = _MateInOneNetwork(chess_game.get_action_size(), mate_action)
@@ -183,7 +246,34 @@ class TestLatentSearch:
 
 
 class TestBatchedMCTS:
-    def test_search_batch_returns_correct_count(self, chess_game, small_learner_config):
+    def test_claimable_draw_root_returns_no_action_without_inference(self, chess_game: ChessGame) -> None:
+        board = chess.Board()
+        for move in ("g1f3", "g8f6", "f3g1", "f6g8") * 2:
+            board.push_uci(move)
+        assert board.can_claim_threefold_repetition()
+        assert np.count_nonzero(chess_game.get_valid_moves(board, 1)) > 0
+
+        class _NoInference:
+            def batched_initial_inference(
+                self,
+                _observations: np.ndarray,
+                _valids: np.ndarray,
+            ) -> Never:
+                raise AssertionError("terminal roots must not call initial inference")
+
+        search = BatchedMCTS(chess_game, _NoInference(), MCTSParams())
+        policy, value, _observation, valid = search.search_batch([board])[0]
+
+        assert not np.any(policy)
+        assert value == 0.0
+        assert np.count_nonzero(valid) > 0
+        assert search.last_actions == [None]
+
+    def test_search_batch_returns_correct_count(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
         nnet = LunaNetwork(chess_game, small_learner_config)
         params = MCTSParams(num_mcts_sims=3, dir_noise=False, recurrent_policy_topk=None)
         bmcts = BatchedMCTS(chess_game, nnet, params)
@@ -202,7 +292,11 @@ class TestBatchedMCTS:
             assert valid.shape == (chess_game.get_action_size(),)
             assert np.count_nonzero(probs[valid == 0]) == 0
 
-    def test_batch_gumbel_actions_and_improved_targets_are_separate(self, chess_game, small_learner_config):
+    def test_batch_gumbel_actions_and_improved_targets_are_separate(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
         nnet = LunaNetwork(chess_game, small_learner_config)
         params = MCTSParams(num_mcts_sims=3, dir_noise=False, recurrent_policy_topk=None)
         bmcts = BatchedMCTS(chess_game, nnet, params)
@@ -234,7 +328,11 @@ class TestBatchedMCTS:
             assert int((action_results[index][0] > 0).sum()) == 1
             assert int(np.argmax(action_results[index][0])) == first_actions[index]
 
-    def test_single_and_batch_gumbel_search_match_at_evaluation(self, chess_game, small_learner_config):
+    def test_single_and_batch_gumbel_search_match_at_evaluation(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
         np.random.seed(7)
         torch.manual_seed(7)
         nnet = LunaNetwork(chess_game, small_learner_config)
@@ -250,7 +348,7 @@ class TestBatchedMCTS:
         assert abs(batch_value - single_value) < 1e-7
         assert batched.last_actions == [single_action.last_action]
 
-    def test_batch_mate_in_one_skips_recurrent_inference(self, chess_game):
+    def test_batch_mate_in_one_skips_recurrent_inference(self, chess_game: ChessGame) -> None:
         board = chess.Board("7k/8/5KQ1/8/8/8/8/8 w - - 0 1")
         mate_action = move_to_action(chess.Move.from_uci("g6g7"))
         network = _MateInOneNetwork(chess_game.get_action_size(), mate_action)
@@ -264,7 +362,7 @@ class TestBatchedMCTS:
         assert value == 1.0
         assert network.recurrent_calls == 0
 
-    def test_mixed_terminal_batch_only_infers_nonterminal_leaves(self, chess_game):
+    def test_mixed_terminal_batch_only_infers_nonterminal_leaves(self, chess_game: ChessGame) -> None:
         mate_board = chess.Board("7k/8/5KQ1/8/8/8/8/8 w - - 0 1")
         mate_action = move_to_action(chess.Move.from_uci("g6g7"))
         network = _MateInOneNetwork(chess_game.get_action_size(), mate_action)
@@ -284,7 +382,11 @@ class TestBatchedMCTS:
         assert network.recurrent_calls == 1
         assert network.recurrent_batch_sizes == [1]
 
-    def test_batch_exploration_noise_accepts_per_root_flags(self, chess_game, monkeypatch):
+    def test_batch_exploration_noise_accepts_per_root_flags(
+        self,
+        chess_game: ChessGame,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         board = chess.Board("7k/8/5KQ1/8/8/8/8/8 w - - 0 1")
         mate_action = move_to_action(chess.Move.from_uci("g6g7"))
         network = _MateInOneNetwork(chess_game.get_action_size(), mate_action)
@@ -326,10 +428,10 @@ class TestBatchedMCTS:
 
 
 class TestGumbelMuZero:
-    def test_default_mode_is_gumbel(self):
+    def test_default_mode_is_gumbel(self) -> None:
         assert MCTSParams().search_mode == "gumbel"
 
-    def test_sequential_halving_respects_budget_and_top_m(self):
+    def test_sequential_halving_respects_budget_and_top_m(self) -> None:
         params = MCTSParams(
             search_mode="gumbel",
             gumbel_max_considered_actions=4,
@@ -355,7 +457,7 @@ class TestGumbelMuZero:
         np.testing.assert_array_equal(visits, [5, 5, 1, 1, 0, 0])
         assert state.proposed_action(root) == 0
 
-    def test_completed_q_policy_is_soft_legal_and_improved(self):
+    def test_completed_q_policy_is_soft_legal_and_improved(self) -> None:
         params = MCTSParams(
             gumbel_value_scale=0.1,
             gumbel_maxvisit_init=50.0,
@@ -377,7 +479,7 @@ class TestGumbelMuZero:
         assert policy[2] > 0.5
         assert np.count_nonzero(policy) == 3
 
-    def test_backup_alternates_player_perspective_at_every_depth(self):
+    def test_backup_alternates_player_perspective_at_every_depth(self) -> None:
         root = _LatentNode(0.0)
         middle = _LatentNode(1.0)
         parent = _LatentNode(1.0)

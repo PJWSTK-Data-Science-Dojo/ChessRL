@@ -7,13 +7,13 @@ import chess
 from loguru import logger
 from tqdm import tqdm
 
-from .chess_game import ChessGame
+from luna.game.chess_game import ChessGame
 
 _WIN_THRESHOLD = 0.5
 
 
 class Arena:
-    """An Arena class where any 2 agents can be pit against each other."""
+    """Play balanced matches between two action-producing chess agents."""
 
     game: ChessGame
     player1: Callable[..., Any]
@@ -69,12 +69,12 @@ class Arena:
             )
             self.display(board)
         outcome = self.game.get_game_outcome(board, current_player)
-        assert outcome is not None
+        if outcome is None:
+            raise RuntimeError("Arena stopped before reaching a terminal position")
         return current_player * outcome
 
     @staticmethod
     def _classify_result(result: float) -> int:
-        """Classify game result: +1 for p1 win, -1 for p2 win, 0 for draw."""
         if result > _WIN_THRESHOLD:
             return 1
         if result < -_WIN_THRESHOLD:
@@ -82,7 +82,7 @@ class Arena:
         return 0
 
     def play_games(self, num: int, verbose: bool = False) -> tuple[int, int, int]:
-        """Play num games, swapping colors halfway. Returns (p1_wins, p2_wins, draws)."""
+        """Play both color assignments and return wins for each agent plus draws."""
         half = num // 2
         player_one_wins = 0
         player_two_wins = 0

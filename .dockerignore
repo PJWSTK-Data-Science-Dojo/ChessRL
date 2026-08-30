@@ -7,8 +7,13 @@ __pycache__
 .mypy_cache
 .ruff_cache
 .env
+.env.*
+!.env.example
+!.env.*.example
 config.yml
 compose.override.yml
+release
+secrets
 temp
 profiles
 logs

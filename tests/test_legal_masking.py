@@ -3,12 +3,16 @@
 import chess
 import pytest
 
-from luna.config import MCTSParams
+from luna.config import EzV2LearnerConfig, MCTSParams
+from luna.game.chess_game import ChessGame
 from luna.mcts import BatchedMCTS
 from luna.network import LunaNetwork
 
 
-def test_batched_mcts_expansion_with_boards(chess_game, small_learner_config):
+def test_batched_mcts_expansion_with_boards(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
     """Batched MCTS should track boards and compute valid masks for all positions."""
     nnet = LunaNetwork(chess_game, small_learner_config)
     params = MCTSParams(num_mcts_sims=3, dir_noise=False, recurrent_policy_topk=None)
@@ -27,7 +31,7 @@ def test_batched_mcts_expansion_with_boards(chess_game, small_learner_config):
         assert len(valids) == chess_game.get_action_size()
 
 
-def test_get_next_state_rejects_illegal_action(chess_game):
+def test_get_next_state_rejects_illegal_action(chess_game: ChessGame) -> None:
     """Illegal actions must fail rather than corrupting action/transition pairs."""
     board = chess_game.get_init_board()
 
@@ -35,7 +39,7 @@ def test_get_next_state_rejects_illegal_action(chess_game):
         chess_game.get_next_state(board, 1, 9999)
 
 
-def test_black_valid_mask_uses_canonical_actions(chess_game):
+def test_black_valid_mask_uses_canonical_actions(chess_game: ChessGame) -> None:
     board = chess.Board()
     board.push_uci("e2e4")
     valids = chess_game.get_valid_moves(board, -1)

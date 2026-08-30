@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from .replay_buffer import Trajectory
+from luna.replay_buffer import Trajectory
 
 
 def compute_target_value(
@@ -15,22 +15,10 @@ def compute_target_value(
     *,
     root_value_override: dict[int, float] | None = None,
 ) -> float:
-    """Compute n-step TD target values with alternating signs for two-player games.
+    """Compute an alternating-sign n-step value target.
 
-    Formula: V_t = r_t + gamma r_{t+1} + gamma^2 r_{t+2} + ... + gamma^n V_{t+n}
-
-    Two-player adjustment: Rewards alternate signs based on player perspective.
-
-    Args:
-        trajectory: Game trajectory containing rewards and root values.
-        pos_idx: Position index in trajectory to compute target for.
-        td_steps: Bootstrap horizon n (how many steps to look ahead).
-        discount: Discount factor in ``(0, 1]``.
-        root_value_override: Optional direct search-value targets keyed by position.
-            When the current position is present, its fresh SVE target replaces TD.
-
-    Returns:
-        n-step value target with shape matching rewards.
+    A fresh search value at the current position takes precedence over the
+    trajectory target instead of being interpreted as a later bootstrap.
     """
     game_len = trajectory.game_length
     if root_value_override is not None and pos_idx in root_value_override:
@@ -69,22 +57,7 @@ def build_unroll_targets(
     root_value_override: dict[int, float] | None = None,
     policy_override: dict[int, np.ndarray] | None = None,
 ) -> dict[str, Any]:
-    """Build targets for K-step unroll starting at pos_idx.
-
-    Returns dict with lists of length (unroll_steps + 1):
-        target_values: scalar value targets
-        target_rewards: scalar reward targets (length unroll_steps, first is for step 0->1)
-        target_policies: policy distribution targets
-        observations_unroll: observations at steps [t, ..., t+K] for consistency targets
-        actions: actions taken (length unroll_steps)
-        observation: the root observation at pos_idx
-        valid_mask: legal-action mask at pos_idx
-        valid_masks_unroll: legal masks aligned with observations_unroll / policy rows
-        unroll_mask: (unroll_steps,) float mask -- 1.0 for real steps, 0.0 for padding
-        consistency_mask: (unroll_steps,) float mask -- 1.0 only when the real
-            next observation exists (terminal observations are not stored)
-        value_mask: (unroll_steps + 1,) float mask -- 1.0 for real value targets
-    """
+    """Build aligned policy, value, reward, legality, and consistency targets."""
     game_len = trajectory.game_length
 
     target_values: list[float] = []
@@ -160,7 +133,8 @@ def build_unroll_targets(
 def collate_batch(
     batch_targets: list[dict[str, Any]],
 ) -> dict[str, np.ndarray]:
-    """Stack a list of per-sample target dicts into batched numpy arrays."""
+    if not batch_targets:
+        raise ValueError("Cannot collate an empty target batch")
     B = len(batch_targets)
     K = len(batch_targets[0]["actions"])
 
@@ -173,7 +147,8 @@ def collate_batch(
 
     policies_list = [np.stack(t["target_policies"]) for t in batch_targets]
     target_policies = np.stack(policies_list).astype(np.float32)
-    assert target_policies.shape == (B, K + 1, target_policies.shape[2])
+    if target_policies.ndim != 3 or target_policies.shape[:2] != (B, K + 1):
+        raise ValueError(f"Policy targets must have shape (batch, unroll + 1, actions), got {target_policies.shape}")
 
     valid_masks_unroll = np.stack([np.stack(t["valid_masks_unroll"]) for t in batch_targets]).astype(np.float32)
 

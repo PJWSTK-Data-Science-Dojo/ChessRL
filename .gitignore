@@ -37,8 +37,13 @@ dist/
 
 # Local deployment configuration and secrets
 .env
+.env.*
+!.env.example
+!.env.*.example
 config.yml
 compose.override.yml
+release/
+secrets/
 
 # Editor and operating-system files
 .idea/

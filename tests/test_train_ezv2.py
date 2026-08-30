@@ -1,11 +1,15 @@
 """Regression tests for EfficientZeroV2 training loop."""
 
+from collections.abc import Sequence
+from pathlib import Path
+
+import chess
 import numpy as np
 import pytest
 import torch
 from torch.amp import GradScaler
 
-from luna.config import EzV2LearnerConfig, TrainingRunConfig
+from luna.config import EzV2LearnerConfig, MCTSParams, TrainingRunConfig
 from luna.game.chess_game import ACTION_SIZE, OBS_PLANES, ChessGame
 from luna.network import LunaNetwork, _scale_gradient
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
@@ -94,6 +98,83 @@ def test_reanalysis_warmup_keeps_plain_replay_prefetch_enabled(
     assert not network._async_batch_prefetch(upcoming_steps=10)
 
 
+def test_zero_replay_workers_disable_background_prefetch(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.dataloader_workers = 0
+    network = LunaNetwork(ChessGame(), small_learner_config)
+
+    assert network._prefetch_executor is None
+    assert not network._async_batch_prefetch()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("grad_accum_steps", 0, "grad_accum_steps must be positive"),
+        ("dataloader_workers", -1, "dataloader_workers cannot be negative"),
+        ("support_size", 0, "support_size must be an integer of at least 1"),
+        ("grad_clip_norm", 0.0, "grad_clip_norm must be positive and finite"),
+        ("grad_clip_norm", float("inf"), "grad_clip_norm must be positive and finite"),
+    ],
+)
+def test_invalid_execution_settings_fail_loudly(
+    small_learner_config: EzV2LearnerConfig,
+    field_name: str,
+    value: object,
+    message: str,
+) -> None:
+    setattr(small_learner_config, field_name, value)
+
+    with pytest.raises(ValueError, match=message):
+        LunaNetwork(ChessGame(), small_learner_config)
+
+
+def test_training_rejects_zero_unroll_horizon(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.unroll_steps = 0
+    small_learner_config.dataloader_workers = 0
+    network = LunaNetwork(ChessGame(), small_learner_config)
+    replay = PrioritizedReplayBuffer(capacity=2)
+    replay.save_trajectory(_make_trajectory(length=1))
+
+    with pytest.raises(ValueError, match="unroll_steps must be positive"):
+        network.train_ezv2(replay, steps=1)
+
+
+def test_reported_total_loss_is_invariant_to_identical_gradient_accumulation() -> None:
+    np.random.seed(23)
+    trajectory = _make_trajectory(length=1)
+
+    def train_once(grad_accum_steps: int) -> float:
+        torch.manual_seed(7)
+        learner = EzV2LearnerConfig(
+            device="cpu",
+            batch_size=1,
+            unroll_steps=1,
+            td_steps=1,
+            num_channels=16,
+            repr_blocks=1,
+            dyn_blocks=1,
+            proj_dim=32,
+            lr=0.0,
+            lr_min=0.0,
+            mixed_precision=False,
+            grad_accum_steps=grad_accum_steps,
+            dataloader_workers=0,
+        )
+        network = LunaNetwork(ChessGame(), learner)
+        replay = PrioritizedReplayBuffer(capacity=2)
+        replay.save_trajectory(trajectory)
+        return network.train_ezv2(replay, steps=1)["total"]
+
+    single_microbatch = train_once(1)
+    accumulated_microbatches = train_once(2)
+
+    assert accumulated_microbatches == pytest.approx(single_microbatch, rel=1e-5)
+
+
 def test_reanalysis_restores_training_mode_and_uses_direct_sve(
     monkeypatch: pytest.MonkeyPatch,
     small_learner_config: EzV2LearnerConfig,
@@ -111,10 +192,16 @@ def test_reanalysis_restores_training_mode_and_uses_direct_sve(
     fresh_value = 0.375
 
     class _FakeBatchedMCTS:
-        def __init__(self, _game, network, _params) -> None:
+        def __init__(self, _game: ChessGame, network: LunaNetwork, _params: MCTSParams) -> None:
             self.network = network
 
-        def search_batch(self, boards, temp, *, add_exploration_noise):
+        def search_batch(
+            self,
+            boards: list[chess.Board],
+            temp: float,
+            *,
+            add_exploration_noise: bool | Sequence[bool] | None,
+        ) -> list[tuple[np.ndarray, float, None, None]]:
             assert temp == 1.0
             assert add_exploration_noise is False
             self.network.nnet.eval()
@@ -139,20 +226,17 @@ def test_reanalysis_restores_training_mode_and_uses_direct_sve(
 
 
 def test_checkpoint_contains_architecture_metadata(
-    tmp_path,
+    tmp_path: Path,
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
 ) -> None:
     small_learner_config.recurrent_gradient_scale = 0.4
     nnet = LunaNetwork(chess_game, small_learner_config)
     nnet._global_step = 17
+    nnet._trainer_iteration = 6
     nnet.scaler = GradScaler("cpu", init_scale=1024.0, growth_interval=123, enabled=True)
     expected_scaler_state = nnet.scaler.state_dict()
-    nnet.save_checkpoint(
-        str(tmp_path),
-        "metadata.pth.tar",
-        extra_state={"trainer_iteration": 6},
-    )
+    nnet.save_checkpoint(str(tmp_path), "metadata.pth.tar")
 
     checkpoint = torch.load(
         tmp_path / "metadata.pth.tar",
@@ -185,7 +269,7 @@ def test_checkpoint_contains_architecture_metadata(
 
 
 def test_learning_rate_continues_from_checkpoint_global_step(
-    tmp_path,
+    tmp_path: Path,
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
 ) -> None:
@@ -214,7 +298,7 @@ def test_learning_rate_continues_from_checkpoint_global_step(
 
 
 def test_checkpoint_loader_rejects_legacy_and_mismatched_model_specs(
-    tmp_path,
+    tmp_path: Path,
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
 ) -> None:
@@ -234,3 +318,138 @@ def test_checkpoint_loader_rejects_legacy_and_mismatched_model_specs(
 
     with pytest.raises(ValueError, match="model specification"):
         network.load_checkpoint(str(tmp_path), mismatch_path.name)
+
+
+@pytest.mark.parametrize("missing_field", ["optimizer", "scaler", "global_step", "trainer_iteration"])
+def test_checkpoint_loader_rejects_incomplete_v2_state(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    missing_field: str,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    valid_path = tmp_path / "complete.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    del checkpoint[missing_field]
+    incomplete_path = tmp_path / f"missing-{missing_field}.pth.tar"
+    torch.save(checkpoint, incomplete_path)
+
+    with pytest.raises(ValueError, match="missing required fields"):
+        network.load_checkpoint(str(tmp_path), incomplete_path.name, load_optimizer=False)
+
+
+def test_checkpoint_loader_rejects_incompatible_training_state(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    original = {name: tensor.detach().clone() for name, tensor in network.nnet.state_dict().items()}
+    valid_path = tmp_path / "valid-training-state.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    first_name = next(iter(checkpoint["state_dict"]))
+    checkpoint["state_dict"][first_name] = checkpoint["state_dict"][first_name] + 1
+    checkpoint["optimizer"] = {"invalid": True}
+    corrupt_path = tmp_path / "invalid-training-state.pth.tar"
+    torch.save(checkpoint, corrupt_path)
+
+    with pytest.raises(RuntimeError, match="training state is incompatible"):
+        network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=True)
+
+    for name, tensor in network.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, original[name])
+
+
+def test_checkpoint_loader_rejects_mismatched_resume_semantics(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    valid_path = tmp_path / "valid-learner-config.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    checkpoint["learner_config"]["unroll_steps"] += 1
+    mismatch_path = tmp_path / "mismatched-learner-config.pth.tar"
+    torch.save(checkpoint, mismatch_path)
+
+    with pytest.raises(ValueError, match=r"differs in fields.*unroll_steps"):
+        network.load_checkpoint(str(tmp_path), mismatch_path.name, load_optimizer=False)
+
+
+def test_checkpoint_loader_rejects_corrupt_learner_metadata(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    valid_path = tmp_path / "valid-metadata.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    checkpoint["learner_config"] = "corrupt"
+    corrupt_path = tmp_path / "corrupt-metadata.pth.tar"
+    torch.save(checkpoint, corrupt_path)
+
+    with pytest.raises(ValueError, match="string-keyed mapping"):
+        network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=False)
+
+
+@pytest.mark.parametrize("field_name", ["optimizer", "scaler"])
+def test_checkpoint_loader_rejects_invalid_training_state_containers_for_inference(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    field_name: str,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    valid_path = tmp_path / "valid-containers.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    checkpoint[field_name] = None
+    corrupt_path = tmp_path / f"invalid-{field_name}.pth.tar"
+    torch.save(checkpoint, corrupt_path)
+
+    with pytest.raises(ValueError, match="optimizer and scaler states must be mappings"):
+        network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=False)
+
+
+def test_checkpoint_counter_validation_precedes_model_mutation(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    valid_path = tmp_path / "valid-counter.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    original = {name: tensor.detach().clone() for name, tensor in network.nnet.state_dict().items()}
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    first_name = next(iter(checkpoint["state_dict"]))
+    checkpoint["state_dict"][first_name] = checkpoint["state_dict"][first_name] + 1
+    checkpoint["global_step"] = -1
+    corrupt_path = tmp_path / "negative-counter.pth.tar"
+    torch.save(checkpoint, corrupt_path)
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=False)
+
+    for name, tensor in network.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, original[name])
+
+
+def test_checkpoint_loader_rejects_non_tensor_model_state(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    valid_path = tmp_path / "valid-model-state.pth.tar"
+    network.save_checkpoint(str(tmp_path), valid_path.name)
+    checkpoint = torch.load(valid_path, map_location="cpu", weights_only=True)
+    checkpoint["state_dict"] = {"invalid": None}
+    corrupt_path = tmp_path / "non-tensor-state.pth.tar"
+    torch.save(checkpoint, corrupt_path)
+
+    with pytest.raises(ValueError, match="state_dict must map string names to tensors"):
+        network.load_checkpoint(str(tmp_path), corrupt_path.name, load_optimizer=False)

@@ -877,7 +877,7 @@ main {
     overflow: hidden;
     background: #222638;
     user-select: none;
-    touch-action: none;
+    touch-action: pan-y;
 }
 
 .square {
@@ -965,6 +965,78 @@ main {
     justify-content: center;
     background: rgba(7, 9, 20, 0.78);
     backdrop-filter: blur(4px);
+}
+
+.game-result {
+    position: absolute;
+    inset: 7px;
+    z-index: 6;
+    display: grid;
+    align-content: center;
+    justify-items: center;
+    padding: 28px;
+    text-align: center;
+    background:
+        radial-gradient(circle at 50% 36%, rgba(150, 135, 255, 0.28), transparent 38%),
+        rgba(7, 9, 20, 0.9);
+    backdrop-filter: blur(7px);
+    animation: result-reveal 520ms cubic-bezier(.2, .8, .2, 1) both;
+}
+
+.game-result::before {
+    content: "";
+    width: 72px;
+    aspect-ratio: 1;
+    margin-bottom: 20px;
+    border: 1px solid rgba(183, 173, 255, 0.65);
+    border-radius: 50%;
+    background: radial-gradient(circle at 34% 34%, #f4f2ff 0 12%, #9687ff 13% 37%, transparent 39%);
+    box-shadow: 0 0 55px rgba(150, 135, 255, 0.38);
+}
+
+.game-result h2 {
+    margin: 0;
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: clamp(2rem, 6vw, 4.2rem);
+    font-weight: 400;
+}
+
+.game-result > p:not(.eyebrow) {
+    margin: 12px 0 24px;
+    color: var(--muted);
+    font-size: 0.78rem;
+}
+
+.game-result > div {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 9px;
+}
+
+.game-result button {
+    min-width: 130px;
+    padding: 11px 17px;
+    border: 1px solid var(--line-bright);
+    border-radius: 3px 13px 3px 13px;
+    background: rgba(255, 255, 255, 0.045);
+    cursor: pointer;
+    font-size: 0.7rem;
+}
+
+.game-result button:first-child {
+    color: #101321;
+    border-color: transparent;
+    background: linear-gradient(115deg, #eeecf5, #c4c7e7);
+    font-weight: 750;
+}
+
+.game-result button:hover {
+    transform: translateY(-1px);
+}
+
+@keyframes result-reveal {
+    from { opacity: 0; transform: scale(0.985); }
 }
 
 .board-thinking strong {

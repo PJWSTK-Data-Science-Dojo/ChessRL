@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import stat
 from pathlib import Path
-from typing import Any
 
+import pytest
 import yaml
 
 from luna.lichess_config import build_config, main, write_private_config
 
+type YamlValue = str | int | float | bool | None | list[YamlValue] | dict[str, YamlValue]
 
-def _template() -> dict[str, Any]:
+
+def _template() -> dict[str, YamlValue]:
     return {
         "token": "placeholder",
         "url": "https://lichess.org/",
@@ -48,7 +50,6 @@ def test_build_config_uses_current_lichess_bot_shape_and_safe_defaults(tmp_path:
     engine, checkpoint = _runtime_files(tmp_path)
     config = build_config(
         _template(),
-        token="secret-token",
         repository=tmp_path,
         engine_path=engine,
         checkpoint=checkpoint,
@@ -82,11 +83,13 @@ def test_build_config_uses_current_lichess_bot_shape_and_safe_defaults(tmp_path:
     assert engine_config["polyglot"]["enabled"] is False
     assert engine_config["draw_or_resign"]["resign_enabled"] is False
     assert engine_config["draw_or_resign"]["offer_draw_enabled"] is False
+    assert config["token"] == ""
 
     challenge = config["challenge"]
     assert challenge["concurrency"] == 1
     assert challenge["variants"] == ["standard"]
     assert challenge["time_controls"] == ["blitz", "rapid", "classical"]
+    assert challenge["modes"] == ["casual"]
     assert "bullet_requires_increment" not in challenge
     assert challenge["max_simultaneous_games_per_user"] == 1
     assert config["correspondence"]["ponder"] is False
@@ -96,19 +99,19 @@ def test_build_config_uses_current_lichess_bot_shape_and_safe_defaults(tmp_path:
 
 def test_private_writer_is_atomic_owner_only_and_requires_force(tmp_path: Path) -> None:
     output = tmp_path / "config.yml"
-    write_private_config({"token": "first"}, output)
+    write_private_config({"setting": "first"}, output)
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
-    assert yaml.safe_load(output.read_text(encoding="utf-8")) == {"token": "first"}
+    assert yaml.safe_load(output.read_text(encoding="utf-8")) == {"setting": "first"}
 
     try:
-        write_private_config({"token": "second"}, output)
+        write_private_config({"setting": "second"}, output)
     except ValueError as exc:
         assert "--force" in str(exc)
     else:
         raise AssertionError("existing private configuration was overwritten without --force")
 
-    write_private_config({"token": "second"}, output, force=True)
-    assert yaml.safe_load(output.read_text(encoding="utf-8")) == {"token": "second"}
+    write_private_config({"setting": "second"}, output, force=True)
+    assert yaml.safe_load(output.read_text(encoding="utf-8")) == {"setting": "second"}
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
@@ -119,7 +122,7 @@ def test_private_writer_never_follows_a_symbolic_link(tmp_path: Path) -> None:
     output.symlink_to(protected)
 
     try:
-        write_private_config({"token": "secret"}, output, force=True)
+        write_private_config({"setting": "replacement"}, output, force=True)
     except ValueError as exc:
         assert "symbolic link" in str(exc)
     else:
@@ -128,15 +131,17 @@ def test_private_writer_never_follows_a_symbolic_link(tmp_path: Path) -> None:
     assert protected.read_text(encoding="utf-8") == "owner: user\n"
 
 
-def test_cli_reads_token_only_from_environment_without_printing_it(
-    tmp_path: Path, monkeypatch: Any, capsys: Any
+def test_cli_never_serializes_or_prints_environment_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     engine, checkpoint = _runtime_files(tmp_path)
     template = tmp_path / "config.yml.default"
     template.write_text(yaml.safe_dump(_template()), encoding="utf-8")
     output = tmp_path / "config.yml"
     token = "do-not-log-this-token"
-    monkeypatch.setenv("LICHESS_TOKEN", token)
+    monkeypatch.setenv("LICHESS_BOT_TOKEN", token)
 
     result = main(
         [
@@ -159,16 +164,21 @@ def test_cli_reads_token_only_from_environment_without_printing_it(
     assert result == 0
     assert token not in captured.out
     assert token not in captured.err
-    assert yaml.safe_load(output.read_text(encoding="utf-8"))["token"] == token
+    assert token not in output.read_text(encoding="utf-8")
+    assert yaml.safe_load(output.read_text(encoding="utf-8"))["token"] == ""
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
-def test_cli_refuses_to_write_without_environment_token(tmp_path: Path, monkeypatch: Any, capsys: Any) -> None:
+def test_cli_writes_credential_free_config_without_environment_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     engine, checkpoint = _runtime_files(tmp_path)
     template = tmp_path / "config.yml.default"
     template.write_text(yaml.safe_dump(_template()), encoding="utf-8")
     output = tmp_path / "config.yml"
-    monkeypatch.delenv("LICHESS_TOKEN", raising=False)
+    monkeypatch.delenv("LICHESS_BOT_TOKEN", raising=False)
 
     result = main(
         [
@@ -184,6 +194,7 @@ def test_cli_refuses_to_write_without_environment_token(tmp_path: Path, monkeypa
     )
 
     captured = capsys.readouterr()
-    assert result == 2
-    assert "LICHESS_TOKEN" in captured.err
-    assert not output.exists()
+    assert result == 0
+    assert "LICHESS_BOT_TOKEN" in captured.out
+    assert captured.err == ""
+    assert yaml.safe_load(output.read_text(encoding="utf-8"))["token"] == ""

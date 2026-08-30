@@ -2,15 +2,27 @@
 
 import os
 
+
+def _bounded_environment_int(name: str, default: int, minimum: int) -> int:
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}")
+    return value
+
+
 bind = f"{os.environ.get('HOST', '127.0.0.1')}:{os.environ.get('PORT', '5000')}"
 workers = 1
 worker_class = "gthread"
-threads = max(1, int(os.environ.get("THREADS", "4")))
-timeout = max(30, int(os.environ.get("TIMEOUT", "180")))
-graceful_timeout = max(10, int(os.environ.get("GRACEFUL_TIMEOUT", "30")))
+threads = _bounded_environment_int("THREADS", 4, 1)
+timeout = _bounded_environment_int("TIMEOUT", 180, 30)
+graceful_timeout = _bounded_environment_int("GRACEFUL_TIMEOUT", 30, 10)
 keepalive = 5
 
-accesslog = "-"
+accesslog = None
 errorlog = "-"
 loglevel = os.environ.get("LOG_LEVEL", "info").lower()
 capture_output = False

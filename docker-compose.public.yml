@@ -1,0 +1,64 @@
+services:
+  luna-web:
+    ports: !reset []
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities:
+                - gpu
+    environment:
+      DEVICE: cuda
+      COMPILE_INFERENCE: "${COMPILE_INFERENCE:-true}"
+      SESSION_COOKIE_SECURE: "true"
+      LUNA_TRUSTED_HOSTS: "${PUBLIC_HOSTNAME:?Set PUBLIC_HOSTNAME to the named-tunnel hostname},127.0.0.1"
+      PROXY_HOPS: "1"
+      HSTS_MAX_AGE_SECONDS: "${HSTS_MAX_AGE_SECONDS:-31536000}"
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.8.2@sha256:0aa26e284f05e6c77ae375b8c9c11d9eb6a448fb7bcd8d40f31cb6176189eb38
+    user: "${CLOUDFLARED_UID:?Set CLOUDFLARED_UID to the token-file owner's non-root UID}:${CLOUDFLARED_GID:?Set CLOUDFLARED_GID to the token-file owner's GID}"
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --loglevel
+      - "${CLOUDFLARED_LOG_LEVEL:-info}"
+      - --metrics
+      - 0.0.0.0:2000
+      - run
+      - --token-file
+      - /run/secrets/cloudflare_tunnel_token
+    init: true
+    read_only: true
+    depends_on:
+      luna-web:
+        condition: service_healthy
+    secrets:
+      - cloudflare_tunnel_token
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    cpus: "0.50"
+    mem_limit: 256m
+    restart: unless-stopped
+    networks:
+      - origin
+      - tunnel-egress
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+secrets:
+  cloudflare_tunnel_token:
+    file: "${CLOUDFLARE_TUNNEL_TOKEN_FILE:?Set the owner-only Cloudflare tunnel token file}"
+
+networks:
+  tunnel-egress:

@@ -132,13 +132,7 @@ class PrioritizedReplayBuffer:
             self._tree.add(priority, (trajectory, pos_idx))
 
     def sample(self, batch_size: int, unroll_steps: int) -> tuple[list[tuple[Trajectory, int]], np.ndarray, list[int]]:
-        """Sample batch_size (trajectory, position) pairs.
-
-        Returns:
-            batch: list of (trajectory, pos_idx) tuples
-            weights: importance-sampling weights (batch_size,)
-            indices: tree data indices for priority updates
-        """
+        """Sample positions with importance weights and indices for priority updates."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if unroll_steps < 0:

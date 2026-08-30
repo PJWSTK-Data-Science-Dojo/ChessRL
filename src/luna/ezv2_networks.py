@@ -15,8 +15,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .config import EzV2LearnerConfig
-from .game.chess_game import ACTION_SIZE, ChessGame
+from luna.config import EzV2LearnerConfig
+from luna.game.chess_game import ACTION_SIZE, ChessGame
 
 _NUM_GROUPS = 8
 
@@ -26,11 +26,6 @@ def _num_groups(channels: int) -> int:
     while channels % g != 0 and g > 1:
         g //= 2
     return g
-
-
-# ------------------------------------------------------------------
-# Residual blocks
-# ------------------------------------------------------------------
 
 
 class _ResBlock(nn.Module):
@@ -79,14 +74,7 @@ def _make_dw_sep_block(channels: int) -> nn.Module:
     return _DepthwiseSepResBlock(channels)
 
 
-# ------------------------------------------------------------------
-# Sub-networks
-# ------------------------------------------------------------------
-
-
 class RepresentationNetwork(nn.Module):
-    """h(observation) -> latent state."""
-
     def __init__(self, obs_planes: int, channels: int, num_blocks: int = 4) -> None:
         super().__init__()
         g = _num_groups(channels)
@@ -95,16 +83,12 @@ class RepresentationNetwork(nn.Module):
         self.blocks = nn.Sequential(*[_make_residual_block(channels) for _ in range(num_blocks)])
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """obs: (B, obs_planes, 8, 8) -> latent: (B, channels, 8, 8)."""
         x = F.relu(self.gn_in(self.conv_in(obs)))
         return cast(torch.Tensor, self.blocks(x))
 
 
 class DynamicsNetwork(nn.Module):
-    """g(latent, action_planes) -> (next_latent, reward_logits).
-
-    Uses depthwise-separable blocks for speed (called once per MCTS simulation).
-    """
+    """Latent transition model optimized for recurrent search inference."""
 
     # from-square, to-square, then knight/rook/bishop underpromotion identity.
     # Keeping promotion identity is essential: these actions share from/to squares
@@ -189,8 +173,6 @@ class _SpatialPolicyHead(nn.Module):
 
 
 class PredictionNetwork(nn.Module):
-    """f(latent) -> (policy_logits, value_logits)."""
-
     def __init__(self, channels: int, action_size: int, support_size: int) -> None:
         super().__init__()
         self.policy_head = _SpatialPolicyHead(channels, action_size)
@@ -240,11 +222,6 @@ class SimSiamProjector(nn.Module):
         return cast(torch.Tensor, self.predictor(z))
 
 
-# ------------------------------------------------------------------
-# Combined model
-# ------------------------------------------------------------------
-
-
 class EZV2Networks(nn.Module):
     """Combined wrapper holding all three sub-networks + SimSiam projector."""
 
@@ -274,7 +251,6 @@ class EZV2Networks(nn.Module):
         observation: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run representation + prediction. Returns (log_policy, scalar_value)."""
         obs_4d = self._obs_to_planes(observation)
         latent = _scale_latent(self.representation(obs_4d))
         policy_logits, value_logits = self.prediction(latent, valid_mask)
@@ -287,7 +263,6 @@ class EZV2Networks(nn.Module):
         observation: torch.Tensor,
         valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (latent, log_policy, scalar_value)."""
         obs_4d = self._obs_to_planes(observation)
         latent = _scale_latent(self.representation(obs_4d))
         policy_logits, value_logits = self.prediction(latent, valid_mask)
@@ -320,11 +295,6 @@ class EZV2Networks(nn.Module):
         if obs.dim() == 4 and obs.shape[1] != C and obs.shape[-1] == C:
             obs = obs.permute(0, 3, 1, 2)
         return obs.contiguous()
-
-
-# ---------------------------------------------------------------------------
-# Action encoding helpers
-# ---------------------------------------------------------------------------
 
 
 def _action_to_squares(action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -381,11 +351,6 @@ def action_int_to_planes(action: int, device: torch.device) -> torch.Tensor:
     """Single action index -> ``(1, 5, 8, 8)`` spatial planes."""
     action_t = torch.tensor([action], device=device)
     return action_index_to_planes(action_t, device)
-
-
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
 
 
 def _scale_latent(latent: torch.Tensor) -> torch.Tensor:

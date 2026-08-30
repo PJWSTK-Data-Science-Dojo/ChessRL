@@ -8,6 +8,7 @@ const PIECES = {
 };
 const PIECE_NAMES = { p: "pawn", n: "knight", b: "bishop", r: "rook", q: "queen", k: "king" };
 const PROMOTION_ORDER = ["q", "r", "b", "n"];
+const REQUEST_TIMEOUT_MS = 85_000;
 
 const ui = {
     game: null,
@@ -18,6 +19,8 @@ const ui = {
     hintMove: null,
     pending: false,
     requestGeneration: 0,
+    activeRequests: new Set(),
+    keyboardSquare: null,
     autoplay: false,
     sound: localStorage.getItem("lunaSound") !== "off",
     audioContext: null,
@@ -36,15 +39,16 @@ class ApiRequestError extends Error {
 
 function collectElements() {
     [
-        "lobbyView", "gameView", "missionForm", "strengthSelect", "strengthDescription",
+        "lobbyView", "gameView", "lobbyTitle", "missionForm", "strengthSelect", "strengthDescription",
         "launchButton", "spectateButton", "connectionPill", "connectionText", "modelStatus",
         "searchStatus", "brandButton", "newMissionButton", "modeEyebrow", "gameTitle",
         "thinkingOrb", "turnStatus", "statusDetail", "evaluationValue", "evaluationFill",
         "thinkTime", "simulationCount", "confidenceValue", "whiteCaptures", "blackCaptures",
-        "topAvatar", "topPlayer", "topPlayerMeta", "topTurnLamp", "bottomAvatar", "bottomPlayer",
+        "gameTitle", "topAvatar", "topPlayer", "topPlayerMeta", "topTurnLamp", "bottomAvatar", "bottomPlayer",
         "bottomPlayerMeta", "bottomTurnLamp", "boardShell", "chessboard", "boardThinking",
         "undoButton", "hintButton", "flipButton", "soundButton", "stepButton", "autoplayButton",
         "moveList", "moveCount", "hintCard", "hintSan", "hintUci", "hintMeta", "dismissHint",
+        "resultOverlay", "resultHeadline", "resultReason", "rematchButton", "resultLobbyButton",
         "promotionDialog", "promotionChoices", "toastStack", "liveRegion",
     ].forEach((id) => { elements[id] = document.getElementById(id); });
 }
@@ -55,13 +59,24 @@ async function api(path, options = {}) {
         requestOptions.headers["Content-Type"] = "application/json";
         requestOptions.body = JSON.stringify(requestOptions.body);
     }
+    const controller = new AbortController();
+    if (options.signal) options.signal.addEventListener("abort", () => controller.abort(), { once: true });
+    requestOptions.signal = controller.signal;
+    ui.activeRequests.add(controller);
+    const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     let response;
     try {
         response = await fetch(`${API}${path}`, requestOptions);
     } catch (error) {
-        const networkError = new ApiRequestError(0, "network_error", "The observatory could not reach Luna.");
+        const message = error?.name === "AbortError"
+            ? "The request was canceled or exceeded the search deadline."
+            : "The observatory could not reach Luna.";
+        const networkError = new ApiRequestError(0, "network_error", message);
         networkError.cause = error;
         throw networkError;
+    } finally {
+        window.clearTimeout(timeout);
+        ui.activeRequests.delete(controller);
     }
     const contentType = response.headers.get("content-type") || "";
     const payload = contentType.includes("application/json") ? await response.json() : null;
@@ -78,7 +93,11 @@ async function api(path, options = {}) {
 }
 
 function gameRequestContext() {
-    return { gameId: ui.game?.id || null, generation: ui.requestGeneration };
+    return {
+        gameId: ui.game?.id || null,
+        generation: ui.requestGeneration,
+        revision: ui.game?.revision ?? null,
+    };
 }
 
 function isCurrentGameRequest(context) {
@@ -168,16 +187,18 @@ function bindEvents() {
     elements.hintButton.addEventListener("click", requestHint);
     elements.stepButton.addEventListener("click", stepSelfplay);
     elements.autoplayButton.addEventListener("click", toggleAutoplay);
+    elements.rematchButton.addEventListener("click", rematchGame);
+    elements.resultLobbyButton.addEventListener("click", returnToLobby);
     elements.dismissHint.addEventListener("click", clearHint);
     elements.promotionDialog.addEventListener("cancel", () => elements.promotionDialog.close("cancel"));
 }
 
-async function startGame(mode) {
+async function startGame(mode, setup = null) {
     if (ui.pending) return;
     const generation = ++ui.requestGeneration;
     const oldId = ui.game?.id;
-    const color = document.querySelector('input[name="color"]:checked')?.value || "white";
-    const strength = elements.strengthSelect.value;
+    const color = setup?.color || document.querySelector('input[name="color"]:checked')?.value || "white";
+    const strength = setup?.strength || elements.strengthSelect.value;
     setLaunchPending(true, mode === "selfplay" ? "Opening observatory…" : "Establishing position…");
     try {
         const response = await api("/games", { method: "POST", body: { mode, color, strength } });
@@ -188,6 +209,7 @@ async function startGame(mode) {
         ui.game = response.data;
         ui.orientation = mode === "human" ? ui.game.human_color : "white";
         ui.selected = null;
+        ui.keyboardSquare = null;
         ui.hintMove = null;
         localStorage.setItem("lunaGameId", ui.game.id);
         localStorage.setItem("lunaOrientation", ui.orientation);
@@ -216,18 +238,27 @@ function showGame() {
     elements.lobbyView.hidden = true;
     elements.gameView.hidden = false;
     elements.modeEyebrow.textContent = ui.game.mode === "selfplay" ? "Live neural observatory" : "Live encounter";
-    elements.gameTitle.innerHTML = ui.game.mode === "selfplay" ? "Luna <span>observes</span> Luna" : "You <span>vs</span> Luna";
+    const separator = document.createElement("span");
+    separator.textContent = ui.game.mode === "selfplay" ? "observes" : "vs";
+    elements.gameTitle.replaceChildren(
+        document.createTextNode(ui.game.mode === "selfplay" ? "Luna " : "You "),
+        separator,
+        document.createTextNode(" Luna"),
+    );
     render();
+    requestAnimationFrame(() => elements.gameTitle.focus());
 }
 
 function returnToLobby() {
     ui.requestGeneration += 1;
+    abortActiveRequests();
     stopAutoplay();
     if (elements.promotionDialog.open) elements.promotionDialog.close("cancel");
     setBusy(false);
     const oldId = ui.game?.id;
     ui.game = null;
     ui.selected = null;
+    ui.keyboardSquare = null;
     ui.hintMove = null;
     localStorage.removeItem("lunaGameId");
     localStorage.removeItem("lunaOrientation");
@@ -235,6 +266,20 @@ function returnToLobby() {
     elements.lobbyView.hidden = false;
     clearHint();
     if (oldId) api(`/games/${oldId}`, { method: "DELETE" }).catch(() => {});
+    requestAnimationFrame(() => elements.lobbyTitle.focus());
+}
+
+function abortActiveRequests() {
+    [...ui.activeRequests].forEach((controller) => controller.abort());
+    ui.activeRequests.clear();
+}
+
+function rematchGame() {
+    if (!ui.game || ui.pending) return;
+    startGame(ui.game.mode, {
+        color: ui.game.human_color || "white",
+        strength: ui.game.strength.id,
+    });
 }
 
 function parseFen(fen) {
@@ -280,6 +325,7 @@ function isInteractive() {
 }
 
 function renderBoard() {
+    const focusedSquare = document.activeElement?.dataset?.square || null;
     const pieces = parseFen(ui.game.fen);
     const lastSquares = ui.game.last_move ? [ui.game.last_move.slice(0, 2), ui.game.last_move.slice(2, 4)] : [];
     const hintSquares = ui.hintMove ? [ui.hintMove.slice(0, 2), ui.hintMove.slice(2, 4)] : [];
@@ -288,6 +334,7 @@ function renderBoard() {
         ? [...pieces.entries()].find(([, symbol]) => symbol.toLowerCase() === "k" && colorOfSymbol(symbol) === ui.game.turn)?.[0]
         : null;
     const squares = displayedSquares();
+    const keyboardSquare = focusedSquare || ui.keyboardSquare || squares[0];
     const fragment = document.createDocumentFragment();
 
     squares.forEach((square, displayIndex) => {
@@ -297,8 +344,12 @@ function renderBoard() {
         const squareButton = document.createElement("button");
         squareButton.type = "button";
         squareButton.dataset.square = square;
+        squareButton.tabIndex = square === keyboardSquare ? 0 : -1;
         squareButton.className = `square ${(fileIndex + rank) % 2 === 0 ? "light" : "dark"}`;
         squareButton.setAttribute("role", "gridcell");
+        squareButton.setAttribute("aria-rowindex", String(Math.floor(displayIndex / 8) + 1));
+        squareButton.setAttribute("aria-colindex", String((displayIndex % 8) + 1));
+        squareButton.setAttribute("aria-selected", String(ui.selected === square));
 
         if (lastSquares.includes(square)) squareButton.classList.add("last");
         if (ui.selected === square) squareButton.classList.add("selected");
@@ -316,7 +367,10 @@ function renderBoard() {
         const description = symbol
             ? `${square}, ${colorOfSymbol(symbol)} ${PIECE_NAMES[symbol.toLowerCase()]}`
             : `${square}, empty`;
-        squareButton.setAttribute("aria-label", `${description}${movable ? ", movable" : ""}`);
+        const stateDescription = [movable ? "movable" : "", selectedTargets.has(square) ? "legal destination" : ""]
+            .filter(Boolean)
+            .join(", ");
+        squareButton.setAttribute("aria-label", `${description}${stateDescription ? `, ${stateDescription}` : ""}`);
 
         if (symbol) {
             const piece = document.createElement("span");
@@ -343,9 +397,37 @@ function renderBoard() {
         squareButton.addEventListener("dragover", handleDragOver);
         squareButton.addEventListener("drop", handleDrop);
         squareButton.addEventListener("dragend", () => { ui.dragSource = null; });
+        squareButton.addEventListener("keydown", handleBoardKeydown);
         fragment.append(squareButton);
     });
     elements.chessboard.replaceChildren(fragment);
+    ui.keyboardSquare = keyboardSquare;
+    if (focusedSquare) {
+        requestAnimationFrame(() => elements.chessboard.querySelector(`[data-square="${focusedSquare}"]`)?.focus());
+    }
+}
+
+function handleBoardKeydown(event) {
+    const navigation = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -8, ArrowDown: 8 };
+    if (!(event.key in navigation) && !["Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const squares = displayedSquares();
+    const currentIndex = squares.indexOf(event.currentTarget.dataset.square);
+    const rowStart = Math.floor(currentIndex / 8) * 8;
+    let nextIndex;
+    if (event.key === "Home") nextIndex = rowStart;
+    else if (event.key === "End") nextIndex = rowStart + 7;
+    else if (event.key === "ArrowLeft") nextIndex = Math.max(rowStart, currentIndex - 1);
+    else if (event.key === "ArrowRight") nextIndex = Math.min(rowStart + 7, currentIndex + 1);
+    else nextIndex = Math.max(0, Math.min(63, currentIndex + navigation[event.key]));
+    const nextSquare = squares[nextIndex];
+    ui.keyboardSquare = nextSquare;
+    elements.chessboard.querySelectorAll(".square").forEach((square) => { square.tabIndex = -1; });
+    const target = elements.chessboard.querySelector(`[data-square="${nextSquare}"]`);
+    if (target) {
+        target.tabIndex = 0;
+        target.focus();
+    }
 }
 
 function handleSquareClick(event) {
@@ -439,7 +521,10 @@ async function submitHumanMove(source, target) {
     clearHint();
     setBusy(true, "Luna is calculating");
     try {
-        const response = await api(`/games/${context.gameId}/moves`, { method: "POST", body: { move } });
+        const response = await api(`/games/${context.gameId}/moves`, {
+            method: "POST",
+            body: { move, revision: context.revision },
+        });
         if (!isCurrentGameRequest(context)) return;
         ui.game = response.data;
         render();
@@ -468,6 +553,7 @@ function render() {
     renderEvaluation();
     renderCaptures();
     renderHistory();
+    renderResult();
     updateControls();
 }
 
@@ -484,6 +570,14 @@ function renderStatus() {
     } else {
         elements.statusDetail.textContent = `${capitalize(ui.game.turn)} to move${ui.game.is_check ? " · Check" : ""}`;
     }
+}
+
+function renderResult() {
+    const result = ui.game?.result;
+    elements.resultOverlay.hidden = !result;
+    if (!result) return;
+    elements.resultHeadline.textContent = result.headline;
+    elements.resultReason.textContent = `${result.notation} · ${capitalize(result.reason)}`;
 }
 
 function participant(color) {
@@ -530,7 +624,7 @@ function renderEvaluation(override = null) {
     }
     const engine = ui.game.engine;
     elements.thinkTime.textContent = engine.think_time_ms == null ? "—" : formatDuration(engine.think_time_ms);
-    elements.simulationCount.textContent = `${ui.game.strength.simulations} sims`;
+    elements.simulationCount.textContent = `${engine.simulations ?? ui.game.strength.simulations} sims`;
     elements.confidenceValue.textContent = engine.confidence == null ? "—" : `${Math.round(engine.confidence * 100)}%`;
 }
 
@@ -548,7 +642,15 @@ function renderHistory() {
     const moveLabel = history.length === 1 ? "1 ply" : `${history.length} plies`;
     elements.moveCount.textContent = moveLabel;
     if (!history.length) {
-        elements.moveList.innerHTML = '<div class="empty-log"><span aria-hidden="true">☾</span><p>Your moves will appear here.</p></div>';
+        const empty = document.createElement("div");
+        empty.className = "empty-log";
+        const moon = document.createElement("span");
+        moon.setAttribute("aria-hidden", "true");
+        moon.textContent = "☾";
+        const message = document.createElement("p");
+        message.textContent = "Your moves will appear here.";
+        empty.append(moon, message);
+        elements.moveList.replaceChildren(empty);
         return;
     }
     const fragment = document.createDocumentFragment();
@@ -614,7 +716,10 @@ async function undoMove() {
     clearHint();
     setBusy(true, "Rewinding the position");
     try {
-        const response = await api(`/games/${context.gameId}/undo`, { method: "POST", body: {} });
+        const response = await api(`/games/${context.gameId}/undo`, {
+            method: "POST",
+            body: { revision: context.revision },
+        });
         if (!isCurrentGameRequest(context)) return;
         ui.game = response.data;
         render();
@@ -637,12 +742,16 @@ async function requestHint() {
     clearHint();
     setBusy(true, "Calculating a hint");
     try {
-        const response = await api(`/games/${context.gameId}/hint`, { method: "POST", body: {} });
+        const response = await api(`/games/${context.gameId}/hint`, {
+            method: "POST",
+            body: { revision: context.revision },
+        });
         if (!isCurrentGameRequest(context)) return;
         const hint = response.data;
         ui.hintMove = hint.move;
         ui.game.engine.evaluation_white = hint.evaluation_white;
         ui.game.engine.think_time_ms = hint.think_time_ms;
+        ui.game.engine.simulations = hint.simulations;
         ui.game.engine.confidence = hint.confidence;
         elements.hintSan.textContent = hint.san;
         elements.hintUci.textContent = hint.move;
@@ -675,7 +784,10 @@ async function stepSelfplay() {
     clearHint();
     setBusy(true, `${capitalize(ui.game.turn)} is calculating`);
     try {
-        const response = await api(`/games/${context.gameId}/engine-move`, { method: "POST", body: {} });
+        const response = await api(`/games/${context.gameId}/engine-move`, {
+            method: "POST",
+            body: { revision: context.revision },
+        });
         if (!isCurrentGameRequest(context)) return false;
         ui.game = response.data;
         render();
