@@ -17,6 +17,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Never, cast
 
+import chess
 import numpy as np
 import wandb
 from loguru import logger
@@ -65,6 +66,13 @@ from luna.self_play_actors import SelfPlayActorPool
 _BEST_EVAL_NAME = "best_eval.json"
 _BEST_EVAL_FIELD = "best_evaluation"
 _BEST_EVAL_SCHEMA_VERSION = 1
+
+
+def _self_play_exploration_enabled(board: chess.Board, ply: int, run: TrainingRunConfig) -> bool:
+    """Keep Gumbel stochastic when a deterministic root starts cycling."""
+    if ply < run.temp_threshold:
+        return True
+    return run.search_mode == "gumbel" and board.is_repetition(2)
 
 
 def _configure_wandb_metrics() -> None:
@@ -215,7 +223,7 @@ class Coach:
         while True:
             episode_step += 1
             canonical_board = self.game.get_canonical_form(board, current_player)
-            explore = episode_step < self.run.temp_threshold
+            explore = _self_play_exploration_enabled(board, episode_step, self.run)
 
             # Store the untempered visit distribution as the policy target.
             # Temperature affects only which action is played.
@@ -247,6 +255,9 @@ class Coach:
 
             outcome = self.game.get_game_outcome(board, current_player)
             if outcome is not None:
+                terminal_outcome = board.outcome(claim_draw=self.game.claim_draw)
+                if terminal_outcome is None:
+                    raise RuntimeError("A terminal self-play state has no chess outcome")
                 return self._trajectory_with_terminal_rewards(
                     observations,
                     actions,
@@ -254,6 +265,7 @@ class Coach:
                     root_values,
                     valids_list,
                     terminal_value_for_next_player=outcome,
+                    termination=terminal_outcome.termination,
                 )
 
             if self.run.max_ply is not None and episode_step >= self.run.max_ply:
@@ -324,7 +336,7 @@ class Coach:
                     self._profile_sp_env_s += time.perf_counter() - _t_env0
                 break
 
-            explore = [steps[i] + 1 < self.run.temp_threshold for i in active_indices]
+            explore = [_self_play_exploration_enabled(boards[i], steps[i] + 1, self.run) for i in active_indices]
 
             if self.run.profile:
                 _t_env1 = time.perf_counter()
@@ -365,6 +377,9 @@ class Coach:
 
                 outcome = self.game.get_game_outcome(boards[idx], players[idx])
                 if outcome is not None:
+                    terminal_outcome = boards[idx].outcome(claim_draw=self.game.claim_draw)
+                    if terminal_outcome is None:
+                        raise RuntimeError("A terminal self-play state has no chess outcome")
                     terminal_rewards[idx] = outcome
                     traj = self._trajectory_with_terminal_rewards(
                         obs_lists[idx],
@@ -373,6 +388,7 @@ class Coach:
                         value_lists[idx],
                         valid_lists[idx],
                         terminal_value_for_next_player=terminal_rewards[idx],
+                        termination=terminal_outcome.termination,
                     )
                     if len(completed) < num_episodes:
                         completed.append(traj)
@@ -414,6 +430,7 @@ class Coach:
         valids_list: list[np.ndarray],
         terminal_value_for_next_player: float,
         truncated: bool = False,
+        termination: chess.Termination | None = None,
     ) -> Trajectory:
         game_len = len(actions)
         rewards = [0.0] * game_len
@@ -428,6 +445,7 @@ class Coach:
             root_values=root_values,
             valids=valids_list,
             truncated=truncated,
+            termination=termination,
         )
 
     def _external_checkpoint_path(self, iteration: int) -> Path:
@@ -708,7 +726,12 @@ class Coach:
             stats.checkpoint_publish_s = time.perf_counter() - t0
 
             stats.total_s = time.perf_counter() - iter_t0
-            self._log_iteration_metrics(i, trajectories, stats)
+            self._log_iteration_metrics(
+                i,
+                trajectories,
+                stats,
+                optimizer_steps=self.run.train_steps_per_iter,
+            )
             self._reconcile_current_evaluations(i)
             if self.run.profile:
                 profile_rows.append(stats)
@@ -737,6 +760,7 @@ class Coach:
         iteration: int,
         trajectories: list[Trajectory],
         stats: IterProfileStats,
+        optimizer_steps: int = 0,
     ) -> None:
         if wandb.run is None:
             return
@@ -747,6 +771,8 @@ class Coach:
         white_wins = 0
         black_wins = 0
         draws = 0
+        termination_counts = {termination: 0 for termination in chess.Termination}
+        unknown_terminations = 0
         policy_entropy_sum = 0.0
         for trajectory in trajectories:
             probabilities = trajectory.root_policies.astype(np.float32)
@@ -754,6 +780,10 @@ class Coach:
             policy_entropy_sum -= float(np.sum(probabilities[positive] * np.log(probabilities[positive])))
             if trajectory.truncated:
                 continue
+            if trajectory.termination is None:
+                unknown_terminations += 1
+            else:
+                termination_counts[trajectory.termination] += 1
             terminal_reward = float(trajectory.rewards[-1])
             if terminal_reward == 0.0:
                 draws += 1
@@ -768,6 +798,9 @@ class Coach:
         decisive_games = white_wins + black_wins
         policy_entropy = policy_entropy_sum / positions if positions else 0.0
         positions_per_second = positions / stats.self_play_s if stats.self_play_s > 0.0 else 0.0
+        replay_samples_per_new_position = (
+            optimizer_steps * self.nnet._learner.batch_size / positions if positions else 0.0
+        )
         wandb.log(
             {
                 "iteration": iteration,
@@ -781,7 +814,33 @@ class Coach:
                 "selfplay/draw_fraction": draws / games if games else 0.0,
                 "selfplay/white_win_fraction": white_wins / games if games else 0.0,
                 "selfplay/black_win_fraction": black_wins / games if games else 0.0,
+                "selfplay/checkmate_fraction": termination_counts[chess.Termination.CHECKMATE] / games
+                if games
+                else 0.0,
+                "selfplay/threefold_repetition_fraction": termination_counts[chess.Termination.THREEFOLD_REPETITION]
+                / games
+                if games
+                else 0.0,
+                "selfplay/fivefold_repetition_fraction": termination_counts[chess.Termination.FIVEFOLD_REPETITION]
+                / games
+                if games
+                else 0.0,
+                "selfplay/fifty_move_fraction": termination_counts[chess.Termination.FIFTY_MOVES] / games
+                if games
+                else 0.0,
+                "selfplay/seventyfive_move_fraction": termination_counts[chess.Termination.SEVENTYFIVE_MOVES] / games
+                if games
+                else 0.0,
+                "selfplay/stalemate_fraction": termination_counts[chess.Termination.STALEMATE] / games
+                if games
+                else 0.0,
+                "selfplay/insufficient_material_fraction": termination_counts[chess.Termination.INSUFFICIENT_MATERIAL]
+                / games
+                if games
+                else 0.0,
+                "selfplay/unknown_termination_fraction": unknown_terminations / games if games else 0.0,
                 "selfplay/policy_entropy": policy_entropy,
+                "selfplay/replay_samples_per_new_position": replay_samples_per_new_position,
                 "performance/self_play_seconds": stats.self_play_s,
                 "performance/self_play_positions_per_second": positions_per_second,
                 "performance/train_seconds": stats.train_s,

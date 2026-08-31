@@ -8,6 +8,8 @@ MAX_STOCKFISH_EVAL_GAMES = 20
 FAIRY_STOCKFISH_MIN_ELO = 500
 FAIRY_STOCKFISH_MAX_ELO = 2850
 WandbResumeMode = Literal["allow", "never", "must"]
+ModelName = Literal["baseline", "balanced"]
+MODEL_NAMES: tuple[ModelName, ...] = ("baseline", "balanced")
 
 
 @dataclass
@@ -93,7 +95,7 @@ class TrainingRunConfig(MCTSParams):
     """Maximum time for actor startup or one self-play collection."""
 
     temp_threshold: int = 15
-    """Ply after which self-play switches to deterministic action selection."""
+    """Ply after which ordinary self-play exploration stops; Gumbel re-enables it for repeated roots."""
 
     evaluation_num_mcts_sims: int | None = None
     """Independent external-evaluation budget; the self-play budget is used when unset."""
@@ -218,6 +220,9 @@ def evaluation_mcts_params(run: TrainingRunConfig) -> MCTSParams:
 @dataclass
 class EzV2LearnerConfig:
     """Optimizer, architecture, unroll training, and loss weights for :class:`LunaNetwork`."""
+
+    model_name: ModelName = "baseline"
+    """Model factory key: ``baseline`` or the asymmetric ``balanced`` architecture."""
 
     lr: float = 2e-4
     """Peak AdamW learning rate after warm-up."""
@@ -430,6 +435,8 @@ def _validate_optimizer(learner: EzV2LearnerConfig) -> None:
 
 
 def _validate_model(learner: EzV2LearnerConfig) -> None:
+    if learner.model_name not in MODEL_NAMES:
+        raise ValueError("model_name must be 'baseline' or 'balanced'")
     _positive_integer("num_channels", learner.num_channels)
     _positive_integer("proj_dim", learner.proj_dim)
     _positive_integer("support_size", learner.support_size)

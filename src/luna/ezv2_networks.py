@@ -205,8 +205,9 @@ class PredictionNetwork(nn.Module):
 class SimSiamProjector(nn.Module):
     """SimSiam projection + prediction heads for consistency loss (EfficientZero)."""
 
-    def __init__(self, in_dim: int, proj_dim: int = 256) -> None:
+    def __init__(self, in_dim: int, proj_dim: int = 256, *, pool_spatial: bool = False) -> None:
         super().__init__()
+        self.pool_spatial = pool_spatial
         self.projection = nn.Sequential(
             nn.Linear(in_dim, proj_dim),
             nn.LayerNorm(proj_dim),
@@ -221,7 +222,8 @@ class SimSiamProjector(nn.Module):
         )
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
-        return cast(torch.Tensor, self.projection(x.flatten(1)))
+        features = x.mean(dim=(-2, -1)) if self.pool_spatial else x.flatten(1)
+        return cast(torch.Tensor, self.projection(features))
 
     def predict(self, z: torch.Tensor) -> torch.Tensor:
         return cast(torch.Tensor, self.predictor(z))

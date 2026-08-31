@@ -11,7 +11,12 @@ import chess
 import numpy as np
 import pytest
 
-from luna.coach import Coach, validate_fresh_checkpoint_target, validate_resume_checkpoint_target
+from luna.coach import (
+    Coach,
+    _self_play_exploration_enabled,
+    validate_fresh_checkpoint_target,
+    validate_resume_checkpoint_target,
+)
 from luna.config import EzV2LearnerConfig, MCTSParams, TrainingRunConfig, WandbResumeMode
 from luna.game.arena import Arena
 from luna.game.chess_game import ChessGame, move_to_action
@@ -311,7 +316,7 @@ def test_completed_iteration_is_logged_before_external_evaluation(
         patch.object(coach, "execute_episodes_batched", return_value=[make_trajectory(2)]),
         patch.object(network, "train_ezv2", return_value={}),
         patch.object(coach, "_publish_checkpoint", side_effect=lambda _iteration: events.append("checkpoint")),
-        patch.object(coach, "_log_iteration_metrics", side_effect=lambda *_args: events.append("metrics")),
+        patch.object(coach, "_log_iteration_metrics", side_effect=lambda *_args, **_kwargs: events.append("metrics")),
         patch.object(
             coach, "_reconcile_current_evaluations", side_effect=lambda _iteration: events.append("evaluation")
         ),
@@ -327,11 +332,11 @@ def test_selfplay_outcome_metrics_respect_ply_color_and_exclude_truncations(
     make_trajectory: TrajectoryFactory,
 ) -> None:
     coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), TrainingRunConfig())
-    white_win = make_trajectory(1)
+    white_win = make_trajectory(1, termination=chess.Termination.CHECKMATE)
     white_win.rewards[-1] = 1.0
-    black_win = make_trajectory(2)
+    black_win = make_trajectory(2, termination=chess.Termination.CHECKMATE)
     black_win.rewards[-1] = 1.0
-    draw = make_trajectory(3)
+    draw = make_trajectory(3, termination=chess.Termination.THREEFOLD_REPETITION)
     truncated = make_trajectory(4, truncated=True)
 
     with (
@@ -350,6 +355,42 @@ def test_selfplay_outcome_metrics_respect_ply_color_and_exclude_truncations(
     assert metrics["selfplay/draw_fraction"] == 0.25
     assert metrics["selfplay/decisive_fraction"] == 0.5
     assert metrics["selfplay/truncated_fraction"] == 0.25
+    assert metrics["selfplay/checkmate_fraction"] == 0.5
+    assert metrics["selfplay/threefold_repetition_fraction"] == 0.25
+    assert metrics["selfplay/unknown_termination_fraction"] == 0.0
+
+
+def test_gumbel_selfplay_reenables_exploration_for_a_repeated_root() -> None:
+    board = chess.Board()
+    for move in ("g1f3", "g8f6", "f3g1", "f6g8"):
+        board.push_uci(move)
+    assert board.is_repetition(2)
+
+    gumbel = TrainingRunConfig(search_mode="gumbel", temp_threshold=1)
+    puct = TrainingRunConfig(search_mode="puct", temp_threshold=1)
+
+    assert _self_play_exploration_enabled(board, 5, gumbel) is True
+    assert _self_play_exploration_enabled(board, 5, puct) is False
+
+
+def test_selfplay_metrics_report_replay_samples_per_new_position(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    make_trajectory: TrajectoryFactory,
+) -> None:
+    small_learner_config.batch_size = 8
+    coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), TrainingRunConfig())
+
+    with patch("luna.coach.wandb.run", object()), patch("luna.coach.wandb.log") as wandb_log:
+        coach._log_iteration_metrics(
+            1,
+            [make_trajectory(4), make_trajectory(4)],
+            IterProfileStats(iter_index=1),
+            optimizer_steps=3,
+        )
+
+    metrics = wandb_log.call_args.args[0]
+    assert metrics["selfplay/replay_samples_per_new_position"] == 3.0
 
 
 def test_resume_defers_beta_configuration_until_replay_can_train(

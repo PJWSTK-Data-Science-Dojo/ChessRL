@@ -23,7 +23,7 @@ from loguru import logger
 from torch._inductor import config as torch_inductor_config
 from torch.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
 
-from luna.config import EzV2LearnerConfig, MCTSParams, validate_learner_config
+from luna.config import MODEL_NAMES, EzV2LearnerConfig, MCTSParams, ModelName, validate_learner_config
 from luna.ezv2_networks import (
     EZV2Networks,
     SimSiamProjector,
@@ -34,6 +34,7 @@ from luna.ezv2_networks import (
 )
 from luna.game.chess_game import ChessGame
 from luna.mcts import BatchedMCTS
+from luna.model_factory import build_model
 from luna.replay_buffer import PrioritizedReplayBuffer
 from luna.targets import build_unroll_targets, collate_batch
 from luna.utils import AverageMeter
@@ -91,7 +92,9 @@ _PredictionInference = Callable[
 ]
 _PreparedBatch = tuple[dict[str, np.ndarray], np.ndarray, list[int]]
 _RUNTIME_LEARNER_FIELDS = frozenset({"device", "cuda_device", "compile_inference", "compile_training"})
-_MODEL_LEARNER_FIELDS = frozenset({"num_channels", "support_size", "repr_blocks", "dyn_blocks", "proj_dim"})
+_MODEL_LEARNER_FIELDS = frozenset(
+    {"model_name", "num_channels", "support_size", "repr_blocks", "dyn_blocks", "proj_dim"}
+)
 _TRAINING_PHASE_PROVENANCE_FIELD = "training_phase_provenance"
 _MAX_CONSECUTIVE_AMP_SKIPS = 16
 _GRAD_SCALER_FIELDS = frozenset({"scale", "growth_factor", "backoff_factor", "growth_interval", "_growth_tracker"})
@@ -305,7 +308,7 @@ class LunaNetwork:
             logger.warning("CUDA bfloat16 is unavailable; falling back to float16 autocast.")
             self._amp_dtype = torch.float16
 
-        self.nnet = EZV2Networks(game, self._learner).to(self.device)
+        self.nnet: EZV2Networks = build_model(game, self._learner).to(self.device)
         self._action_plane_lookup = (
             action_index_to_planes(torch.arange(self.action_size, device=self.device), self.device)
             if self.device.type == "cuda"
@@ -1121,6 +1124,8 @@ class LunaNetwork:
         optimizer_state = self.optimizer.state_dict()
         scaler_state = self.scaler.state_dict()
         _validate_grad_scaler_state(scaler_state)
+        learner_config = asdict(self._learner)
+        learner_config.pop("model_name")
         payload: dict[str, object] = {
             "format_version": 2,
             "state_dict": model_state,
@@ -1129,8 +1134,9 @@ class LunaNetwork:
             "global_step": self._global_step,
             "trainer_iteration": self._trainer_iteration,
             "lr_schedule_total_steps": self._lr_schedule_total_steps,
-            "learner_config": asdict(self._learner),
+            "learner_config": learner_config,
             "model_spec": {
+                "model_name": self._learner.model_name,
                 "action_size": self.action_size,
                 "observation_shape": [self.board_x, self.board_y, self.board_z],
             },
@@ -1336,7 +1342,7 @@ class LunaNetwork:
         stored = checkpoint["learner_config"]
         if not isinstance(stored, dict) or not all(isinstance(key, str) for key in stored):
             raise ValueError(f"Checkpoint learner_config must be a string-keyed mapping: {filepath}")
-        expected_fields = {field.name for field in fields(EzV2LearnerConfig)}
+        expected_fields = {field.name for field in fields(EzV2LearnerConfig)} - {"model_name"}
         stored_fields = set(stored)
         if stored_fields != expected_fields:
             missing = sorted(expected_fields - stored_fields)
@@ -1347,12 +1353,24 @@ class LunaNetwork:
             )
         return cast(dict[str, Any], stored)
 
+    @staticmethod
+    def _checkpoint_model_name(checkpoint: Mapping[str, Any], filepath: str | os.PathLike[str]) -> ModelName:
+        model_spec = checkpoint.get("model_spec")
+        if not isinstance(model_spec, dict):
+            raise ValueError(f"Checkpoint is missing model_spec metadata: {filepath}")
+        model_name = model_spec.get("model_name", "baseline")
+        if model_name not in MODEL_NAMES:
+            raise ValueError(f"Checkpoint has unknown model_name {model_name!r}: {filepath}")
+        return cast(ModelName, model_name)
+
     def _validate_learner_config(self, checkpoint: Mapping[str, Any], filepath: str | os.PathLike[str]) -> None:
         stored = self._checkpoint_learner_config(checkpoint, filepath)
         current = asdict(self._learner)
         mismatched = sorted(
             name for name in stored if name not in _RUNTIME_LEARNER_FIELDS and stored[name] != current[name]
         )
+        if self._checkpoint_model_name(checkpoint, filepath) != self._learner.model_name:
+            mismatched.append("model_name")
         if mismatched:
             raise ValueError(f"Checkpoint learner configuration differs in fields {mismatched}: {filepath}")
 
@@ -1363,7 +1381,8 @@ class LunaNetwork:
     ) -> None:
         stored = self._checkpoint_learner_config(checkpoint, filepath)
         current = asdict(self._learner)
-        mismatched = sorted(name for name in _MODEL_LEARNER_FIELDS if stored[name] != current[name])
+        stored_model = {**stored, "model_name": self._checkpoint_model_name(checkpoint, filepath)}
+        mismatched = sorted(name for name in _MODEL_LEARNER_FIELDS if stored_model[name] != current[name])
         if mismatched:
             raise ValueError(f"Checkpoint model configuration differs in fields {mismatched}: {filepath}")
 
@@ -1514,6 +1533,7 @@ class LunaNetwork:
             raise ValueError(f"Checkpoint has no valid state_dict: {path}")
 
         config_values = dict(cls._checkpoint_learner_config(checkpoint, path))
+        config_values["model_name"] = cls._checkpoint_model_name(checkpoint, path)
         config_values.update(
             device=device,
             cuda_device=cuda_device,
@@ -1527,7 +1547,8 @@ class LunaNetwork:
     def log_model_summary(self) -> None:
         total = sum(p.numel() for p in self.nnet.parameters())
         logger.info(
-            "Model: {} parameters | observation={} | actions={} | channels={} | representation_blocks={} | dynamics_blocks={}",
+            "Model: {} | {} parameters | observation={} | actions={} | channels={} | representation_blocks={} | dynamics_blocks={}",
+            self._learner.model_name,
             f"{total:,}",
             (self.board_x, self.board_y, self.board_z),
             self.action_size,

@@ -18,6 +18,7 @@ from luna.replay_buffer import Trajectory
 from luna.self_play_actors import (
     SelfPlayActorError,
     SelfPlayActorPool,
+    _actor_learner_config,
     _ActorCollectionDone,
     _ActorTrajectory,
     derive_actor_seed,
@@ -68,6 +69,16 @@ def test_actor_seeds_are_repeatable_and_unique() -> None:
     assert seeds == [derive_actor_seed(7, actor_id, generation=12) for actor_id in range(4)]
     assert len(set(seeds)) == 4
     assert seeds != [derive_actor_seed(7, actor_id, generation=13) for actor_id in range(4)]
+
+
+def test_actor_learner_configuration_uses_eager_inference() -> None:
+    learner = EzV2LearnerConfig(compile_inference=True, compile_training=True, dataloader_workers=4)
+
+    actor_learner = _actor_learner_config(learner)
+
+    assert not actor_learner.compile_inference
+    assert not actor_learner.compile_training
+    assert actor_learner.dataloader_workers == 0
 
 
 def test_episode_partition_is_balanced_and_does_not_create_empty_work() -> None:

@@ -3,6 +3,7 @@
 import pickle
 from typing import Any
 
+import chess
 import numpy as np
 import pytest
 
@@ -114,6 +115,21 @@ class TestPrioritizedReplayBuffer:
 
         assert complete.truncated is False
         assert restored.truncated is True
+
+    def test_trajectory_termination_survives_ipc_pickle(self, make_trajectory: TrajectoryFactory) -> None:
+        trajectory = make_trajectory(length=1, termination=chess.Termination.THREEFOLD_REPETITION)
+
+        restored = pickle.loads(pickle.dumps(trajectory))
+
+        assert restored.termination is chess.Termination.THREEFOLD_REPETITION
+
+    def test_truncated_trajectory_rejects_terminal_outcome(self) -> None:
+        with pytest.raises(ValueError, match="truncated trajectory"):
+            Trajectory(
+                **_trajectory_inputs(),
+                truncated=True,
+                termination=chess.Termination.THREEFOLD_REPETITION,
+            )
 
     def test_invalid_inputs_fail_fast(self, make_trajectory: TrajectoryFactory) -> None:
         with pytest.raises(ValueError, match="capacity"):

@@ -1,9 +1,17 @@
 """Tests for EfficientZeroV2 model components."""
 
+from dataclasses import replace
+
 import chess
 import pytest
 import torch
 
+from luna.balanced_networks import (
+    BalancedDynamicsNetwork,
+    BalancedNetworks,
+    LayerNorm2d,
+    SEResBlock,
+)
 from luna.config import EzV2LearnerConfig
 from luna.ezv2_networks import (
     EZV2Networks,
@@ -15,6 +23,7 @@ from luna.ezv2_networks import (
     scalar_to_support,
 )
 from luna.game.chess_game import OBS_PLANES, ChessGame
+from luna.model_factory import available_models, build_model
 
 
 @pytest.mark.parametrize("network_type", ["initial", "recurrent"])
@@ -105,3 +114,52 @@ def test_spatial_policy_head_preserves_action_layout() -> None:
     assert policy_logits.shape == (1, 4288)
     assert policy_logits[0, normal_action].item() == 3.0
     assert policy_logits[0, knight_promotion_action].item() == 5.0
+
+
+def test_model_factory_builds_all_registered_architectures(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    assert available_models() == ("baseline", "balanced")
+
+    baseline = build_model(chess_game, small_learner_config)
+    balanced = build_model(chess_game, replace(small_learner_config, model_name="balanced"))
+
+    assert type(baseline) is EZV2Networks
+    assert isinstance(balanced, BalancedNetworks)
+
+
+def test_balanced_model_uses_dense_asymmetric_se_trunks(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(small_learner_config, model_name="balanced", repr_blocks=3, dyn_blocks=1)
+    model = build_model(chess_game, config)
+
+    assert len(model.representation.blocks) == 3
+    assert len(model.dynamics.blocks) == 1
+    assert isinstance(model.representation.norm_in, LayerNorm2d)
+    assert isinstance(model.dynamics.blocks[0], SEResBlock)
+    assert isinstance(model.dynamics, BalancedDynamicsNetwork)
+    assert model.dynamics.conv_in.groups == 1
+    assert model.simsiam.pool_spatial
+
+    observation = torch.randn(2, 8, 8, OBS_PLANES)
+    valid = torch.ones(2, chess_game.get_action_size())
+    latent, log_policy, value = model.initial_inference_with_latent(observation, valid)
+    actions = action_index_to_planes(torch.tensor([0, 4096]), latent.device)
+    next_latent, reward, recurrent_policy, recurrent_value = model.recurrent_inference(
+        latent,
+        actions,
+        valid,
+    )
+
+    assert latent.shape == next_latent.shape == (2, config.num_channels, 8, 8)
+    assert log_policy.shape == recurrent_policy.shape == (2, chess_game.get_action_size())
+    assert value.shape == reward.shape == recurrent_value.shape == (2,)
+
+
+def test_layer_norm_2d_preserves_channels_last_layout() -> None:
+    normalized = LayerNorm2d(16)(torch.randn(2, 16, 8, 8))
+
+    assert normalized.is_contiguous(memory_format=torch.channels_last)

@@ -2,6 +2,7 @@
 
 from typing import Protocol
 
+import chess
 import numpy as np
 import pytest
 
@@ -11,7 +12,13 @@ from luna.replay_buffer import Trajectory
 
 
 class TrajectoryFactory(Protocol):
-    def __call__(self, length: int = 10, *, truncated: bool = False) -> Trajectory: ...
+    def __call__(
+        self,
+        length: int = 10,
+        *,
+        truncated: bool = False,
+        termination: chess.Termination | None = None,
+    ) -> Trajectory: ...
 
 
 @pytest.fixture
@@ -37,7 +44,12 @@ def chess_game() -> ChessGame:
 def make_trajectory() -> TrajectoryFactory:
     """Factory for creating test trajectories."""
 
-    def _make(length: int = 10, *, truncated: bool = False) -> Trajectory:
+    def _make(
+        length: int = 10,
+        *,
+        truncated: bool = False,
+        termination: chess.Termination | None = None,
+    ) -> Trajectory:
         game = ChessGame()
         action_size = game.get_action_size()
         observations = [np.random.randn(*game.get_board_size()).astype(np.float32) for _ in range(length)]
@@ -51,6 +63,7 @@ def make_trajectory() -> TrajectoryFactory:
             root_values=np.zeros(length, dtype=np.float32),
             valids=np.ones((length, action_size), dtype=np.float32),
             truncated=truncated,
+            termination=termination,
         )
 
     return _make

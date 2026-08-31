@@ -14,6 +14,7 @@ import torch
 from torch._inductor import config as torch_inductor_config
 from torch.amp import GradScaler
 
+from luna.balanced_networks import BalancedNetworks
 from luna.config import EzV2LearnerConfig, MCTSParams, TrainingRunConfig
 from luna.game.chess_game import ACTION_SIZE, OBS_PLANES, ChessGame
 from luna.network import (
@@ -86,6 +87,28 @@ def test_train_ezv2_increments_global_step_per_optimizer_step() -> None:
     assert nnet._global_step == g0 + 4
 
 
+def test_balanced_model_completes_unrolled_optimizer_step(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        model_name="balanced",
+        batch_size=1,
+        dataloader_workers=0,
+        mixed_precision=False,
+        td_steps=1,
+        unroll_steps=1,
+    )
+    network = LunaNetwork(ChessGame(), config)
+    replay = PrioritizedReplayBuffer(capacity=8)
+    replay.save_trajectory(_make_trajectory(length=4))
+
+    metrics = network.train_ezv2(replay, steps=1, total_train_steps=1)
+
+    assert network._global_step == 1
+    assert math.isfinite(metrics["total"])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_reanalyze_disables_async_prefetch_paths() -> None:
     game = ChessGame()
@@ -152,6 +175,7 @@ def test_recurrent_inference_copies_only_legal_policy_candidates(
 @pytest.mark.parametrize(
     ("field_name", "value", "message"),
     [
+        ("model_name", "unknown", "model_name must be 'baseline' or 'balanced'"),
         ("grad_accum_steps", 0, "grad_accum_steps must be a positive integer"),
         ("dataloader_workers", -1, "dataloader_workers must be a non-negative integer"),
         ("support_size", 0, "support_size must be a positive integer"),
@@ -527,6 +551,7 @@ def test_checkpoint_contains_architecture_metadata(
     assert checkpoint["model_spec"]["action_size"] == chess_game.get_action_size()
     assert checkpoint["model_spec"]["observation_shape"] == list(chess_game.get_board_size())
     assert checkpoint["learner_config"]["num_channels"] == small_learner_config.num_channels
+    assert checkpoint["model_spec"]["model_name"] == small_learner_config.model_name
     assert checkpoint["learner_config"]["recurrent_gradient_scale"] == pytest.approx(0.4)
 
     restored = LunaNetwork.from_checkpoint(
@@ -545,6 +570,40 @@ def test_checkpoint_contains_architecture_metadata(
     resumed.load_checkpoint(str(tmp_path), "metadata.pth.tar", load_optimizer=True)
     assert resumed.scaler.state_dict() == expected_scaler_state
     assert resumed._lr_schedule_total_steps == 80
+
+
+def test_checkpoint_reconstructs_balanced_model_from_factory_metadata(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(small_learner_config, model_name="balanced")
+    network = LunaNetwork(chess_game, config)
+    network.save_checkpoint(str(tmp_path), "balanced.pth.tar")
+
+    restored = LunaNetwork.from_checkpoint(chess_game, tmp_path / "balanced.pth.tar", device="cpu")
+
+    assert restored._learner.model_name == "balanced"
+    assert isinstance(restored.nnet, BalancedNetworks)
+    for name, tensor in network.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, restored.nnet.state_dict()[name])
+
+
+def test_checkpoint_without_model_factory_metadata_defaults_to_baseline(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    network.save_checkpoint(str(tmp_path), "current.pth.tar")
+    checkpoint = torch.load(tmp_path / "current.pth.tar", map_location="cpu", weights_only=True)
+    del checkpoint["model_spec"]["model_name"]
+    torch.save(checkpoint, tmp_path / "pre-factory.pth.tar")
+
+    restored = LunaNetwork.from_checkpoint(chess_game, tmp_path / "pre-factory.pth.tar", device="cpu")
+
+    assert restored._learner.model_name == "baseline"
+    assert type(restored.nnet) is type(network.nnet)
 
 
 def test_learning_rate_continues_from_checkpoint_global_step(

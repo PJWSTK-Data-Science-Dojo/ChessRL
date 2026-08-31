@@ -256,7 +256,13 @@ def test_phase_make_target_sets_explicit_wandb_resume_policy(target: str, resume
     assert "--run.stockfish-elo 1500" in result.stdout
     assert "--run.ladder-start-elo 500" in result.stdout
     assert "--run.ladder-step-elo 100" in result.stdout
+    assert "--learner.model-name balanced" in result.stdout
+    assert "--learner.repr-blocks 10" in result.stdout
+    assert "--learner.dyn-blocks 1" in result.stdout
+    assert "--learner.unroll-steps 5" in result.stdout
+    assert "--learner.td-steps 5" in result.stdout
     assert "--learner.reanalyze-prob 0.10" in result.stdout
+    assert "--learner.reanalyze-start-step 40000" in result.stdout
     if target == "migrate-ladder-phase":
         assert "--initialize-evaluation-state" in result.stdout
 
@@ -274,3 +280,34 @@ def test_train_phase_make_target_keeps_pinned_source_preflight() -> None:
 
     assert "best.pth.tar" in result.stdout
     assert "b6ec9f2e5455f592a3833a285fe478dfba9bb9bdddba9207a2d66572277c7b8d" in result.stdout
+
+
+def test_maintained_train_target_uses_balanced_ezv2_contract() -> None:
+    repository = Path(__file__).resolve().parents[1]
+
+    result = subprocess.run(
+        ["make", "-n", "train"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    expected_flags = (
+        "--run.search-mode gumbel",
+        "--run.gumbel-max-considered-actions 16",
+        "--run.num-mcts-sims 32",
+        "--run.self-play-workers 4",
+        "--learner.model-name balanced",
+        "--learner.batch-size 256",
+        "--learner.repr-blocks 10",
+        "--learner.dyn-blocks 1",
+        "--learner.unroll-steps 5",
+        "--learner.td-steps 5",
+        "--learner.compile-inference",
+        "--learner.compile-training",
+        "--learner.reanalyze-prob 0.10",
+        "--learner.reanalyze-start-step 40000",
+    )
+    for flag in expected_flags:
+        assert flag in result.stdout

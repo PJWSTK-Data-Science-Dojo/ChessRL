@@ -7,6 +7,7 @@ changing the learner's numerical precision.
 
 from threading import RLock
 
+import chess
 import numpy as np
 
 from luna.game.chess_game import ACTION_SIZE, OBS_PLANES
@@ -24,6 +25,7 @@ class Trajectory:
         "rewards",
         "root_policies",
         "root_values",
+        "termination",
         "truncated",
         "valids",
     )
@@ -37,6 +39,7 @@ class Trajectory:
         root_values: list[float] | np.ndarray,
         valids: list[np.ndarray] | np.ndarray,
         truncated: bool = False,
+        termination: chess.Termination | None = None,
     ) -> None:
         raw_actions = np.asarray(actions)
         if raw_actions.ndim != 1 or raw_actions.size == 0:
@@ -99,6 +102,10 @@ class Trajectory:
             raise ValueError("Every trajectory root policy must sum to one")
         if not isinstance(truncated, bool | np.bool_):
             raise ValueError("truncated must be a boolean")
+        if termination is not None and not isinstance(termination, chess.Termination):
+            raise TypeError("termination must be a chess.Termination or None")
+        if truncated and termination is not None:
+            raise ValueError("A truncated trajectory cannot have a terminal chess outcome")
 
         self.observations = observations_array
         self.actions = actions_array
@@ -108,6 +115,7 @@ class Trajectory:
         self.valids = valids_array
         self.game_length = game_length
         self.truncated = bool(truncated)
+        self.termination = termination
 
 
 class _SumTree:

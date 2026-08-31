@@ -117,6 +117,11 @@ def _seed_actor(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _actor_learner_config(learner: EzV2LearnerConfig) -> EzV2LearnerConfig:
+    """Return the eager-only runtime configuration for a self-play actor."""
+    return replace(learner, compile_inference=False, compile_training=False, dataloader_workers=0)
+
+
 def _actor_entry(
     actor_id: int,
     connection: Connection,
@@ -138,7 +143,7 @@ def _actor_entry(
         from luna.network import LunaNetwork
 
         actor_run = replace(run, self_play_workers=1, profile=False)
-        actor_learner = replace(learner, compile_training=False, dataloader_workers=0)
+        actor_learner = _actor_learner_config(learner)
         game = ChessGame()
         network = LunaNetwork(game, actor_learner)
         coach = Coach(game, network, actor_run, seed=derive_actor_seed(base_seed, actor_id, 0))

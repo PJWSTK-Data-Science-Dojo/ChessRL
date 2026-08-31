@@ -23,6 +23,8 @@ PHASE_TRAIN_ARGS = \
 	--wandb-run-name "$(NEW_PHASE_WANDB_RUN_NAME)" \
 	--run.search-mode gumbel \
 	--run.gumbel-max-considered-actions 16 \
+	--run.gumbel-scale 1.0 \
+	--run.gumbel-value-scale 0.1 \
 	--run.num-iters 400 \
 	--run.num-episodes 128 \
 	--run.self-play-workers 4 \
@@ -48,14 +50,23 @@ PHASE_TRAIN_ARGS = \
 	--run.checkpoint-top-k 3 \
 	--learner.device cuda \
 	--learner.cuda-device 0 \
+	--learner.model-name balanced \
 	--learner.batch-size 256 \
 	--learner.num-channels 128 \
-	--learner.repr-blocks 8 \
-	--learner.dyn-blocks 3 \
+	--learner.repr-blocks 10 \
+	--learner.dyn-blocks 1 \
 	--learner.proj-dim 256 \
-	--learner.lr 1e-4 \
+	--learner.lr 2e-4 \
 	--learner.lr-min 1e-5 \
 	--learner.lr-warmup-steps 1000 \
+	--learner.weight-decay 1e-4 \
+	--learner.amp-dtype bfloat16 \
+	--learner.unroll-steps 5 \
+	--learner.td-steps 5 \
+	--learner.policy-loss-weight 1.0 \
+	--learner.value-loss-weight 0.25 \
+	--learner.reward-loss-weight 1.0 \
+	--learner.consistency-loss-weight 2.0 \
 	--learner.grad-accum-steps 2 \
 	--learner.grad-clip-norm 5 \
 	--learner.recurrent-gradient-scale 0.5 \
@@ -64,7 +75,7 @@ PHASE_TRAIN_ARGS = \
 	--learner.compile-training \
 	--learner.reanalyze-mcts-sims 16 \
 	--learner.reanalyze-prob 0.10 \
-	--learner.reanalyze-start-step 5000
+	--learner.reanalyze-start-step 40000
 
 WEB_COMPOSE = docker compose --env-file .env -f docker-compose.yml
 PUBLIC_COMPOSE = docker compose --env-file $(PUBLIC_ENV) -f docker-compose.yml -f docker-compose.public.yml
@@ -103,15 +114,18 @@ train:
 	uv run --frozen python src/main.py \
 		--run.search-mode gumbel \
 		--run.gumbel-max-considered-actions 16 \
+		--run.gumbel-scale 1.0 \
+		--run.gumbel-value-scale 0.1 \
 		--run.num-iters 400 \
-		--run.num-episodes 32 \
+		--run.num-episodes 128 \
+		--run.self-play-workers 4 \
 		--run.parallel-games 32 \
 		--run.num-mcts-sims 32 \
 		--run.recurrent-policy-topk 256 \
 		--run.temp-threshold 20 \
 		--run.max-ply 256 \
 		--run.train-steps-per-iter 150 \
-		--run.replay-capacity 150000 \
+		--run.replay-capacity 300000 \
 		--run.stockfish-eval-every 25 \
 		--run.stockfish-eval-games 8 \
 		--run.stockfish-elo 1500 \
@@ -119,20 +133,32 @@ train:
 		--run.checkpoint-top-k 3 \
 		--learner.device cuda \
 		--learner.cuda-device 0 \
-		--learner.batch-size 64 \
+		--learner.model-name balanced \
+		--learner.batch-size 256 \
 		--learner.num-channels 128 \
-		--learner.repr-blocks 8 \
-		--learner.dyn-blocks 3 \
+		--learner.repr-blocks 10 \
+		--learner.dyn-blocks 1 \
 		--learner.proj-dim 256 \
 		--learner.lr 2e-4 \
+		--learner.lr-min 1e-5 \
 		--learner.lr-warmup-steps 1000 \
+		--learner.weight-decay 1e-4 \
+		--learner.amp-dtype bfloat16 \
+		--learner.unroll-steps 5 \
+		--learner.td-steps 5 \
+		--learner.policy-loss-weight 1.0 \
+		--learner.value-loss-weight 0.25 \
+		--learner.reward-loss-weight 1.0 \
+		--learner.consistency-loss-weight 2.0 \
 		--learner.grad-accum-steps 2 \
 		--learner.grad-clip-norm 5 \
 		--learner.recurrent-gradient-scale 0.5 \
+		--learner.dataloader-workers 4 \
 		--learner.compile-inference \
+		--learner.compile-training \
 		--learner.reanalyze-mcts-sims 16 \
-		--learner.reanalyze-prob 0.25 \
-		--learner.reanalyze-start-step 15000 \
+		--learner.reanalyze-prob 0.10 \
+		--learner.reanalyze-start-step 40000 \
 		$(TRAIN_ARGS) $(ARGS)
 
 resume:
