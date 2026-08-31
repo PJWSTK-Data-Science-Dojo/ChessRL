@@ -71,6 +71,23 @@ class StockfishEvaluationProtocol:
     mcts: MCTSParams
 
 
+def _wandb_metrics(scores: StockfishEvalScores, iteration: int | None) -> dict[str, float | int]:
+    total = scores.model_wins + scores.draws + scores.stockfish_wins
+    win_rate = scores.model_wins / total if total else 0.0
+    score = (scores.model_wins + 0.5 * scores.draws) / total if total else 0.0
+    metrics: dict[str, float | int] = {
+        "stockfish/luna_wins": scores.model_wins,
+        "stockfish/draws": scores.draws,
+        "stockfish/stockfish_wins": scores.stockfish_wins,
+        "stockfish/win_rate": win_rate,
+        "stockfish/score": score,
+        "stockfish/opening_suite_version": OPENING_SUITE_VERSION,
+    }
+    if iteration is not None:
+        metrics["iteration"] = iteration
+    return metrics
+
+
 def stockfish_evaluation_protocol(run: TrainingRunConfig) -> StockfishEvaluationProtocol:
     """Capture the comparable external-evaluation contract."""
     return StockfishEvaluationProtocol(
@@ -200,11 +217,10 @@ def run_stockfish_eval(
     finally:
         sf.close()
 
-    total = mw + dr + sw
-    wr = mw / total if total else 0.0
+    scores = StockfishEvalScores(model_wins=mw, draws=dr, stockfish_wins=sw)
     iter_suffix = f" (iter {iteration})" if iteration is not None else ""
     logger.info(
-        "Stockfish eval{}: model {} — {} — {} SF | MCTS sims={} SF elo={} depth={} games={} openings=v{}",
+        "Stockfish eval{}: Luna {} — {} — {} Stockfish | MCTS sims={} SF elo={} depth={} games={} openings=v{}",
         iter_suffix,
         mw,
         dr,
@@ -216,15 +232,6 @@ def run_stockfish_eval(
         OPENING_SUITE_VERSION,
     )
     if wandb.run is not None:
-        log_payload = {
-            "stockfish/model_wins": mw,
-            "stockfish/draws": dr,
-            "stockfish/opponent_wins": sw,
-            "stockfish/win_rate": wr,
-            "stockfish/opening_suite_version": OPENING_SUITE_VERSION,
-        }
-        if iteration is not None:
-            log_payload["iteration"] = iteration
-        wandb.log(log_payload)
+        wandb.log(_wandb_metrics(scores, iteration))
 
-    return StockfishEvalScores(model_wins=mw, draws=dr, stockfish_wins=sw)
+    return scores

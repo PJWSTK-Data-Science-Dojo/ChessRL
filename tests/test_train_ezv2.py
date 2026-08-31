@@ -2,7 +2,10 @@
 
 import math
 from collections.abc import Sequence
+from dataclasses import replace
+from hashlib import file_digest
 from pathlib import Path
+from unittest.mock import patch
 
 import chess
 import numpy as np
@@ -13,7 +16,12 @@ from torch.amp import GradScaler
 
 from luna.config import EzV2LearnerConfig, MCTSParams, TrainingRunConfig
 from luna.game.chess_game import ACTION_SIZE, OBS_PLANES, ChessGame
-from luna.network import LunaNetwork, _configure_dynamic_cudagraphs, _scale_gradient
+from luna.network import (
+    LunaNetwork,
+    TrainingPhaseProvenance,
+    _configure_dynamic_cudagraphs,
+    _scale_gradient,
+)
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 
 
@@ -530,6 +538,266 @@ def test_learning_rate_continues_from_checkpoint_global_step(
     assert restored._global_step == 8
     assert restored._lr_schedule_total_steps == 20
     assert restored.optimizer.param_groups[0]["lr"] == pytest.approx(expected_lr)
+
+
+def test_new_training_phase_loads_only_weights_and_resets_progress(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    source = LunaNetwork(chess_game, small_learner_config)
+    source_parameter = next(source.nnet.parameters())
+    with torch.no_grad():
+        source_parameter.add_(0.25)
+    source_parameter.grad = torch.ones_like(source_parameter)
+    source.optimizer.step()
+    source.optimizer.zero_grad(set_to_none=True)
+    source._global_step = 123
+    source._trainer_iteration = 17
+    source._lr_schedule_total_steps = 500
+    source.save_checkpoint(str(tmp_path), "source.pth.tar")
+    source_path = tmp_path / "source.pth.tar"
+    with source_path.open("rb") as source_file:
+        source_sha256 = file_digest(source_file, "sha256").hexdigest()
+
+    phase_config = replace(
+        small_learner_config,
+        batch_size=64,
+        grad_accum_steps=2,
+        lr=7e-4,
+        lr_min=2e-5,
+        weight_decay=3e-4,
+    )
+    phase = LunaNetwork(chess_game, phase_config)
+    phase_parameter = next(phase.nnet.parameters())
+    phase_parameter.grad = torch.ones_like(phase_parameter)
+    phase.optimizer.step()
+    phase.optimizer.zero_grad(set_to_none=True)
+    phase._global_step = 9
+    phase._trainer_iteration = 4
+    phase._lr_schedule_total_steps = 80
+
+    phase.initialize_training_phase(str(tmp_path), "source.pth.tar")
+
+    for name, tensor in phase.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, source.nnet.state_dict()[name])
+    assert phase.optimizer.state_dict()["state"] == {}
+    assert phase.optimizer.param_groups[0]["lr"] == pytest.approx(phase_config.lr)
+    assert phase.optimizer.param_groups[0]["weight_decay"] == pytest.approx(phase_config.weight_decay)
+    assert phase._global_step == 0
+    assert phase._trainer_iteration == 0
+    assert phase._lr_schedule_total_steps == 0
+    assert not phase._lr_schedule_mismatch_warned
+    assert phase._loaded_checkpoint_path is None
+    provenance = phase.training_phase_provenance
+    assert provenance == TrainingPhaseProvenance(
+        source_checkpoint_sha256=source_sha256,
+        source_trainer_iteration=17,
+        source_global_step=123,
+    )
+    assert provenance is not None
+
+    phase.save_checkpoint(str(tmp_path), "phase.pth.tar")
+    phase_checkpoint = torch.load(tmp_path / "phase.pth.tar", map_location="cpu", weights_only=True)
+    assert phase_checkpoint["training_phase_provenance"] == provenance.as_config()
+    assert set(phase_checkpoint["training_phase_provenance"]) == {
+        "source_checkpoint_sha256",
+        "source_trainer_iteration",
+        "source_global_step",
+    }
+
+    resumed = LunaNetwork(chess_game, phase_config)
+    resumed.load_checkpoint(str(tmp_path), "phase.pth.tar", load_optimizer=False)
+    assert resumed.training_phase_provenance == provenance
+
+
+def test_new_training_phase_rejects_architecture_change_before_mutation(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    source = LunaNetwork(chess_game, small_learner_config)
+    source.save_checkpoint(str(tmp_path), "source.pth.tar")
+    phase = LunaNetwork(chess_game, replace(small_learner_config, num_channels=24))
+    original = {name: tensor.detach().clone() for name, tensor in phase.nnet.state_dict().items()}
+
+    with pytest.raises(ValueError, match=r"model configuration differs.*num_channels"):
+        phase.initialize_training_phase(str(tmp_path), "source.pth.tar")
+
+    for name, tensor in phase.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, original[name])
+
+
+def test_new_training_phase_validates_ignored_optimizer_state_before_mutation(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    source = LunaNetwork(chess_game, small_learner_config)
+    source.save_checkpoint(str(tmp_path), "source.pth.tar")
+    checkpoint = torch.load(tmp_path / "source.pth.tar", map_location="cpu", weights_only=True)
+    checkpoint["optimizer"]["param_groups"][0]["lr"] = float("nan")
+    torch.save(checkpoint, tmp_path / "corrupt-source.pth.tar")
+
+    phase = LunaNetwork(chess_game, replace(small_learner_config, lr=5e-4))
+    original = {name: tensor.detach().clone() for name, tensor in phase.nnet.state_dict().items()}
+    with pytest.raises(ValueError, match=r"non-finite value at checkpoint\.optimizer"):
+        phase.initialize_training_phase(str(tmp_path), "corrupt-source.pth.tar")
+
+    for name, tensor in phase.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, original[name])
+
+
+def test_new_training_phase_requires_exact_tensor_contract(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    source = LunaNetwork(chess_game, small_learner_config)
+    source.save_checkpoint(str(tmp_path), "source.pth.tar")
+    checkpoint = torch.load(tmp_path / "source.pth.tar", map_location="cpu", weights_only=True)
+    first_name = next(iter(checkpoint["state_dict"]))
+    checkpoint["state_dict"][first_name] = checkpoint["state_dict"][first_name].double()
+    torch.save(checkpoint, tmp_path / "wrong-dtype.pth.tar")
+
+    phase = LunaNetwork(chess_game, small_learner_config)
+    with pytest.raises(ValueError, match=r"does not strictly match.*incompatible"):
+        phase.initialize_training_phase(str(tmp_path), "wrong-dtype.pth.tar")
+
+
+def test_checkpoint_without_phase_provenance_restores_none(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    source = LunaNetwork(chess_game, small_learner_config)
+    source.save_checkpoint(str(tmp_path), "source.pth.tar")
+    phase = LunaNetwork(chess_game, small_learner_config)
+    phase.initialize_training_phase(str(tmp_path), "source.pth.tar")
+    assert phase.training_phase_provenance is not None
+
+    checkpoint = torch.load(tmp_path / "source.pth.tar", map_location="cpu", weights_only=True)
+    assert "training_phase_provenance" not in checkpoint
+    torch.save(checkpoint, tmp_path / "old-format-v2.pth.tar")
+
+    phase.load_checkpoint(str(tmp_path), "old-format-v2.pth.tar", load_optimizer=False)
+
+    assert phase.training_phase_provenance is None
+
+
+@pytest.mark.parametrize(
+    ("raw_provenance", "message"),
+    [
+        pytest.param("invalid", "must be a string-keyed mapping", id="not-mapping"),
+        pytest.param(
+            {
+                "source_checkpoint_sha256": "0" * 64,
+                "source_trainer_iteration": 3,
+            },
+            "fields are invalid",
+            id="missing-field",
+        ),
+        pytest.param(
+            {
+                "source_checkpoint_sha256": "g" * 64,
+                "source_trainer_iteration": 3,
+                "source_global_step": 12,
+            },
+            "64 lowercase hexadecimal characters",
+            id="non-hex-digest",
+        ),
+        pytest.param(
+            {
+                "source_checkpoint_sha256": "A" * 64,
+                "source_trainer_iteration": 3,
+                "source_global_step": 12,
+            },
+            "64 lowercase hexadecimal characters",
+            id="uppercase-digest",
+        ),
+        pytest.param(
+            {
+                "source_checkpoint_sha256": "0" * 64,
+                "source_trainer_iteration": -1,
+                "source_global_step": 12,
+            },
+            "source_trainer_iteration.*non-negative integer",
+            id="negative-iteration",
+        ),
+        pytest.param(
+            {
+                "source_checkpoint_sha256": "0" * 64,
+                "source_trainer_iteration": 3,
+                "source_global_step": True,
+            },
+            "source_global_step.*non-negative integer",
+            id="boolean-global-step",
+        ),
+    ],
+)
+def test_checkpoint_rejects_invalid_phase_provenance_before_mutation(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    raw_provenance: object,
+    message: str,
+) -> None:
+    source = LunaNetwork(chess_game, small_learner_config)
+    source.save_checkpoint(str(tmp_path), "valid-provenance-source.pth.tar")
+    checkpoint = torch.load(
+        tmp_path / "valid-provenance-source.pth.tar",
+        map_location="cpu",
+        weights_only=True,
+    )
+    first_name = next(iter(checkpoint["state_dict"]))
+    checkpoint["state_dict"][first_name] = checkpoint["state_dict"][first_name] + 1
+    checkpoint["training_phase_provenance"] = raw_provenance
+    torch.save(checkpoint, tmp_path / "invalid-provenance.pth.tar")
+
+    target = LunaNetwork(chess_game, small_learner_config)
+    target._global_step = 9
+    target._trainer_iteration = 4
+    original = {name: tensor.detach().clone() for name, tensor in target.nnet.state_dict().items()}
+
+    with pytest.raises(ValueError, match=message):
+        target.load_checkpoint(str(tmp_path), "invalid-provenance.pth.tar", load_optimizer=False)
+
+    for name, tensor in target.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, original[name])
+    assert target._global_step == 9
+    assert target._trainer_iteration == 4
+    assert target.training_phase_provenance is None
+
+
+def test_extra_checkpoint_state_cannot_replace_phase_provenance(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+
+    with pytest.raises(ValueError, match=r"reserved checkpoint fields.*training_phase_provenance"):
+        network.save_checkpoint(
+            str(tmp_path),
+            "invalid-extra-state.pth.tar",
+            extra_state={"training_phase_provenance": None},
+        )
+
+    assert not (tmp_path / "invalid-extra-state.pth.tar").exists()
+
+
+def test_changed_lr_horizon_warning_is_emitted_once(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    network._lr_schedule_total_steps = 20
+
+    with patch("luna.network.logger.warning") as warning:
+        assert network._resolve_lr_schedule_total(40, 1) == 20
+        assert network._resolve_lr_schedule_total(40, 1) == 20
+
+    warning.assert_called_once()
 
 
 def test_checkpoint_loader_rejects_legacy_and_mismatched_model_specs(

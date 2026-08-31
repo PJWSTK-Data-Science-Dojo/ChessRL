@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, fields
 from typing import Literal
 
 MAX_STOCKFISH_EVAL_GAMES = 20
+WandbResumeMode = Literal["allow", "never", "must"]
 
 
 @dataclass
@@ -81,7 +82,13 @@ class TrainingRunConfig(MCTSParams):
     """Self-play games generated per iteration."""
 
     parallel_games: int = 8
-    """Games advanced together to batch network inference."""
+    """Games advanced together per self-play process to batch network inference."""
+
+    self_play_workers: int = 1
+    """Spawned self-play processes; one keeps self-play in the learner process."""
+
+    self_play_actor_timeout_s: float = 1_800.0
+    """Maximum time for actor startup or one self-play collection."""
 
     temp_threshold: int = 15
     """Ply after which self-play switches to deterministic action selection."""
@@ -308,8 +315,16 @@ def validate_mcts_params(params: MCTSParams) -> None:
 
 
 def _validate_training_schedule(run: TrainingRunConfig) -> None:
-    for name in ("num_iters", "num_episodes", "parallel_games", "train_steps_per_iter", "replay_capacity"):
+    for name in (
+        "num_iters",
+        "num_episodes",
+        "parallel_games",
+        "self_play_workers",
+        "train_steps_per_iter",
+        "replay_capacity",
+    ):
         _positive_integer(name, getattr(run, name))
+    _finite_at_least("self_play_actor_timeout_s", run.self_play_actor_timeout_s, math.ulp(0.0))
     _non_negative_integer("temp_threshold", run.temp_threshold)
     _non_negative_integer("stockfish_eval_every", run.stockfish_eval_every)
     _non_negative_integer("profile_torch_steps", run.profile_torch_steps)
@@ -406,6 +421,26 @@ def validate_training_configuration(run: TrainingRunConfig, learner: EzV2Learner
         raise ValueError("replay_capacity must be at least batch_size or training can never start")
 
 
+def validate_wandb_run_id(run_id: str | None) -> None:
+    """Validate an optional run ID against the local W&B SDK contract."""
+    if run_id is None:
+        return
+    if not run_id.strip():
+        raise ValueError("wandb_run_id cannot be blank")
+    if run_id != run_id.strip():
+        raise ValueError("wandb_run_id cannot start or end with whitespace")
+    reserved_characters = ":;,#?/'"
+    if any(character in run_id for character in reserved_characters):
+        raise ValueError(f"wandb_run_id cannot contain these characters: {reserved_characters}")
+
+
+def validate_wandb_resume(mode: str) -> None:
+    """Validate the W&B run-resume policy after programmatic config construction."""
+    allowed_modes = ("allow", "never", "must")
+    if mode not in allowed_modes:
+        raise ValueError(f"wandb_resume must be one of {allowed_modes}, got {mode!r}")
+
+
 @dataclass
 class TrainCliConfig:
     """Full set of options exposed by ``python main.py`` (tyro).
@@ -417,9 +452,18 @@ class TrainCliConfig:
     seed: int = 0
     log_level: str = "INFO"
     load_model: bool = False
+    new_training_phase: bool = False
+    """Load only model weights and reset all optimizer and training counters."""
+
     load_checkpoint_dir: str = "./runs/luna-main"
     load_checkpoint_file: str = "latest.pth.tar"
     wandb_project: str | None = None  # Optional WandB project name for experiment tracking
+    wandb_run_id: str | None = None
+    """Stable W&B run ID used to continue one run after a restart."""
+
+    wandb_resume: WandbResumeMode = "allow"
+    """Whether W&B may, must not, or must resume the stable run ID."""
+
     run: TrainingRunConfig = field(default_factory=TrainingRunConfig)
     learner: EzV2LearnerConfig = field(default_factory=EzV2LearnerConfig)
 

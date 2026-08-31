@@ -11,7 +11,7 @@ from luna.replay_buffer import Trajectory
 
 
 class TrajectoryFactory(Protocol):
-    def __call__(self, length: int = 10) -> Trajectory: ...
+    def __call__(self, length: int = 10, *, truncated: bool = False) -> Trajectory: ...
 
 
 @pytest.fixture
@@ -37,7 +37,7 @@ def chess_game() -> ChessGame:
 def make_trajectory() -> TrajectoryFactory:
     """Factory for creating test trajectories."""
 
-    def _make(length: int = 10) -> Trajectory:
+    def _make(length: int = 10, *, truncated: bool = False) -> Trajectory:
         game = ChessGame()
         action_size = game.get_action_size()
         observations = [np.random.randn(*game.get_board_size()).astype(np.float32) for _ in range(length)]
@@ -50,6 +50,7 @@ def make_trajectory() -> TrajectoryFactory:
             root_policies=policies,
             root_values=np.zeros(length, dtype=np.float32),
             valids=np.ones((length, action_size), dtype=np.float32),
+            truncated=truncated,
         )
 
     return _make

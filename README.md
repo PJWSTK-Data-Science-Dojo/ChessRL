@@ -76,6 +76,57 @@ from being merged accidentally.
 
 Use `uv run python src/main.py --help` for the complete Tyro-generated option reference. A bare `src/main.py` invocation uses the lighter dataclass defaults; `make train` applies the larger maintained experiment preset.
 
+## Throughput training phase
+
+The continuation preset starts from the formally externally evaluated best snapshot,
+`runs/luna-stockfish16-continuation/best.pth.tar` (iteration 225), and writes a separate
+lineage to `runs/luna-throughput-phase`:
+
+```bash
+make train-phase
+```
+
+The command verifies the source against the pinned `NEW_PHASE_SOURCE_SHA256` before
+loading it, so the stable `best.pth.tar` name cannot silently select different bytes.
+Override the source file and hash together only when intentionally starting from a
+different evaluated snapshot.
+
+This imports the validated model weights but deliberately starts a fresh optimizer,
+scaler, counters, replay buffer, and warm-up/cosine learning-rate schedule. The target
+directory must not exist or must be completely empty; the command refuses to merge it
+with an earlier lineage. A local, Git-ignored `.env` must define
+`WANDB_API_KEY` and `WANDB_ENTITY`. The preflight checks only that both variables are
+non-empty and does not print their values.
+
+After a crash or reboot, continue the phase instead of starting it again:
+
+```bash
+make resume-phase
+```
+
+Resume restores the phase optimizer, scaler, counters, and original learning-rate
+schedule. Both commands pass the same `NEW_PHASE_WANDB_RUN_ID` (default
+`luna-throughput-phase-v1`) through `--wandb-run-id`. `make train-phase` uses
+`--wandb-resume never`, so it refuses to append a new phase to an existing remote run;
+`make resume-phase` uses `--wandb-resume must`, so a typo or missing remote run fails
+instead of silently creating a second dashboard. Change the run ID only when intentionally
+starting a different phase. If the remote run was deliberately deleted while its local
+checkpoint remains valid, recreate it explicitly with
+`make resume-phase ARGS='--wandb-resume allow'`. The general CLI defaults to `allow`.
+The maintained phase preset collects 128 self-play episodes
+with two persistent actors running up to 32 active games each, trains with batches of
+256, reanalyzes 10% of eligible samples, and uses a fixed 20-game Stockfish sentinel.
+The actor pool is controlled by `--run.self-play-workers` and can be overridden through
+`ARGS`; set it to `1` for in-process self-play without the pool.
+
+The preset does not keep 1,024 MCTS roots active at once. Larger recurrent-inference
+batches improve the GPU kernel less than they increase CPU chess-rule and tree-management
+work at that scale; multiple actors keep the accelerator fed more effectively. W&B logs
+`selfplay/*` workload data, `performance/*` phase timings and throughput, and `replay/*`
+buffer state in addition to learner and Stockfish metrics. The Stockfish match is a
+fixed-protocol regression sentinel, not a guarantee of playing strength, and a 20-game
+sample remains noisy.
+
 ## Checkpoint contract
 
 Training writes format-v2 files under `CHECKPOINT_DIR` (`./runs/luna-main` by default):
@@ -172,6 +223,8 @@ make check               # format check + lint + types + tests
 make audit               # audit locked runtime dependencies (network required)
 make bench               # throughput benchmark
 make profile-smoke       # bounded end-to-end profile
+make train-phase         # start the dedicated throughput continuation phase
+make resume-phase        # resume that phase after an interruption
 make test-pipeline-cpu   # short CPU training smoke test
 make test-pipeline-mps   # short MPS training smoke test
 make release-web-model RELEASE_ID=<id>  # immutable evaluated web artifact

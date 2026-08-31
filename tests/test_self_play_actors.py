@@ -1,0 +1,177 @@
+"""Tests for isolated persistent self-play actors."""
+
+import threading
+from multiprocessing.connection import Connection
+from pathlib import Path
+from typing import cast
+from unittest.mock import patch
+
+import pytest
+import torch
+
+from luna.coach import Coach
+from luna.config import EzV2LearnerConfig, TrainingRunConfig, validate_training_configuration
+from luna.game.chess_game import ChessGame
+from luna.network import LunaNetwork
+from luna.self_play_actors import (
+    SelfPlayActorError,
+    SelfPlayActorPool,
+    derive_actor_seed,
+    partition_episode_counts,
+)
+
+
+class _BlockingReceiveConnection:
+    def __init__(self, delegate: Connection) -> None:
+        self._delegate = delegate
+        self._closed = threading.Event()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed.is_set()
+
+    def send(self, message: object) -> None:
+        self._delegate.send(message)
+
+    def recv(self) -> object:
+        if not self._closed.wait(timeout=2.0):
+            raise EOFError("test receive guard expired")
+        raise EOFError("connection closed by actor-pool shutdown")
+
+    def close(self) -> None:
+        self._closed.set()
+        self._delegate.close()
+
+
+def test_actor_seeds_are_repeatable_and_unique() -> None:
+    seeds = [derive_actor_seed(7, actor_id, generation=12) for actor_id in range(4)]
+
+    assert seeds == [derive_actor_seed(7, actor_id, generation=12) for actor_id in range(4)]
+    assert len(set(seeds)) == 4
+    assert seeds != [derive_actor_seed(7, actor_id, generation=13) for actor_id in range(4)]
+
+
+def test_episode_partition_is_balanced_and_does_not_create_empty_work() -> None:
+    assert partition_episode_counts(10, 3) == [4, 3, 3]
+    assert partition_episode_counts(2, 4) == [1, 1]
+
+
+def test_actor_configuration_rejects_invalid_worker_count_and_timeout() -> None:
+    learner = EzV2LearnerConfig(device="cpu")
+
+    with pytest.raises(ValueError, match="self_play_workers must be a positive integer"):
+        validate_training_configuration(TrainingRunConfig(self_play_workers=0), learner)
+    with pytest.raises(ValueError, match="self_play_actor_timeout_s must be finite"):
+        validate_training_configuration(TrainingRunConfig(self_play_actor_timeout_s=0.0), learner)
+
+
+def test_coach_owns_actor_pool_for_the_complete_training_loop(tmp_path: Path) -> None:
+    game = ChessGame()
+    learner = EzV2LearnerConfig(
+        device="cpu",
+        num_channels=8,
+        repr_blocks=0,
+        dyn_blocks=0,
+        proj_dim=16,
+        dataloader_workers=0,
+    )
+    run = TrainingRunConfig(
+        num_iters=1,
+        num_episodes=4,
+        self_play_workers=2,
+        checkpoint=str(tmp_path),
+        stockfish_eval_every=0,
+    )
+    network = LunaNetwork(game, learner)
+    coach = Coach(game, network, run, seed=31)
+
+    with (
+        patch("luna.coach.SelfPlayActorPool") as actor_pool_type,
+        patch.object(coach, "_learn_iterations") as learn_iterations,
+    ):
+        actor_pool = actor_pool_type.return_value.__enter__.return_value
+        coach.learn()
+
+    actor_pool_type.assert_called_once_with(network, run, worker_count=2, base_seed=31)
+    learn_iterations.assert_called_once_with(1, run.train_steps_per_iter, actor_pool=actor_pool)
+
+
+def test_spawned_actors_collect_compact_trajectories_and_fail_fast(
+    tmp_path: Path,
+) -> None:
+    game = ChessGame()
+    learner = EzV2LearnerConfig(
+        device="cpu",
+        num_channels=8,
+        repr_blocks=0,
+        dyn_blocks=0,
+        proj_dim=16,
+        dataloader_workers=0,
+    )
+    run = TrainingRunConfig(
+        num_mcts_sims=1,
+        num_episodes=3,
+        parallel_games=1,
+        self_play_workers=2,
+        self_play_actor_timeout_s=60.0,
+        max_ply=1,
+        checkpoint=str(tmp_path),
+        stockfish_eval_every=0,
+    )
+    network = LunaNetwork(game, learner)
+    original_state = {name: tensor.detach().clone() for name, tensor in network.nnet.state_dict().items()}
+    pool = SelfPlayActorPool(network, run, worker_count=2, base_seed=19)
+    try:
+        trajectories = pool.collect(3, generation=1)
+
+        assert len(trajectories) == 3
+        assert all(trajectory.game_length == 1 for trajectory in trajectories)
+        assert all(trajectory.observations.dtype.name == "float16" for trajectory in trajectories)
+        assert all(torch.equal(network.nnet.state_dict()[name], value) for name, value in original_state.items())
+
+        next_trajectories = pool.collect(3, generation=2)
+        assert len(next_trajectories) == 3
+        assert all(trajectory.game_length == 1 for trajectory in next_trajectories)
+
+        pool._connections[0].send(None)
+        pool._processes[0].join(timeout=5.0)
+        with pytest.raises(SelfPlayActorError, match=r"Actor 0 received an unsupported request: NoneType"):
+            pool.collect(2, generation=3)
+    finally:
+        pool.close()
+
+
+def test_collection_timeout_terminates_actors_and_joins_io_threads(tmp_path: Path) -> None:
+    game = ChessGame()
+    learner = EzV2LearnerConfig(
+        device="cpu",
+        num_channels=8,
+        repr_blocks=0,
+        dyn_blocks=0,
+        proj_dim=16,
+        dataloader_workers=0,
+    )
+    run = TrainingRunConfig(
+        num_mcts_sims=1,
+        num_episodes=1,
+        parallel_games=1,
+        self_play_workers=1,
+        self_play_actor_timeout_s=60.0,
+        max_ply=1,
+        checkpoint=str(tmp_path),
+        stockfish_eval_every=0,
+    )
+    pool = SelfPlayActorPool(LunaNetwork(game, learner), run, worker_count=1, base_seed=23)
+    cache_root = Path(pool._cache_root.name)
+    blocking_connection = _BlockingReceiveConnection(pool._connections[0])
+    pool._connections[0] = cast(Connection, blocking_connection)
+    pool._timeout_s = 0.05
+
+    with pytest.raises(SelfPlayActorError, match=r"Timed out after 0\.05s waiting for"):
+        pool.collect(1, generation=1)
+
+    assert pool._closed
+    assert blocking_connection.closed
+    assert not pool._processes[0].is_alive()
+    assert not cache_root.exists()
+    assert not any(thread.name.startswith("luna-actor-io") for thread in threading.enumerate())

@@ -13,7 +13,16 @@ import numpy as np
 class Trajectory:
     """One self-play game trajectory with contiguous array storage."""
 
-    __slots__ = ("actions", "game_length", "observations", "rewards", "root_policies", "root_values", "valids")
+    __slots__ = (
+        "actions",
+        "game_length",
+        "observations",
+        "rewards",
+        "root_policies",
+        "root_values",
+        "truncated",
+        "valids",
+    )
 
     def __init__(
         self,
@@ -23,6 +32,7 @@ class Trajectory:
         root_policies: list[np.ndarray] | np.ndarray,
         root_values: list[float] | np.ndarray,
         valids: list[np.ndarray] | np.ndarray,
+        truncated: bool = False,
     ) -> None:
         observations_array = np.ascontiguousarray(observations, dtype=np.float16)
         actions_array = np.asarray(actions, dtype=np.int64)
@@ -56,6 +66,7 @@ class Trajectory:
         self.root_values = values_array
         self.valids = valids_array
         self.game_length = game_length
+        self.truncated = truncated
 
 
 class _SumTree:
@@ -128,6 +139,15 @@ class PrioritizedReplayBuffer:
     def size(self) -> int:
         with self._lock:
             return self._tree.size
+
+    def configure_beta_annealing(self, expected_sample_calls: int) -> None:
+        """Linearly anneal the current importance exponent to one over future samples."""
+        if isinstance(expected_sample_calls, bool) or not isinstance(expected_sample_calls, int):
+            raise ValueError("expected_sample_calls must be a positive integer")
+        if expected_sample_calls <= 0:
+            raise ValueError("expected_sample_calls must be a positive integer")
+        with self._lock:
+            self.beta_increment = (1.0 - self.beta) / expected_sample_calls
 
     def save_trajectory(self, trajectory: Trajectory) -> None:
         """Store a trajectory, giving each position the current max priority."""

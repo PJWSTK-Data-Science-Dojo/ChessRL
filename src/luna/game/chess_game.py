@@ -33,6 +33,19 @@ EN_PASSANT_PLANE = CASTLING_PLANES_START + 4
 HALFMOVE_CLOCK_PLANE = CASTLING_PLANES_START + 5
 SIDE_TO_MOVE_PLANE = CASTLING_PLANES_START + 6
 HALFMOVE_CLOCK_NORMALIZER = 100.0
+_MIN_THREEFOLD_CLAIM_HALFMOVES = 7
+
+
+def _observation_history_plies(board: chess.Board) -> int:
+    """Bound the stack while preserving all eight temporal repetition planes."""
+    temporal_plies = min(HISTORY_LENGTH - 1, len(board.move_stack))
+    if temporal_plies == len(board.move_stack):
+        return temporal_plies
+
+    oldest_observation = board.copy(stack=temporal_plies)
+    for _ in range(temporal_plies):
+        oldest_observation.pop()
+    return min(len(board.move_stack), temporal_plies + oldest_observation.halfmove_clock)
 
 
 def board_to_numpy(board: chess.Board) -> np.ndarray:
@@ -49,7 +62,7 @@ def board_to_numpy(board: chess.Board) -> np.ndarray:
     """
     arr = np.zeros((8, 8, OBS_PLANES), dtype=np.float32)
 
-    historical_board = board.copy(stack=True)
+    historical_board = board.copy(stack=_observation_history_plies(board))
     for history_index in range(HISTORY_LENGTH):
         plane_offset = history_index * PLANES_PER_POSITION
         for square, piece in historical_board.piece_map().items():
@@ -131,14 +144,16 @@ def mirror_move(move: chess.Move) -> chess.Move:
 
 
 def mirror_board(board: chess.Board) -> chess.Board:
-    """Mirror a position while retaining its reversible move history.
+    """Mirror a position while retaining all semantically relevant history.
 
     ``python-chess`` intentionally drops the stack in :meth:`Board.mirror`. Search
-    needs that stack for threefold-repetition adjudication, so rebuild it from the
-    mirrored root and transformed moves.
+    needs reversible history for repetition adjudication and the latest seven
+    plies for temporal observations. Earlier moves cannot affect either result.
     """
-    mirrored = board.root().mirror()
-    for move in board.move_stack:
+    history_plies = _observation_history_plies(board)
+    source = board if len(board.move_stack) <= history_plies else board.copy(stack=history_plies)
+    mirrored = source.root().mirror()
+    for move in source.move_stack:
         mirrored.push(mirror_move(move))
     mirrored.fullmove_number = board.fullmove_number
     return mirrored
@@ -183,6 +198,19 @@ class ChessGame:
         next_player = self.push_action(next_board, player, action)
         return next_board, next_player
 
+    def get_next_search_state(self, board: chess.Board, player: int, action: int) -> tuple[chess.Board, int]:
+        """Execute an MCTS edge while retaining exactly the rule-relevant history.
+
+        Recurrent MCTS nodes are never encoded as temporal observations. Their
+        move stack is needed only for repetition adjudication, which cannot cross
+        the most recent zeroing move represented by ``halfmove_clock``.
+        """
+        next_board = board.copy(stack=board.halfmove_clock)
+        next_player = self.push_action(next_board, player, action)
+        if next_board.halfmove_clock == 0:
+            next_board.clear_stack()
+        return next_board, next_player
+
     def push_action(self, board: chess.Board, player: int, action: int) -> int:
         """Validate and apply an action to a board owned by the caller."""
         move = self._legal_move(board, player, action)
@@ -223,7 +251,11 @@ class ChessGame:
         Returns ``None`` while the game is ongoing, ``0.0`` for a draw, and ``+1`` or
         ``-1`` for a decisive result.
         """
-        outcome = board.outcome(claim_draw=self.claim_draw)
+        # In legal standard chess, the earliest claim by a move occurs after
+        # seven reversible plies. Skipping the expensive history replay below
+        # that exact bound preserves fifty-move and repetition semantics.
+        claim_draw = self.claim_draw and board.halfmove_clock >= _MIN_THREEFOLD_CLAIM_HALFMOVES
+        outcome = board.outcome(claim_draw=claim_draw)
         if outcome is None:
             return None
         if outcome.winner is None:

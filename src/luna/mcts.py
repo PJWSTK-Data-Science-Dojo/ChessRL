@@ -398,12 +398,13 @@ class MCTS:
         if add_exploration_noise is None:
             add_exploration_noise = temp > 0.0
 
-        terminal_value = self.game.get_game_outcome(canonical_board, 1)
+        root_board = canonical_board.copy(stack=canonical_board.halfmove_clock)
+        terminal_value = self.game.get_game_outcome(root_board, 1)
         if terminal_value is not None:
             return [0.0] * self.game.get_action_size(), float(terminal_value)
 
         action_size = self.game.get_action_size()
-        valids = self.game.get_valid_moves(canonical_board, 1)
+        valids = self.game.get_valid_moves(root_board, 1)
         if allowed_root_actions is not None:
             root_mask = np.zeros(action_size, dtype=valids.dtype)
             for action in allowed_root_actions:
@@ -418,7 +419,7 @@ class MCTS:
         obs = self.game.to_array(canonical_board)
         pi_np, root_prediction, latent = self.nnet.predict_with_latent(obs, valids)
 
-        root = _LatentNode(prior=0.0, board=canonical_board.copy())
+        root = _LatentNode(prior=0.0, board=root_board)
         root.latent = latent
         root.raw_value = float(root_prediction)
         root.expanded = True
@@ -505,7 +506,7 @@ class MCTS:
             if node.board is not None:
                 try:
                     parent_player = player_from_turn(node.board.turn)
-                    child_board, child_player = self.game.get_next_state(node.board, parent_player, best_action)
+                    child_board, child_player = self.game.get_next_search_state(node.board, parent_player, best_action)
                     terminal_value = self.game.get_game_outcome(child_board, child_player)
                     child.board = child_board
                     if terminal_value is None:
@@ -630,7 +631,8 @@ class BatchedMCTS:
             if len(exploration_noise) != N:
                 raise ValueError("add_exploration_noise must contain one flag per batched root")
         action_size = self.game.get_action_size()
-        root_outcomes = [self.game.get_game_outcome(board, 1) for board in canonical_boards]
+        root_boards = [board.copy(stack=board.halfmove_clock) for board in canonical_boards]
+        root_outcomes = [self.game.get_game_outcome(board, 1) for board in root_boards]
         discount = float(self.params.discount)
         cpuct = self.params.cpuct
         tm = self._timings
@@ -642,9 +644,9 @@ class BatchedMCTS:
         sample_obs = self.game.to_array(canonical_boards[0])
         obs_batch = np.empty((N, *sample_obs.shape), dtype=np.float32)
         valid_batch = np.empty((N, action_size), dtype=np.float32)
-        for i, b in enumerate(canonical_boards):
-            obs_batch[i] = self.game.to_array(b)
-            valid_batch[i] = self.game.get_valid_moves(b, 1)
+        for i, (canonical_board, root_board) in enumerate(zip(canonical_boards, root_boards)):
+            obs_batch[i] = self.game.to_array(canonical_board)
+            valid_batch[i] = self.game.get_valid_moves(root_board, 1)
 
         if tm is not None:
             tm.encode_s += time.perf_counter() - t0
@@ -669,7 +671,7 @@ class BatchedMCTS:
 
         roots: list[_LatentNode] = []
         for i in range(N):
-            root = _LatentNode(prior=0.0, board=canonical_boards[i].copy())
+            root = _LatentNode(prior=0.0, board=root_boards[i])
             root_outcome = root_outcomes[i]
             root.raw_value = float(root_outcome) if root_outcome is not None else float(root_predictions[i])
             root.expanded = True
@@ -761,7 +763,7 @@ class BatchedMCTS:
                 if parent_board is not None:
                     try:
                         parent_player = player_from_turn(parent_board.turn)
-                        child_board, child_player = self.game.get_next_state(parent_board, parent_player, action)
+                        child_board, child_player = self.game.get_next_search_state(parent_board, parent_player, action)
                         terminal_value = self.game.get_game_outcome(child_board, child_player)
                         child_boards_list.append(child_board)
                         child_valid_mask = (

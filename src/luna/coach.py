@@ -21,7 +21,13 @@ import wandb
 from loguru import logger
 from tqdm import tqdm
 
-from luna.config import TrainingRunConfig, validate_training_configuration
+from luna.config import (
+    TrainingRunConfig,
+    WandbResumeMode,
+    validate_training_configuration,
+    validate_wandb_resume,
+    validate_wandb_run_id,
+)
 from luna.game.chess_game import ChessGame
 from luna.game.stockfish_eval import (
     StockfishEvalOutcome,
@@ -35,8 +41,20 @@ from luna.mcts import MCTS, BatchedMCTS
 from luna.network import LunaNetwork
 from luna.profiling import IterProfileStats, SelfPlayMCTSTimings, write_iter_summaries_json
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
+from luna.self_play_actors import SelfPlayActorPool
 
 _BEST_EVAL_NAME = "best_eval.json"
+
+
+def _configure_wandb_metrics() -> None:
+    wandb.define_metric("global_step")
+    wandb.define_metric("train/*", step_metric="global_step")
+    wandb.define_metric("iteration")
+    wandb.define_metric("replay_buffer_size", step_metric="iteration")
+    wandb.define_metric("selfplay/*", step_metric="iteration")
+    wandb.define_metric("performance/*", step_metric="iteration")
+    wandb.define_metric("replay/*", step_metric="iteration")
+    wandb.define_metric("stockfish/*", step_metric="iteration")
 
 
 def _managed_checkpoint_conflicts(folder: Path) -> list[str]:
@@ -87,6 +105,8 @@ class Coach:
         nnet: LunaNetwork,
         run: TrainingRunConfig,
         wandb_project: str | None = None,
+        wandb_run_id: str | None = None,
+        wandb_resume: WandbResumeMode = "allow",
         seed: int = 0,
     ) -> None:
         self.game = game
@@ -104,13 +124,30 @@ class Coach:
         self._profile_sp_env_s: float = 0.0
         self._checkpoint_lineage_iteration: int | None = None
         self._checkpoint_target_validated = False
+        self._replay_beta_annealing_configured = False
+        self._seed = seed
+        validate_wandb_run_id(wandb_run_id)
+        validate_wandb_resume(wandb_resume)
 
         if wandb_project:
-            wandb.init(
-                project=wandb_project,
-                config={"seed": seed, "run": asdict(run), "learner": asdict(nnet._learner)},
-                tags=["chess", "ezv2"],
-            )
+            phase_provenance = nnet.training_phase_provenance
+            init_config = {
+                "seed": seed,
+                "run": asdict(run),
+                "learner": asdict(nnet._learner),
+                "training_phase_provenance": (phase_provenance.as_config() if phase_provenance is not None else None),
+            }
+            if wandb_run_id is None:
+                wandb.init(project=wandb_project, config=init_config, tags=["chess", "ezv2"])
+            else:
+                wandb.init(
+                    project=wandb_project,
+                    id=wandb_run_id,
+                    resume=wandb_resume,
+                    config=init_config,
+                    tags=["chess", "ezv2"],
+                )
+            _configure_wandb_metrics()
             logger.info("WandB initialized for project: {}", wandb_project)
 
     def execute_episode(self) -> Trajectory:
@@ -179,9 +216,10 @@ class Coach:
                     root_values,
                     valids_list,
                     terminal_value_for_next_player=0.0,
+                    truncated=True,
                 )
 
-    def execute_episodes_batched(self, num_episodes: int) -> list[Trajectory]:
+    def execute_episodes_batched(self, num_episodes: int, *, progress: bool = True) -> list[Trajectory]:
         """Run ``num_episodes`` self-play games using batched parallel MCTS.
 
         Uses a sliding pool of up to ``parallel_games`` games so that whenever a
@@ -194,7 +232,7 @@ class Coach:
             self._profile_mcts_timings = SelfPlayMCTSTimings()
             self._profile_sp_env_s = 0.0
         pool_size = min(self.run.parallel_games, num_episodes)
-        with tqdm(total=num_episodes, desc="Self Play (batched)") as pbar:
+        with tqdm(total=num_episodes, desc="Self Play (batched)", disable=not progress) as pbar:
             return self._run_self_play_pool(num_episodes, pool_size, pbar)
 
     def _run_self_play_pool(self, num_episodes: int, pool_size: int, pbar: tqdm[Never]) -> list[Trajectory]:
@@ -304,6 +342,7 @@ class Coach:
                         value_lists[idx],
                         valid_lists[idx],
                         terminal_value_for_next_player=terminal_rewards[idx],
+                        truncated=True,
                     )
                     if len(completed) < num_episodes:
                         completed.append(traj)
@@ -326,6 +365,7 @@ class Coach:
         root_values: list[float],
         valids_list: list[np.ndarray],
         terminal_value_for_next_player: float,
+        truncated: bool = False,
     ) -> Trajectory:
         game_len = len(actions)
         rewards = [0.0] * game_len
@@ -339,6 +379,7 @@ class Coach:
             root_policies=root_policies,
             root_values=root_values,
             valids=valids_list,
+            truncated=truncated,
         )
 
     def learn(self) -> None:
@@ -367,6 +408,30 @@ class Coach:
 
         self.nnet.warmup_mcts_inference(self.game)
 
+        worker_count = min(self.run.self_play_workers, self.run.num_episodes)
+        if worker_count <= 1:
+            self._learn_iterations(start_iteration, total_train_steps, actor_pool=None)
+            return
+
+        logger.info(
+            "Starting {} persistent self-play actors with up to {} batched games each",
+            worker_count,
+            self.run.parallel_games,
+        )
+        with SelfPlayActorPool(
+            self.nnet,
+            self.run,
+            worker_count=worker_count,
+            base_seed=self._seed,
+        ) as actor_pool:
+            self._learn_iterations(start_iteration, total_train_steps, actor_pool=actor_pool)
+
+    def _learn_iterations(
+        self,
+        start_iteration: int,
+        total_train_steps: int,
+        actor_pool: SelfPlayActorPool | None,
+    ) -> None:
         profile_rows: list[IterProfileStats] = []
         if self.run.profile:
             os.makedirs(self.run.profile_dir, exist_ok=True)
@@ -386,7 +451,10 @@ class Coach:
             stats = IterProfileStats(iter_index=i)
 
             t0 = time.perf_counter()
-            trajectories = self.execute_episodes_batched(self.run.num_episodes)
+            if actor_pool is None:
+                trajectories = self.execute_episodes_batched(self.run.num_episodes)
+            else:
+                trajectories = actor_pool.collect(self.run.num_episodes, generation=i)
             stats.self_play_s = time.perf_counter() - t0
             if self.run.profile and self._profile_mcts_timings is not None:
                 mt = self._profile_mcts_timings
@@ -407,11 +475,14 @@ class Coach:
             learner_batch_size = self.nnet._learner.batch_size
             if self.replay.size < learner_batch_size:
                 logger.warning("Replay buffer too small ({}), skipping training.", self.replay.size)
+                stats.total_s = time.perf_counter() - iter_t0
+                self._log_iteration_metrics(i, trajectories, stats)
                 if self.run.profile:
-                    stats.total_s = time.perf_counter() - iter_t0
                     profile_rows.append(stats)
                     logger.info("\n{}\n", stats.to_log_lines())
                 continue
+
+            self._configure_replay_beta_annealing(i)
 
             do_kineto = (
                 self.run.profile
@@ -433,7 +504,7 @@ class Coach:
             t0 = time.perf_counter()
             loss_info = self.nnet.train_ezv2(
                 self.replay,
-                steps=train_steps_per_iter,
+                steps=self.run.train_steps_per_iter,
                 total_train_steps=total_train_steps,
                 discount=self.run.discount,
                 mcts_for_reanalyze=self.run,
@@ -447,14 +518,6 @@ class Coach:
             stats.train_s = time.perf_counter() - t0
             logger.info("Training done: {}", loss_info)
 
-            if wandb.run is not None:
-                wandb.log(
-                    {
-                        "iteration": i,
-                        "replay_buffer_size": self.replay.size,
-                    }
-                )
-
             t0 = time.perf_counter()
             self._publish_checkpoint(i)
             stats.checkpoint_publish_s = time.perf_counter() - t0
@@ -464,6 +527,7 @@ class Coach:
                 self._update_best_from_stockfish(i, sf_outcome)
 
             stats.total_s = time.perf_counter() - iter_t0
+            self._log_iteration_metrics(i, trajectories, stats)
             if self.run.profile:
                 profile_rows.append(stats)
                 logger.info("\n{}\n", stats.to_log_lines())
@@ -472,6 +536,49 @@ class Coach:
             summary_path = Path(self.run.profile_dir) / self.run.profile_summary_json
             write_iter_summaries_json(str(summary_path), profile_rows)
             logger.info("Wrote aggregated phase timings to {}", summary_path.resolve())
+
+    def _configure_replay_beta_annealing(self, iteration: int) -> None:
+        if self._replay_beta_annealing_configured:
+            return
+        remaining_iterations = self.run.num_iters - iteration + 1
+        remaining_sample_calls = remaining_iterations * self.run.train_steps_per_iter
+        self.replay.configure_beta_annealing(remaining_sample_calls)
+        self._replay_beta_annealing_configured = True
+        logger.info(
+            "PER beta annealing starts at iteration {} over {} optimizer sample calls",
+            iteration,
+            remaining_sample_calls,
+        )
+
+    def _log_iteration_metrics(
+        self,
+        iteration: int,
+        trajectories: list[Trajectory],
+        stats: IterProfileStats,
+    ) -> None:
+        if wandb.run is None:
+            return
+        games = len(trajectories)
+        positions = sum(trajectory.game_length for trajectory in trajectories)
+        average_ply = positions / games if games else 0.0
+        max_ply_fraction = sum(trajectory.truncated for trajectory in trajectories) / games if games else 0.0
+        positions_per_second = positions / stats.self_play_s if stats.self_play_s > 0.0 else 0.0
+        wandb.log(
+            {
+                "iteration": iteration,
+                "replay_buffer_size": self.replay.size,
+                "selfplay/games": games,
+                "selfplay/positions": positions,
+                "selfplay/avg_ply": average_ply,
+                "selfplay/max_ply_fraction": max_ply_fraction,
+                "performance/self_play_seconds": stats.self_play_s,
+                "performance/self_play_positions_per_second": positions_per_second,
+                "performance/train_seconds": stats.train_s,
+                "performance/iteration_seconds": stats.total_s,
+                "replay/size": self.replay.size,
+                "replay/beta": self.replay.beta,
+            }
+        )
 
     @staticmethod
     def _stockfish_normalized_score(scores: StockfishEvalScores) -> float:

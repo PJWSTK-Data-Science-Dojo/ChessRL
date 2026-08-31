@@ -252,6 +252,25 @@ class TestLatentSearch:
         assert not any(policy)
         assert value == -1.0
 
+    def test_claimable_draw_by_next_move_short_circuits_initial_inference(self, chess_game: ChessGame) -> None:
+        board = chess.Board()
+        for move in ("g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"):
+            board.push_uci(move)
+        canonical = chess_game.get_canonical_form(board, -1)
+
+        class _NoInference:
+            def predict_with_latent(
+                self,
+                _observation: np.ndarray,
+                _valid: np.ndarray,
+            ) -> Never:
+                raise AssertionError("claimable roots must not call initial inference")
+
+        policy, value = MCTS(chess_game, _NoInference(), MCTSParams()).search_latent(canonical)
+
+        assert not any(policy)
+        assert value == 0.0
+
     def test_mate_in_one_uses_exact_terminal_value_without_recurrent_inference(
         self,
         chess_game: ChessGame,
@@ -271,10 +290,11 @@ class TestLatentSearch:
 class TestBatchedMCTS:
     def test_claimable_draw_root_returns_no_action_without_inference(self, chess_game: ChessGame) -> None:
         board = chess.Board()
-        for move in ("g1f3", "g8f6", "f3g1", "f6g8") * 2:
+        for move in ("g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"):
             board.push_uci(move)
-        assert board.can_claim_threefold_repetition()
-        assert np.count_nonzero(chess_game.get_valid_moves(board, 1)) > 0
+        canonical = chess_game.get_canonical_form(board, -1)
+        assert canonical.can_claim_threefold_repetition()
+        assert np.count_nonzero(chess_game.get_valid_moves(canonical, 1)) > 0
 
         class _NoInference:
             def batched_initial_inference(
@@ -285,7 +305,7 @@ class TestBatchedMCTS:
                 raise AssertionError("terminal roots must not call initial inference")
 
         search = BatchedMCTS(chess_game, _NoInference(), MCTSParams())
-        policy, value, _observation, valid = search.search_batch([board])[0]
+        policy, value, _observation, valid = search.search_batch([canonical])[0]
 
         assert not np.any(policy)
         assert value == 0.0

@@ -9,7 +9,8 @@ from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from copy import deepcopy
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
@@ -49,6 +50,31 @@ class RecurrentBatchResult(NamedTuple):
     next_latent: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class TrainingPhaseProvenance:
+    """Immutable identity of the checkpoint used to start a training phase."""
+
+    source_checkpoint_sha256: str
+    source_trainer_iteration: int
+    source_global_step: int
+
+    def as_config(self) -> dict[str, str | int]:
+        """Return a detached mapping suitable for experiment configuration."""
+        return {
+            "source_checkpoint_sha256": self.source_checkpoint_sha256,
+            "source_trainer_iteration": self.source_trainer_iteration,
+            "source_global_step": self.source_global_step,
+        }
+
+
+class _ValidatedCheckpoint(NamedTuple):
+    state_dict: dict[str, torch.Tensor]
+    global_step: int
+    trainer_iteration: int
+    lr_schedule_total_steps: int
+    training_phase_provenance: TrainingPhaseProvenance | None
+
+
 _InitialInference = Callable[
     [torch.Tensor, torch.Tensor | None],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -65,6 +91,8 @@ _PredictionInference = Callable[
 ]
 _PreparedBatch = tuple[dict[str, np.ndarray], np.ndarray, list[int]]
 _RUNTIME_LEARNER_FIELDS = frozenset({"device", "cuda_device", "compile_inference", "compile_training"})
+_MODEL_LEARNER_FIELDS = frozenset({"num_channels", "support_size", "repr_blocks", "dyn_blocks", "proj_dim"})
+_TRAINING_PHASE_PROVENANCE_FIELD = "training_phase_provenance"
 _MAX_CONSECUTIVE_AMP_SKIPS = 16
 _GRAD_SCALER_FIELDS = frozenset({"scale", "growth_factor", "backoff_factor", "growth_interval", "_growth_tracker"})
 
@@ -279,23 +307,15 @@ class LunaNetwork:
             if self.device.type == "cuda"
             else None
         )
-        self.optimizer = optim.AdamW(
-            self.nnet.parameters(),
-            lr=self._learner.lr,
-            weight_decay=self._learner.weight_decay,
-            fused=self.device.type == "cuda",
-        )
-
-        scaler_backend = "cuda" if self.device.type == "cuda" else "cpu"
-        scaler_enabled = (
-            self._learner.mixed_precision and self.device.type == "cuda" and self._amp_dtype == torch.float16
-        )
-        self.scaler = torch.GradScaler(scaler_backend, enabled=scaler_enabled)
+        self.optimizer = self._new_optimizer()
+        self.scaler = self._new_grad_scaler()
 
         self._global_step = 0
         self._trainer_iteration = 0
         self._lr_schedule_total_steps = 0
+        self._lr_schedule_mismatch_warned = False
         self._loaded_checkpoint_path: Path | None = None
+        self._training_phase_provenance: TrainingPhaseProvenance | None = None
         self._mcts_inference_compiled = False
         self._training_compiled = False
 
@@ -346,6 +366,26 @@ class LunaNetwork:
                 thread_name_prefix="replay-fetch",
             )
 
+    def _new_optimizer(self) -> optim.AdamW:
+        return optim.AdamW(
+            self.nnet.parameters(),
+            lr=self._learner.lr,
+            weight_decay=self._learner.weight_decay,
+            fused=self.device.type == "cuda",
+        )
+
+    def _new_grad_scaler(self) -> torch.GradScaler:
+        scaler_backend = "cuda" if self.device.type == "cuda" else "cpu"
+        scaler_enabled = (
+            self._learner.mixed_precision and self.device.type == "cuda" and self._amp_dtype == torch.float16
+        )
+        return torch.GradScaler(scaler_backend, enabled=scaler_enabled)
+
+    @property
+    def training_phase_provenance(self) -> TrainingPhaseProvenance | None:
+        """Return the immutable source identity for this training phase, if present."""
+        return self._training_phase_provenance
+
     def warmup_mcts_inference(self, game: ChessGame) -> None:
         """Run one initial + one recurrent forward to pay torch.compile warmup cost before self-play."""
         if not self._mcts_inference_compiled:
@@ -373,12 +413,17 @@ class LunaNetwork:
         candidate = requested_total if requested_total > 0 else self._global_step + current_call_steps
         if self._lr_schedule_total_steps == 0:
             self._lr_schedule_total_steps = candidate
-        elif requested_total > 0 and requested_total != self._lr_schedule_total_steps:
+        elif (
+            requested_total > 0
+            and requested_total != self._lr_schedule_total_steps
+            and not self._lr_schedule_mismatch_warned
+        ):
             logger.warning(
                 "Ignoring changed LR horizon {} and preserving checkpoint horizon {} steps.",
                 requested_total,
                 self._lr_schedule_total_steps,
             )
+            self._lr_schedule_mismatch_warned = True
         return self._lr_schedule_total_steps
 
     def _async_batch_prefetch(self, upcoming_steps: int = 0) -> bool:
@@ -1073,8 +1118,12 @@ class LunaNetwork:
                 "observation_shape": [self.board_x, self.board_y, self.board_z],
             },
         }
+        if self._training_phase_provenance is not None:
+            payload[_TRAINING_PHASE_PROVENANCE_FIELD] = self._training_phase_provenance.as_config()
         if extra_state:
-            reserved = payload.keys() & extra_state.keys()
+            reserved_fields = set(payload)
+            reserved_fields.add(_TRAINING_PHASE_PROVENANCE_FIELD)
+            reserved = reserved_fields & extra_state.keys()
             if reserved:
                 raise ValueError(f"extra_state cannot replace reserved checkpoint fields: {sorted(reserved)}")
             payload.update(extra_state)
@@ -1100,10 +1149,85 @@ class LunaNetwork:
         checkpoint = self._read_checkpoint(filepath)
         self._restore_checkpoint(checkpoint, filepath, load_optimizer=load_optimizer)
 
-    @staticmethod
-    def _read_checkpoint(filepath: str | os.PathLike[str]) -> dict[str, Any]:
+    def initialize_training_phase(
+        self,
+        folder: str = "checkpoint",
+        filename: str = "checkpoint.pth.tar",
+    ) -> None:
+        """Load compatible model weights while resetting all learner progress state.
+
+        This is intentionally different from resume: optimizer moments, gradient
+        scaler state, iteration counters, and the LR schedule horizon are not
+        inherited from the source checkpoint.
+        """
+        filepath = os.path.join(folder, filename)
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"No model in path {filepath}")
+        checkpoint, source_checkpoint_sha256 = self._read_checkpoint_with_sha256(filepath)
+        self._validate_phase_model_config(checkpoint, filepath)
+        validated = self._validate_checkpoint_state(checkpoint, filepath)
+        self._validate_phase_state_dict(validated.state_dict, filepath)
+        phase_provenance = TrainingPhaseProvenance(
+            source_checkpoint_sha256=source_checkpoint_sha256,
+            source_trainer_iteration=validated.trainer_iteration,
+            source_global_step=validated.global_step,
+        )
+
+        previous_model = {name: tensor.detach().cpu().clone() for name, tensor in self.nnet.state_dict().items()}
+        previous_optimizer = self.optimizer
+        previous_scaler = self.scaler
+        previous_global_step = self._global_step
+        previous_trainer_iteration = self._trainer_iteration
+        previous_lr_schedule_total_steps = self._lr_schedule_total_steps
+        previous_lr_schedule_mismatch_warned = self._lr_schedule_mismatch_warned
+        previous_loaded_checkpoint_path = self._loaded_checkpoint_path
+        previous_training_phase_provenance = self._training_phase_provenance
+        try:
+            self.nnet.load_state_dict(validated.state_dict, strict=True)
+            self.optimizer = self._new_optimizer()
+            self.scaler = self._new_grad_scaler()
+            self._global_step = 0
+            self._trainer_iteration = 0
+            self._lr_schedule_total_steps = 0
+            self._lr_schedule_mismatch_warned = False
+            self._loaded_checkpoint_path = None
+            self._training_phase_provenance = phase_provenance
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            self.nnet.load_state_dict(previous_model, strict=True)
+            self.optimizer = previous_optimizer
+            self.scaler = previous_scaler
+            self._global_step = previous_global_step
+            self._trainer_iteration = previous_trainer_iteration
+            self._lr_schedule_total_steps = previous_lr_schedule_total_steps
+            self._lr_schedule_mismatch_warned = previous_lr_schedule_mismatch_warned
+            self._loaded_checkpoint_path = previous_loaded_checkpoint_path
+            self._training_phase_provenance = previous_training_phase_provenance
+            raise
+
+    @classmethod
+    def _read_checkpoint(cls, filepath: str | os.PathLike[str]) -> dict[str, Any]:
         """Read one supported checkpoint onto CPU without executing pickled code."""
         checkpoint = torch.load(filepath, map_location="cpu", weights_only=True)
+        return cls._validate_checkpoint_payload(checkpoint, filepath)
+
+    @classmethod
+    def _read_checkpoint_with_sha256(
+        cls,
+        filepath: str | os.PathLike[str],
+    ) -> tuple[dict[str, Any], str]:
+        digest = sha256()
+        with open(filepath, "rb") as checkpoint_stream:
+            while chunk := checkpoint_stream.read(1024 * 1024):
+                digest.update(chunk)
+            checkpoint_stream.seek(0)
+            checkpoint = torch.load(checkpoint_stream, map_location="cpu", weights_only=True)
+        return cls._validate_checkpoint_payload(checkpoint, filepath), digest.hexdigest()
+
+    @staticmethod
+    def _validate_checkpoint_payload(
+        checkpoint: object,
+        filepath: str | os.PathLike[str],
+    ) -> dict[str, Any]:
         if not isinstance(checkpoint, dict):
             raise ValueError(f"Checkpoint payload is not a mapping: {filepath}")
         if checkpoint.get("format_version") != 2:
@@ -1121,7 +1245,7 @@ class LunaNetwork:
         missing = sorted(required - checkpoint.keys())
         if missing:
             raise ValueError(f"Checkpoint is missing required fields {missing}: {filepath}")
-        return checkpoint
+        return cast(dict[str, Any], checkpoint)
 
     @classmethod
     def checkpoint_trainer_iteration(cls, filepath: str | os.PathLike[str]) -> int:
@@ -1135,6 +1259,52 @@ class LunaNetwork:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"Checkpoint field '{name}' must be a non-negative integer: {filepath}")
         return value
+
+    @classmethod
+    def _checkpoint_training_phase_provenance(
+        cls,
+        checkpoint: Mapping[str, Any],
+        filepath: str | os.PathLike[str],
+    ) -> TrainingPhaseProvenance | None:
+        if _TRAINING_PHASE_PROVENANCE_FIELD not in checkpoint:
+            return None
+        raw_provenance = checkpoint[_TRAINING_PHASE_PROVENANCE_FIELD]
+        if not isinstance(raw_provenance, dict) or not all(isinstance(key, str) for key in raw_provenance):
+            raise ValueError(f"Checkpoint training_phase_provenance must be a string-keyed mapping: {filepath}")
+        expected_fields = {
+            "source_checkpoint_sha256",
+            "source_trainer_iteration",
+            "source_global_step",
+        }
+        actual_fields = set(raw_provenance)
+        if actual_fields != expected_fields:
+            missing = sorted(expected_fields - actual_fields)
+            unexpected = sorted(actual_fields - expected_fields)
+            raise ValueError(
+                f"Checkpoint training_phase_provenance fields are invalid: {filepath} "
+                f"(missing={missing}, unexpected={unexpected})."
+            )
+        source_checkpoint_sha256 = raw_provenance["source_checkpoint_sha256"]
+        if (
+            not isinstance(source_checkpoint_sha256, str)
+            or len(source_checkpoint_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in source_checkpoint_sha256)
+        ):
+            raise ValueError(
+                "Checkpoint training_phase_provenance source_checkpoint_sha256 "
+                f"must be 64 lowercase hexadecimal characters: {filepath}"
+            )
+        source_trainer_iteration = cls._checkpoint_counter(
+            raw_provenance,
+            "source_trainer_iteration",
+            filepath,
+        )
+        source_global_step = cls._checkpoint_counter(raw_provenance, "source_global_step", filepath)
+        return TrainingPhaseProvenance(
+            source_checkpoint_sha256=source_checkpoint_sha256,
+            source_trainer_iteration=source_trainer_iteration,
+            source_global_step=source_global_step,
+        )
 
     @staticmethod
     def _checkpoint_learner_config(checkpoint: Mapping[str, Any], filepath: str | os.PathLike[str]) -> dict[str, Any]:
@@ -1161,6 +1331,36 @@ class LunaNetwork:
         if mismatched:
             raise ValueError(f"Checkpoint learner configuration differs in fields {mismatched}: {filepath}")
 
+    def _validate_phase_model_config(
+        self,
+        checkpoint: Mapping[str, Any],
+        filepath: str | os.PathLike[str],
+    ) -> None:
+        stored = self._checkpoint_learner_config(checkpoint, filepath)
+        current = asdict(self._learner)
+        mismatched = sorted(name for name in _MODEL_LEARNER_FIELDS if stored[name] != current[name])
+        if mismatched:
+            raise ValueError(f"Checkpoint model configuration differs in fields {mismatched}: {filepath}")
+
+    def _validate_phase_state_dict(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        filepath: str | os.PathLike[str],
+    ) -> None:
+        expected = self.nnet.state_dict()
+        missing = sorted(expected.keys() - state_dict.keys())
+        unexpected = sorted(state_dict.keys() - expected.keys())
+        incompatible = sorted(
+            name
+            for name in expected.keys() & state_dict.keys()
+            if expected[name].shape != state_dict[name].shape or expected[name].dtype != state_dict[name].dtype
+        )
+        if missing or unexpected or incompatible:
+            raise ValueError(
+                f"Checkpoint model state does not strictly match the configured network: {filepath} "
+                f"(missing={missing}, unexpected={unexpected}, incompatible={incompatible})."
+            )
+
     def _restore_training_state(self, checkpoint: Mapping[str, Any], filepath: str | os.PathLike[str]) -> None:
         optimizer_state = checkpoint["optimizer"]
         scaler_state = checkpoint["scaler"]
@@ -1170,20 +1370,18 @@ class LunaNetwork:
         except (KeyError, RuntimeError, ValueError) as exc:
             raise RuntimeError(f"Checkpoint training state is incompatible: {filepath}") from exc
 
-    def _restore_checkpoint(
+    def _validate_checkpoint_state(
         self,
-        checkpoint: dict[str, Any],
+        checkpoint: Mapping[str, Any],
         filepath: str | os.PathLike[str],
-        *,
-        load_optimizer: bool,
-    ) -> None:
-        """Validate and restore an already-read format-v2 checkpoint."""
-        self._validate_learner_config(checkpoint, filepath)
+    ) -> _ValidatedCheckpoint:
         global_step = self._checkpoint_counter(checkpoint, "global_step", filepath)
         trainer_iteration = self._checkpoint_counter(checkpoint, "trainer_iteration", filepath)
         lr_schedule_total_steps = self._checkpoint_counter(checkpoint, "lr_schedule_total_steps", filepath)
+        training_phase_provenance = self._checkpoint_training_phase_provenance(checkpoint, filepath)
         if not isinstance(checkpoint["optimizer"], dict) or not isinstance(checkpoint["scaler"], dict):
             raise ValueError(f"Checkpoint optimizer and scaler states must be mappings: {filepath}")
+
         model_spec = checkpoint.get("model_spec")
         expected_shape = [self.board_x, self.board_y, self.board_z]
         if not isinstance(model_spec, dict):
@@ -1204,6 +1402,24 @@ class LunaNetwork:
         _validate_finite_state(checkpoint["optimizer"], "checkpoint.optimizer")
         _validate_finite_state(checkpoint["scaler"], "checkpoint.scaler")
         _validate_grad_scaler_state(checkpoint["scaler"])
+        return _ValidatedCheckpoint(
+            state_dict,
+            global_step,
+            trainer_iteration,
+            lr_schedule_total_steps,
+            training_phase_provenance,
+        )
+
+    def _restore_checkpoint(
+        self,
+        checkpoint: dict[str, Any],
+        filepath: str | os.PathLike[str],
+        *,
+        load_optimizer: bool,
+    ) -> None:
+        """Validate and restore an already-read format-v2 checkpoint."""
+        self._validate_learner_config(checkpoint, filepath)
+        validated = self._validate_checkpoint_state(checkpoint, filepath)
         previous_model = {name: tensor.detach().cpu().clone() for name, tensor in self.nnet.state_dict().items()}
         previous_optimizer = _clone_state_to_cpu(self.optimizer.state_dict()) if load_optimizer else None
         previous_scaler = deepcopy(self.scaler.state_dict()) if load_optimizer else None
@@ -1211,9 +1427,10 @@ class LunaNetwork:
         previous_trainer_iteration = self._trainer_iteration
         previous_lr_schedule_total_steps = self._lr_schedule_total_steps
         previous_loaded_checkpoint_path = self._loaded_checkpoint_path
+        previous_training_phase_provenance = self._training_phase_provenance
         try:
             try:
-                self.nnet.load_state_dict(state_dict, strict=True)
+                self.nnet.load_state_dict(validated.state_dict, strict=True)
             except RuntimeError as exc:
                 raise RuntimeError(
                     f"Checkpoint architecture does not match the configured network: {filepath}. "
@@ -1221,10 +1438,11 @@ class LunaNetwork:
                 ) from exc
             if load_optimizer:
                 self._restore_training_state(checkpoint, filepath)
-            self._global_step = global_step
-            self._trainer_iteration = trainer_iteration
-            self._lr_schedule_total_steps = lr_schedule_total_steps
+            self._global_step = validated.global_step
+            self._trainer_iteration = validated.trainer_iteration
+            self._lr_schedule_total_steps = validated.lr_schedule_total_steps
             self._loaded_checkpoint_path = Path(filepath).expanduser().resolve()
+            self._training_phase_provenance = validated.training_phase_provenance
         except (KeyError, RuntimeError, TypeError, ValueError) as restore_error:
             self.nnet.load_state_dict(previous_model, strict=True)
             if load_optimizer:
@@ -1236,6 +1454,7 @@ class LunaNetwork:
             self._trainer_iteration = previous_trainer_iteration
             self._lr_schedule_total_steps = previous_lr_schedule_total_steps
             self._loaded_checkpoint_path = previous_loaded_checkpoint_path
+            self._training_phase_provenance = previous_training_phase_provenance
             raise
 
     @staticmethod

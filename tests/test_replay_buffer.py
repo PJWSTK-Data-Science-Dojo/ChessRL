@@ -1,5 +1,7 @@
 """Tests for prioritized replay buffer."""
 
+import pickle
+
 import numpy as np
 import pytest
 
@@ -46,6 +48,37 @@ class TestPrioritizedReplayBuffer:
         batch, _, _ = buf.sample(batch_size=10, unroll_steps=3)
         for t, pos in batch:
             assert 0 <= pos < t.game_length
+
+    def test_beta_annealing_reaches_one_and_stays_capped(self, make_trajectory: TrajectoryFactory) -> None:
+        buf = PrioritizedReplayBuffer(capacity=8, beta=0.4)
+        buf.save_trajectory(make_trajectory(length=2))
+        buf.configure_beta_annealing(expected_sample_calls=3)
+
+        observed = []
+        for _ in range(4):
+            buf.sample(batch_size=1, unroll_steps=0)
+            observed.append(buf.beta)
+
+        assert observed == pytest.approx([0.6, 0.8, 1.0, 1.0])
+
+    @pytest.mark.parametrize("sample_calls", [0, -1, True, 1.5])
+    def test_beta_annealing_rejects_invalid_sample_counts(self, sample_calls: int) -> None:
+        buf = PrioritizedReplayBuffer(capacity=8)
+
+        with pytest.raises(ValueError, match="positive integer"):
+            buf.configure_beta_annealing(sample_calls)
+
+    def test_trajectory_truncation_marker_defaults_false_and_survives_ipc_pickle(
+        self,
+        make_trajectory: TrajectoryFactory,
+    ) -> None:
+        complete = make_trajectory(length=1)
+        truncated = make_trajectory(length=1, truncated=True)
+
+        restored = pickle.loads(pickle.dumps(truncated))
+
+        assert complete.truncated is False
+        assert restored.truncated is True
 
     def test_invalid_inputs_fail_fast(self, make_trajectory: TrajectoryFactory) -> None:
         with pytest.raises(ValueError, match="capacity"):

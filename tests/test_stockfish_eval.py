@@ -14,6 +14,7 @@ from luna.game.stockfish_eval import (
     StockfishEvalSkipped,
     _score_game_for_model,
     _StockfishException,
+    _wandb_metrics,
     run_stockfish_eval,
     validate_stockfish_configuration,
 )
@@ -165,6 +166,22 @@ def test_evaluation_mcts_params_matches_run() -> None:
 def test_scores_dataclass_fields() -> None:
     s = StockfishEvalScores(model_wins=2, draws=1, stockfish_wins=7)
     assert s.model_wins == 2 and s.draws == 1 and s.stockfish_wins == 7
+
+
+def test_wandb_metrics_use_named_players_and_draw_aware_score() -> None:
+    scores = StockfishEvalScores(model_wins=2, draws=2, stockfish_wins=4)
+
+    metrics = _wandb_metrics(scores, iteration=25)
+
+    assert metrics == {
+        "stockfish/luna_wins": 2,
+        "stockfish/draws": 2,
+        "stockfish/stockfish_wins": 4,
+        "stockfish/win_rate": 0.25,
+        "stockfish/score": 0.375,
+        "stockfish/opening_suite_version": 1,
+        "iteration": 25,
+    }
 
 
 def test_stockfish_player_configures_engine_and_forwards_new_game() -> None:

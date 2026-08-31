@@ -10,9 +10,31 @@ import tyro
 from loguru import logger
 
 from luna.coach import Coach, validate_fresh_checkpoint_target, validate_resume_checkpoint_target
-from luna.config import TrainCliConfig, validate_training_configuration
+from luna.config import (
+    TrainCliConfig,
+    validate_training_configuration,
+    validate_wandb_resume,
+    validate_wandb_run_id,
+)
 from luna.game.chess_game import ChessGame as Game
 from luna.network import LunaNetwork
+
+
+def validate_new_training_phase_target(checkpoint_dir: str) -> None:
+    """Require a dedicated empty directory for a weights-only training phase."""
+    if not checkpoint_dir.strip():
+        raise ValueError("new_training_phase requires a non-empty --run.checkpoint directory")
+    target = Path(checkpoint_dir).expanduser().resolve()
+    if not target.exists():
+        return
+    if not target.is_dir():
+        raise FileExistsError(f"New training phase target is not a directory: {target}")
+    contents = sorted(path.name for path in target.iterdir())
+    if contents:
+        raise FileExistsError(
+            f"New training phase requires an empty checkpoint directory, but {target} contains {contents}. "
+            "Choose a new --run.checkpoint directory."
+        )
 
 
 def main() -> int:
@@ -28,12 +50,20 @@ def main() -> int:
     learner.discount = run_cfg.discount
     try:
         validate_training_configuration(run_cfg, learner)
+        validate_wandb_run_id(cfg.wandb_run_id)
+        validate_wandb_resume(cfg.wandb_resume)
+        if cfg.load_model and cfg.new_training_phase:
+            raise ValueError("--load-model and --new-training-phase are mutually exclusive")
+        source_checkpoint = Path(cfg.load_checkpoint_dir) / cfg.load_checkpoint_file
         if cfg.load_model:
-            source_checkpoint = Path(cfg.load_checkpoint_dir) / cfg.load_checkpoint_file
             validate_resume_checkpoint_target(run_cfg, source_checkpoint)
+        elif cfg.new_training_phase:
+            if not source_checkpoint.expanduser().is_file():
+                raise FileNotFoundError(f"No model in path {source_checkpoint.expanduser().resolve()}")
+            validate_new_training_phase_target(run_cfg.checkpoint)
         else:
             validate_fresh_checkpoint_target(run_cfg)
-    except (FileExistsError, ValueError) as exc:
+    except (FileExistsError, FileNotFoundError, ValueError) as exc:
         logger.error("Invalid training setup: {}", exc)
         return 2
 
@@ -57,6 +87,14 @@ def main() -> int:
             cfg.load_checkpoint_file,
         )
         nnet.load_checkpoint(cfg.load_checkpoint_dir, cfg.load_checkpoint_file)
+    elif cfg.new_training_phase:
+        logger.info(
+            'Starting a new training phase from weights in "{}" / "{}"; '
+            "optimizer, scaler, counters, and LR schedule will start fresh.",
+            cfg.load_checkpoint_dir,
+            cfg.load_checkpoint_file,
+        )
+        nnet.initialize_training_phase(cfg.load_checkpoint_dir, cfg.load_checkpoint_file)
     else:
         logger.info("Starting a new run from randomly initialized weights.")
 
@@ -75,7 +113,15 @@ def main() -> int:
         )
 
     logger.info("Loading the Coach...")
-    c = Coach(game, nnet, run_cfg, wandb_project=cfg.wandb_project, seed=cfg.seed)
+    c = Coach(
+        game,
+        nnet,
+        run_cfg,
+        wandb_project=cfg.wandb_project,
+        wandb_run_id=cfg.wandb_run_id,
+        wandb_resume=cfg.wandb_resume,
+        seed=cfg.seed,
+    )
 
     logger.info("Starting EfficientZeroV2 learning process")
     c.learn()
