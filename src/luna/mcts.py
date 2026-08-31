@@ -458,7 +458,7 @@ class MCTS:
             q_sum[idx] = child.value_sum
 
         total_visits = counts.sum()
-        root_value = float(q_sum.sum() / max(total_visits, 1))
+        root_value = float(root.raw_value if total_visits == 0 else q_sum.sum() / total_visits)
 
         if self.params.search_mode == "gumbel":
             if gumbel_state is None:
@@ -653,18 +653,27 @@ class BatchedMCTS:
             t0 = time.perf_counter()
 
         active_indices = [i for i, outcome in enumerate(root_outcomes) if outcome is None]
-        policies_np = np.zeros((N, action_size), dtype=np.float32)
-        root_predictions = np.zeros(N, dtype=np.float32)
         root_latents: list[torch.Tensor | None] = [None] * N
-        if active_indices:
+        if len(active_indices) == N:
             active_policies, active_predictions, active_latents = self.nnet.batched_initial_inference(
-                obs_batch[active_indices],
-                valid_batch[active_indices],
+                obs_batch,
+                valid_batch,
             )
-            for batch_index, root_index in enumerate(active_indices):
-                policies_np[root_index] = active_policies[batch_index]
-                root_predictions[root_index] = float(np.asarray(active_predictions[batch_index]).item())
-                root_latents[root_index] = active_latents[batch_index : batch_index + 1]
+            policies_np = np.asarray(active_policies, dtype=np.float32)
+            root_predictions = np.asarray(active_predictions, dtype=np.float32).reshape(N)
+            root_latents = [active_latents[index : index + 1] for index in range(N)]
+        else:
+            policies_np = np.zeros((N, action_size), dtype=np.float32)
+            root_predictions = np.zeros(N, dtype=np.float32)
+            if active_indices:
+                active_policies, active_predictions, active_latents = self.nnet.batched_initial_inference(
+                    obs_batch[active_indices],
+                    valid_batch[active_indices],
+                )
+                for batch_index, root_index in enumerate(active_indices):
+                    policies_np[root_index] = active_policies[batch_index]
+                    root_predictions[root_index] = float(np.asarray(active_predictions[batch_index]).item())
+                    root_latents[root_index] = active_latents[batch_index : batch_index + 1]
 
         if tm is not None:
             tm.initial_inf_s += time.perf_counter() - t0
@@ -754,7 +763,7 @@ class BatchedMCTS:
                 continue
 
             if tm is not None:
-                t_rec = time.perf_counter()
+                t_expand = time.perf_counter()
 
             child_boards_list: list[chess.Board | None] = []
             valid_masks_list: list[np.ndarray | None] = []
@@ -781,6 +790,9 @@ class BatchedMCTS:
                     terminal_values.append(None)
 
             inference_indices = [j for j, terminal_value in enumerate(terminal_values) if terminal_value is None]
+            if tm is not None:
+                tm.expand_backup_s += time.perf_counter() - t_expand
+                t_rec = time.perf_counter()
             rb = None
             if inference_indices:
                 batched_latent = torch.cat([parent_latents[j] for j in inference_indices], dim=0)

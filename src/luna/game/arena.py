@@ -1,6 +1,7 @@
 """Arena where 2 players fight against each other."""
 
 from collections.abc import Callable
+from operator import index
 from typing import Any
 
 import chess
@@ -55,11 +56,17 @@ class Arena:
                 logger.info("Turn {} Player {}", turn_count, current_player)
                 self.display(board)
             canonical_board = self.game.get_canonical_form(board, current_player)
-            action = players[current_player](canonical_board)
+            raw_action = players[current_player](canonical_board)
+            if isinstance(raw_action, bool):
+                raise ValueError(f"Player returned a non-integer action: {raw_action!r}")
+            try:
+                action = index(raw_action)
+            except TypeError as exc:
+                raise ValueError(f"Player returned a non-integer action: {raw_action!r}") from exc
 
             valids = self.game.get_valid_moves(canonical_board, 1)
 
-            if valids[action] == 0:
+            if not 0 <= action < len(valids) or valids[action] == 0:
                 logger.error("Action {} is not valid!", action)
                 logger.debug("valids = {}", valids)
                 raise ValueError(f"Action {action} is not valid")
@@ -102,15 +109,15 @@ class Arena:
                 draws += 1
 
         self.player1, self.player2 = self.player2, self.player1
-
-        for _ in tqdm(range(num - half), desc="Arena.play_games (2)"):
-            classification = self._classify_result(self.play_game(verbose=verbose))
-            if classification == -1:
-                player_one_wins += 1
-            elif classification == 1:
-                player_two_wins += 1
-            else:
-                draws += 1
-
-        self.player1, self.player2 = self.player2, self.player1
+        try:
+            for _ in tqdm(range(num - half), desc="Arena.play_games (2)"):
+                classification = self._classify_result(self.play_game(verbose=verbose))
+                if classification == -1:
+                    player_one_wins += 1
+                elif classification == 1:
+                    player_two_wins += 1
+                else:
+                    draws += 1
+        finally:
+            self.player1, self.player2 = self.player2, self.player1
         return player_one_wins, player_two_wins, draws

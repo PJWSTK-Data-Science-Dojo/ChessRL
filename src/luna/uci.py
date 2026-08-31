@@ -7,6 +7,7 @@ compatible with desktop chess GUIs and the community ``lichess-bot`` bridge.
 from __future__ import annotations
 
 import argparse
+import math
 import shlex
 import sys
 import threading
@@ -26,6 +27,19 @@ from luna.network import LunaNetwork
 
 _TIMED_GO_KEYS = frozenset({"movetime", "wtime", "btime", "winc", "binc", "movestogo"})
 _CLOCK_SAFETY_MS = 25
+_MAX_UCI_INTEGER = (1 << 63) - 1
+MAX_MCTS_SIMULATIONS = 4096
+MAX_MINIMUM_SIMULATIONS = 512
+
+
+def _bounded_simulations(value: int, maximum: int) -> int:
+    return min(maximum, max(1, value))
+
+
+def _validated_simulation_time(value: float) -> float:
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("estimated simulation time must be finite and positive")
+    return max(0.1, value)
 
 
 @dataclass
@@ -35,6 +49,14 @@ class UciOptions:
     mcts_simulations: int
     minimum_simulations: int = 8
     estimated_simulation_ms: float = 4.0
+
+    def __post_init__(self) -> None:
+        self.mcts_simulations = _bounded_simulations(self.mcts_simulations, MAX_MCTS_SIMULATIONS)
+        self.minimum_simulations = min(
+            self.mcts_simulations,
+            _bounded_simulations(self.minimum_simulations, MAX_MINIMUM_SIMULATIONS),
+        )
+        self.estimated_simulation_ms = _validated_simulation_time(self.estimated_simulation_ms)
 
 
 @dataclass(frozen=True)
@@ -89,13 +111,17 @@ class LunaUciEngine:
     def _go_values(go_tokens: list[str]) -> dict[str, int]:
         values: dict[str, int] = {}
         for index, token in enumerate(go_tokens):
-            if token in _TIMED_GO_KEYS or token == "nodes":
+            key = token.lower()
+            if key in _TIMED_GO_KEYS or key == "nodes":
                 if index + 1 >= len(go_tokens):
-                    raise ValueError(f"go {token} requires an integer value")
+                    raise ValueError(f"go {key} requires an integer value")
                 try:
-                    values[token] = int(go_tokens[index + 1])
+                    value = int(go_tokens[index + 1])
                 except ValueError as exc:
-                    raise ValueError(f"go {token} requires an integer value") from exc
+                    raise ValueError(f"go {key} requires an integer value") from exc
+                if abs(value) > _MAX_UCI_INTEGER:
+                    raise ValueError(f"go {key} exceeds the supported 64-bit integer range")
+                values[key] = value
         return values
 
     def _allocated_time_ms(self, values: dict[str, int]) -> int | None:
@@ -168,7 +194,7 @@ class LunaUciEngine:
             "infinite",
         }
         try:
-            start = go_tokens.index("searchmoves") + 1
+            start = [token.lower() for token in go_tokens].index("searchmoves") + 1
         except ValueError:
             return None
 
@@ -295,7 +321,7 @@ class LunaUciEngine:
         name = " ".join(tokens[name_at:value_at]).strip().lower()
         value = " ".join(tokens[value_at + 1 :]).strip()
         if name == "mcts simulations":
-            self.options.mcts_simulations = max(1, int(value))
+            self.options.mcts_simulations = _bounded_simulations(int(value), MAX_MCTS_SIMULATIONS)
             self.options.minimum_simulations = min(
                 self.options.minimum_simulations,
                 self.options.mcts_simulations,
@@ -303,10 +329,10 @@ class LunaUciEngine:
         elif name == "minimum simulations":
             self.options.minimum_simulations = min(
                 self.options.mcts_simulations,
-                max(1, int(value)),
+                _bounded_simulations(int(value), MAX_MINIMUM_SIMULATIONS),
             )
         elif name == "estimated simulation ms":
-            self.options.estimated_simulation_ms = max(0.1, float(value))
+            self.options.estimated_simulation_ms = _validated_simulation_time(float(value))
 
     def run(self) -> None:
         for raw_line in sys.stdin:
@@ -320,10 +346,12 @@ class LunaUciEngine:
                     self.send("id name Luna ChessRL")
                     self.send("id author ChessRL contributors")
                     self.send(
-                        f"option name MCTS Simulations type spin default {self.options.mcts_simulations} min 1 max 4096"
+                        "option name MCTS Simulations type spin "
+                        f"default {self.options.mcts_simulations} min 1 max {MAX_MCTS_SIMULATIONS}"
                     )
                     self.send(
-                        f"option name Minimum Simulations type spin default {self.options.minimum_simulations} min 1 max 512"
+                        "option name Minimum Simulations type spin "
+                        f"default {self.options.minimum_simulations} min 1 max {MAX_MINIMUM_SIMULATIONS}"
                     )
                     self.send(
                         "option name Estimated Simulation ms type string "
@@ -375,6 +403,15 @@ def main() -> int:
     torch.set_float32_matmul_precision("medium")
     game = ChessGame(claim_draw=False)
     try:
+        options = UciOptions(
+            mcts_simulations=args.mcts_sims,
+            minimum_simulations=args.minimum_sims,
+            estimated_simulation_ms=args.estimated_sim_ms,
+        )
+    except ValueError as exc:
+        logger.error("Invalid UCI search options: {}", exc)
+        return 2
+    try:
         network = LunaNetwork.from_checkpoint(
             game,
             args.checkpoint,
@@ -388,11 +425,7 @@ def main() -> int:
         return 2
     engine = LunaUciEngine(
         network,
-        UciOptions(
-            mcts_simulations=max(1, args.mcts_sims),
-            minimum_simulations=max(1, args.minimum_sims),
-            estimated_simulation_ms=max(0.1, args.estimated_sim_ms),
-        ),
+        options,
     )
     engine.run()
     return 0

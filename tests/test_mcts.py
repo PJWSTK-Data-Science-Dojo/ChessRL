@@ -20,6 +20,7 @@ from luna.mcts import (
     _LatentNode,
 )
 from luna.network import LunaNetwork, RecurrentBatchResult
+from luna.profiling import SelfPlayMCTSTimings
 
 
 def _root_with_priors(priors: list[float], actions: list[int] | None = None) -> _LatentNode:
@@ -286,6 +287,42 @@ class TestLatentSearch:
         assert value == 1.0
         assert network.recurrent_calls == 0
 
+    @pytest.mark.parametrize("search_mode", ["gumbel", "puct"])
+    def test_immediate_stop_uses_root_prediction(
+        self,
+        chess_game: ChessGame,
+        search_mode: str,
+    ) -> None:
+        board = chess_game.get_init_board()
+        preferred_action = move_to_action(chess.Move.from_uci("e2e4"))
+
+        class _RootOnlyNetwork(_MateInOneNetwork):
+            def predict_with_latent(
+                self,
+                _observation: np.ndarray,
+                _valid: np.ndarray,
+            ) -> tuple[np.ndarray, float, torch.Tensor]:
+                return self._policy()[0], 0.625, torch.zeros((1, 1, 1, 1))
+
+        network = _RootOnlyNetwork(chess_game.get_action_size(), preferred_action)
+        search = MCTS(
+            chess_game,
+            network,
+            MCTSParams(num_mcts_sims=8, search_mode=search_mode, dir_noise=False),
+        )
+
+        policy, root_value = search.search_latent(
+            board,
+            temp=0.0,
+            add_exploration_noise=False,
+            should_stop=lambda: True,
+        )
+
+        assert search.last_simulations == 0
+        assert search.last_action == preferred_action
+        assert int(np.argmax(policy)) == preferred_action
+        assert root_value == pytest.approx(0.625)
+
 
 class TestBatchedMCTS:
     def test_claimable_draw_root_returns_no_action_without_inference(self, chess_game: ChessGame) -> None:
@@ -516,6 +553,53 @@ class TestBatchedMCTS:
                 temp=1,
                 add_exploration_noise=[True],
             )
+
+    def test_profile_separates_rule_expansion_from_recurrent_inference(
+        self,
+        chess_game: ChessGame,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        preferred_action = move_to_action(chess.Move.from_uci("e2e4"))
+        network = _MateInOneNetwork(chess_game.get_action_size(), preferred_action)
+        timings = SelfPlayMCTSTimings()
+        clock = 0.0
+        original_next_state = chess_game.get_next_search_state
+        original_recurrent = network.batched_recurrent_inference
+
+        def timed_next_state(board: chess.Board, player: int, action: int) -> tuple[chess.Board, int]:
+            nonlocal clock
+            clock += 3.0
+            return original_next_state(board, player, action)
+
+        def timed_recurrent(
+            latents: torch.Tensor,
+            actions: list[int],
+            *,
+            valid_masks: list[np.ndarray | None],
+            policy_topk: int | None,
+        ) -> RecurrentBatchResult:
+            nonlocal clock
+            clock += 5.0
+            return original_recurrent(
+                latents,
+                actions,
+                valid_masks=valid_masks,
+                policy_topk=policy_topk,
+            )
+
+        monkeypatch.setattr("luna.mcts.time.perf_counter", lambda: clock)
+        monkeypatch.setattr(chess_game, "get_next_search_state", timed_next_state)
+        monkeypatch.setattr(network, "batched_recurrent_inference", timed_recurrent)
+
+        BatchedMCTS(
+            chess_game,
+            network,
+            MCTSParams(num_mcts_sims=1, gumbel_max_considered_actions=1),
+            timings=timings,
+        ).search_batch([chess_game.get_init_board()], num_sims=1)
+
+        assert timings.expand_backup_s == pytest.approx(3.0)
+        assert timings.recurrent_inf_s == pytest.approx(5.0)
 
 
 class TestGumbelMuZero:

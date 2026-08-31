@@ -195,6 +195,8 @@ def run_stockfish_eval(
         return StockfishEvalSkipped("no_engine", str(exc))
 
     mw = dr = sw = 0
+    runtime_failure: StockfishEvalSkipped | None = None
+    close_failure: str | None = None
     try:
         for opening in openings:
             for model_is_p1 in (True, False):
@@ -213,9 +215,20 @@ def run_stockfish_eval(
                     dr += 1
     except (OSError, ValueError, RuntimeError, _StockfishException) as exc:
         logger.exception("Stockfish eval aborted during games")
-        return StockfishEvalSkipped("runtime_error", str(exc))
+        runtime_failure = StockfishEvalSkipped("runtime_error", str(exc))
     finally:
-        sf.close()
+        try:
+            sf.close()
+        except (OSError, ValueError, RuntimeError, _StockfishException) as exc:
+            close_failure = str(exc)
+
+    if runtime_failure is not None:
+        if close_failure is not None:
+            logger.warning("Stockfish cleanup also failed after the benchmark error: {}", close_failure)
+        return runtime_failure
+    if close_failure is not None:
+        logger.error("Stockfish eval cleanup failed: {}", close_failure)
+        return StockfishEvalSkipped("runtime_error", f"failed to close Stockfish: {close_failure}")
 
     scores = StockfishEvalScores(model_wins=mw, draws=dr, stockfish_wins=sw)
     iter_suffix = f" (iter {iteration})" if iteration is not None else ""

@@ -9,6 +9,10 @@ from threading import RLock
 
 import numpy as np
 
+from luna.game.chess_game import ACTION_SIZE, OBS_PLANES
+
+_POLICY_SUM_ATOL = 5e-3
+
 
 class Trajectory:
     """One self-play game trajectory with contiguous array storage."""
@@ -34,30 +38,67 @@ class Trajectory:
         valids: list[np.ndarray] | np.ndarray,
         truncated: bool = False,
     ) -> None:
+        raw_actions = np.asarray(actions)
+        if raw_actions.ndim != 1 or raw_actions.size == 0:
+            raise ValueError("A trajectory must contain at least one one-dimensional action sequence")
+        if raw_actions.dtype.kind not in {"i", "u"}:
+            raise ValueError("Trajectory actions must be integers")
+        if np.any(raw_actions < 0) or np.any(raw_actions >= ACTION_SIZE):
+            raise ValueError(f"Trajectory actions must be in [0, {ACTION_SIZE})")
+
         observations_array = np.ascontiguousarray(observations, dtype=np.float16)
-        actions_array = np.asarray(actions, dtype=np.int64)
+        actions_array = raw_actions.astype(np.int64, copy=False)
         rewards_array = np.asarray(rewards, dtype=np.float32)
         policies_array = np.ascontiguousarray(root_policies, dtype=np.float16)
         values_array = np.asarray(root_values, dtype=np.float32)
-        valids_array = np.ascontiguousarray(valids, dtype=np.bool_)
+        raw_valids = np.asarray(valids)
 
-        if actions_array.ndim != 1 or actions_array.size == 0:
-            raise ValueError("A trajectory must contain at least one one-dimensional action sequence")
         game_length = int(actions_array.shape[0])
         named_lengths = {
             "observations": len(observations_array),
             "rewards": len(rewards_array),
             "root_policies": len(policies_array),
             "root_values": len(values_array),
-            "valids": len(valids_array),
+            "valids": len(raw_valids),
         }
         mismatched = {name: length for name, length in named_lengths.items() if length != game_length}
         if mismatched:
             raise ValueError(f"Trajectory fields must all have length {game_length}; got {mismatched}")
-        if policies_array.ndim != 2 or valids_array.ndim != 2 or policies_array.shape != valids_array.shape:
-            raise ValueError("root_policies and valids must be matching two-dimensional arrays")
+        expected_observation_shape = (game_length, 8, 8, OBS_PLANES)
+        if observations_array.shape != expected_observation_shape:
+            raise ValueError(
+                f"Trajectory observations must have shape {expected_observation_shape}, got {observations_array.shape}"
+            )
+        expected_policy_shape = (game_length, ACTION_SIZE)
+        if policies_array.shape != expected_policy_shape or raw_valids.shape != expected_policy_shape:
+            raise ValueError(
+                f"Trajectory root_policies and valids must have shape {expected_policy_shape}; "
+                f"got {policies_array.shape} and {raw_valids.shape}"
+            )
+        if rewards_array.ndim != 1 or values_array.ndim != 1:
+            raise ValueError("Trajectory rewards and root values must be one-dimensional")
+        if not np.isfinite(observations_array).all():
+            raise ValueError("Trajectory observations must be finite")
         if not np.isfinite(rewards_array).all() or not np.isfinite(values_array).all():
             raise ValueError("Trajectory rewards and root values must be finite")
+        if not np.isfinite(policies_array).all() or np.any(policies_array < 0):
+            raise ValueError("Trajectory root policies must be finite and non-negative")
+        if raw_valids.dtype.kind not in {"b", "i", "u", "f"}:
+            raise ValueError("Trajectory valid masks must contain numeric zero/one values")
+        if not np.isfinite(raw_valids).all() or not np.all((raw_valids == 0) | (raw_valids == 1)):
+            raise ValueError("Trajectory valid masks must contain only finite zero/one values")
+        valids_array = np.ascontiguousarray(raw_valids, dtype=np.bool_)
+        if not np.all(valids_array.any(axis=1)):
+            raise ValueError("Every trajectory position must contain at least one legal action")
+        if not np.all(valids_array[np.arange(game_length), actions_array]):
+            raise ValueError("Every trajectory action must be legal in its stored position")
+        if np.any(policies_array[~valids_array] != 0):
+            raise ValueError("Trajectory root policies must assign zero probability to illegal actions")
+        policy_sums = policies_array.astype(np.float32).sum(axis=1)
+        if not np.allclose(policy_sums, 1.0, rtol=0.0, atol=_POLICY_SUM_ATOL):
+            raise ValueError("Every trajectory root policy must sum to one")
+        if not isinstance(truncated, bool | np.bool_):
+            raise ValueError("truncated must be a boolean")
 
         self.observations = observations_array
         self.actions = actions_array
@@ -66,7 +107,7 @@ class Trajectory:
         self.root_values = values_array
         self.valids = valids_array
         self.game_length = game_length
-        self.truncated = truncated
+        self.truncated = bool(truncated)
 
 
 class _SumTree:
@@ -200,15 +241,29 @@ class PrioritizedReplayBuffer:
 
     def update_priorities(self, indices: list[int], td_errors: np.ndarray) -> None:
         """Update priorities based on absolute TD errors."""
-        if len(indices) != len(td_errors):
+        errors = np.asarray(td_errors)
+        if errors.ndim != 1:
+            raise ValueError("td_errors must be one-dimensional")
+        if len(indices) != len(errors):
             raise ValueError("indices and td_errors must have the same length")
         with self._lock:
-            for idx, err in zip(indices, td_errors):
-                if not 0 <= idx < self.capacity:
+            raw_priorities: dict[int, float] = {}
+            for idx, err in zip(indices, errors):
+                if (
+                    isinstance(idx, bool | np.bool_)
+                    or not isinstance(idx, int | np.integer)
+                    or not 0 <= idx < self.capacity
+                ):
                     raise IndexError(f"Replay index out of range: {idx}")
+                normalized_idx = int(idx)
+                if self._tree.data[normalized_idx] is None:
+                    raise IndexError(f"Replay index is not active: {normalized_idx}")
                 if not np.isfinite(err):
                     raise ValueError("TD errors must be finite")
                 raw_priority = abs(float(err)) + 1e-6
+                raw_priorities[normalized_idx] = max(raw_priorities.get(normalized_idx, 0.0), raw_priority)
+
+            for idx, raw_priority in raw_priorities.items():
                 priority = raw_priority**self.alpha
                 self._max_priority = max(self._max_priority, raw_priority)
                 self._tree.update(idx, priority)

@@ -77,7 +77,13 @@ def test_human_game_reply_and_undo_are_transactional() -> None:
 
     undone = client.post(f"/api/v1/games/{game_id}/undo", json={"revision": 2})
     assert undone.status_code == 200
-    assert undone.get_json()["data"]["history"] == []
+    undone_state = undone.get_json()["data"]
+    assert undone_state["history"] == []
+    assert undone_state["revision"] == 3
+
+    stale = client.post(f"/api/v1/games/{game_id}/moves", json={"move": "e2e4", "revision": 0})
+    assert stale.status_code == 409
+    assert stale.get_json()["error"]["details"] == {"current_revision": 3}
 
 
 def test_games_are_isolated_by_browser_session() -> None:
@@ -117,6 +123,7 @@ def test_selfplay_and_structured_validation_errors() -> None:
     step = client.post(f"/api/v1/games/{game_id}/engine-move", json={"revision": 0})
     assert step.status_code == 200
     assert len(step.get_json()["data"]["history"]) == 1
+    assert step.get_json()["data"]["revision"] == 1
 
     invalid = client.post("/api/v1/games", json={"mode": "arcade"})
     assert invalid.status_code == 422

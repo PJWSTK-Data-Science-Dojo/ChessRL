@@ -257,6 +257,45 @@ def test_accumulation_samples_one_configured_batch_per_optimizer_step(
     assert requested_batch_sizes == [4, 4]
 
 
+def test_accumulation_updates_duplicate_replay_index_atomically_with_largest_error(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.batch_size = 2
+    small_learner_config.grad_accum_steps = 2
+    small_learner_config.unroll_steps = 1
+    small_learner_config.td_steps = 1
+    small_learner_config.mixed_precision = False
+    small_learner_config.dataloader_workers = 0
+    small_learner_config.lr = 0.0
+    small_learner_config.lr_min = 0.0
+    network = LunaNetwork(ChessGame(), small_learner_config)
+    replay = PrioritizedReplayBuffer(capacity=1)
+    replay.save_trajectory(_make_trajectory(length=1))
+    collated, weights, _indices = network._prepare_batch(
+        replay,
+        bs=2,
+        unroll=1,
+        td=1,
+        discount=1.0,
+        training_step=1,
+        mcts_for_reanalyze=None,
+    )
+    collated["target_values"][:, 0] = np.array([-1.0, 1.0], dtype=np.float32)
+    prepared = (collated, weights, [0, 0])
+
+    with (
+        patch.object(network, "_prepare_batch", return_value=prepared),
+        patch.object(replay, "update_priorities", wraps=replay.update_priorities) as update_priorities,
+    ):
+        network.train_ezv2(replay, steps=1)
+
+    update_priorities.assert_called_once()
+    indices, errors = update_priorities.call_args.args
+    assert indices == [0, 0]
+    expected_raw_priority = float(np.max(errors)) + 1e-6
+    assert replay._tree.tree[replay.capacity] == pytest.approx(expected_raw_priority**replay.alpha)
+
+
 def test_non_finite_gradient_fails_before_parameter_update(
     small_learner_config: EzV2LearnerConfig,
 ) -> None:
@@ -959,6 +998,24 @@ def test_checkpoint_save_rejects_non_finite_model_state_without_creating_file(
 
     with pytest.raises(ValueError, match="non-finite value"):
         network.save_checkpoint(str(tmp_path), checkpoint_path.name)
+
+    assert not checkpoint_path.exists()
+
+
+def test_checkpoint_save_rejects_non_finite_numpy_extra_state(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    checkpoint_path = tmp_path / "non-finite-extra.pth.tar"
+
+    with pytest.raises(ValueError, match=r"non-finite value at checkpoint\.diagnostics"):
+        network.save_checkpoint(
+            str(tmp_path),
+            checkpoint_path.name,
+            extra_state={"diagnostics": np.array([0.0, np.nan])},
+        )
 
     assert not checkpoint_path.exists()
 

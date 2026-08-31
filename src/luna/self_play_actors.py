@@ -56,10 +56,18 @@ class _ActorReady:
 
 
 @dataclass(frozen=True)
-class _ActorResult:
+class _ActorTrajectory:
     actor_id: int
     generation: int
-    trajectories: list[Trajectory]
+    episode_index: int
+    trajectory: Trajectory
+
+
+@dataclass(frozen=True)
+class _ActorCollectionDone:
+    actor_id: int
+    generation: int
+    episode_count: int
 
 
 @dataclass(frozen=True)
@@ -72,7 +80,7 @@ class _ActorFailure:
 
 
 _ActorRequest = _CollectRequest | _StopRequest
-_ActorResponse = _ActorReady | _ActorResult | _ActorFailure
+_ActorResponse = _ActorReady | _ActorTrajectory | _ActorCollectionDone | _ActorFailure
 _FutureResult = TypeVar("_FutureResult")
 
 
@@ -155,8 +163,12 @@ def _actor_entry(
                 network.warmup_mcts_inference(game)
                 warmed_up = True
             trajectories = coach.execute_episodes_batched(episode_count, progress=False)
-            connection.send(_ActorResult(actor_id, generation, trajectories))
-            del trajectories
+            while trajectories:
+                episode_index = len(trajectories) - 1
+                trajectory = trajectories.pop()
+                connection.send(_ActorTrajectory(actor_id, generation, episode_index, trajectory))
+                del trajectory
+            connection.send(_ActorCollectionDone(actor_id, generation, episode_count))
     except BaseException as exc:
         failure = _ActorFailure(
             actor_id=actor_id,
@@ -259,10 +271,15 @@ class SelfPlayActorPool:
             del requests, snapshot
 
             receive_futures = {
-                executor.submit(self._receive_blocking, actor_id): actor_id for actor_id in range(len(counts))
+                executor.submit(
+                    self._receive_collection_blocking,
+                    actor_id,
+                    counts[actor_id],
+                    generation,
+                ): actor_id
+                for actor_id in range(len(counts))
             }
-            responses = self._await_futures(receive_futures, deadline, phase="waiting for")
-            results = self._validate_results(responses, counts, generation)
+            results = self._await_futures(receive_futures, deadline, phase="waiting for")
         except BaseException:
             self._shutdown(graceful=False)
             raise
@@ -374,33 +391,52 @@ class SelfPlayActorPool:
             response = connection.recv()
         except (BrokenPipeError, EOFError, OSError) as exc:
             raise SelfPlayActorError(f"Lost connection to self-play actor {actor_id}: {exc}") from exc
-        if not isinstance(response, _ActorReady | _ActorResult | _ActorFailure):
+        if not isinstance(response, _ActorReady | _ActorTrajectory | _ActorCollectionDone | _ActorFailure):
             raise SelfPlayActorError(f"Actor {actor_id} sent an unsupported response: {type(response).__name__}")
         return response
 
-    def _validate_results(
+    def _receive_collection_blocking(
         self,
-        responses: dict[int, _ActorResponse],
-        counts: list[int],
+        actor_id: int,
+        episode_count: int,
         generation: int,
-    ) -> dict[int, list[Trajectory]]:
-        results: dict[int, list[Trajectory]] = {}
-        for actor_id, response in responses.items():
+    ) -> list[Trajectory]:
+        trajectories: list[Trajectory | None] = [None] * episode_count
+        while True:
+            response = self._receive_blocking(actor_id)
             if isinstance(response, _ActorFailure):
-                self._fail(response)
-            if not isinstance(response, _ActorResult):
-                self._abort(f"Actor {actor_id} sent an unexpected {type(response).__name__}")
+                raise SelfPlayActorError(self._failure_message(response))
+            if isinstance(response, _ActorTrajectory):
+                if response.actor_id != actor_id or response.generation != generation:
+                    raise SelfPlayActorError(
+                        f"Actor protocol mismatch: expected actor={actor_id}, generation={generation}; "
+                        f"got actor={response.actor_id}, generation={response.generation}"
+                    )
+                episode_index = response.episode_index
+                if not 0 <= episode_index < episode_count:
+                    raise SelfPlayActorError(
+                        f"Actor {actor_id} returned trajectory index {episode_index}; "
+                        f"expected an index in [0, {episode_count})"
+                    )
+                if trajectories[episode_index] is not None:
+                    raise SelfPlayActorError(f"Actor {actor_id} returned duplicate trajectory index {episode_index}")
+                trajectories[episode_index] = response.trajectory
+                continue
+            if not isinstance(response, _ActorCollectionDone):
+                raise SelfPlayActorError(f"Actor {actor_id} sent an unexpected {type(response).__name__}")
             if response.actor_id != actor_id or response.generation != generation:
-                self._abort(
+                raise SelfPlayActorError(
                     f"Actor protocol mismatch: expected actor={actor_id}, generation={generation}; "
                     f"got actor={response.actor_id}, generation={response.generation}"
                 )
-            if len(response.trajectories) != counts[actor_id]:
-                self._abort(
-                    f"Actor {actor_id} returned {len(response.trajectories)} trajectories; expected {counts[actor_id]}"
+            if response.episode_count != episode_count:
+                raise SelfPlayActorError(
+                    f"Actor {actor_id} completed {response.episode_count} trajectories; expected {episode_count}"
                 )
-            results[actor_id] = response.trajectories
-        return results
+            missing = [index for index, trajectory in enumerate(trajectories) if trajectory is None]
+            if missing:
+                raise SelfPlayActorError(f"Actor {actor_id} completed with missing trajectory indices: {missing}")
+            return [trajectory for trajectory in trajectories if trajectory is not None]
 
     def _wait_until_ready(self) -> None:
         pending = set(range(len(self._processes)))
@@ -432,7 +468,7 @@ class SelfPlayActorPool:
             response = connection.recv()
         except (BrokenPipeError, EOFError, OSError) as exc:
             self._abort(f"Lost connection to self-play actor {actor_id}: {exc}")
-        if not isinstance(response, _ActorReady | _ActorResult | _ActorFailure):
+        if not isinstance(response, _ActorReady | _ActorTrajectory | _ActorCollectionDone | _ActorFailure):
             self._abort(f"Actor {actor_id} sent an unsupported response: {type(response).__name__}")
         return response
 
@@ -449,8 +485,12 @@ class SelfPlayActorPool:
                 self._abort(f"Self-play actor {actor_id} exited unexpectedly with code {process.exitcode}")
 
     def _fail(self, failure: _ActorFailure) -> NoReturn:
+        self._abort(self._failure_message(failure))
+
+    @staticmethod
+    def _failure_message(failure: _ActorFailure) -> str:
         generation = "startup" if failure.generation is None else str(failure.generation)
-        self._abort(
+        return (
             f"Self-play actor {failure.actor_id} failed during generation {generation}: "
             f"{failure.exception_type}: {failure.message}\n{failure.traceback_text}"
         )

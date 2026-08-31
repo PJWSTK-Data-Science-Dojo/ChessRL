@@ -17,7 +17,7 @@ from luna.game.arena import Arena
 from luna.game.chess_game import ChessGame, move_to_action
 from luna.game.stockfish_eval import StockfishEvalScores, StockfishEvalSkipped
 from luna.network import LunaNetwork
-from luna.profiling import SelfPlayMCTSTimings
+from luna.profiling import IterProfileStats, SelfPlayMCTSTimings
 from luna.replay_buffer import PrioritizedReplayBuffer
 from tests.conftest import TrajectoryFactory
 
@@ -36,6 +36,7 @@ def test_wandb_metrics_use_domain_specific_step_axes(
 
     init_kwargs = wandb_init.call_args.kwargs
     assert init_kwargs["project"] == "ChessRL"
+    assert init_kwargs["name"] is None
     assert "id" not in init_kwargs
     assert "resume" not in init_kwargs
     assert init_kwargs["config"]["training_phase_provenance"] is None
@@ -110,6 +111,31 @@ def test_wandb_run_id_uses_requested_resume_policy(
     assert init_kwargs["resume"] == resume_mode
 
 
+def test_wandb_display_name_is_independent_of_stable_run_id(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+
+    with (
+        patch("luna.coach.wandb.init") as wandb_init,
+        patch("luna.coach.wandb.define_metric"),
+    ):
+        Coach(
+            chess_game,
+            network,
+            TrainingRunConfig(),
+            wandb_project="ChessRL",
+            wandb_run_id="luna-strength-1500-v1",
+            wandb_run_name="Luna Strength 1500 v1",
+            wandb_resume="never",
+        )
+
+    init_kwargs = wandb_init.call_args.kwargs
+    assert init_kwargs["id"] == "luna-strength-1500-v1"
+    assert init_kwargs["name"] == "Luna Strength 1500 v1"
+
+
 @pytest.mark.parametrize("resume_mode", ["never", "must"])
 def test_wandb_resume_policy_is_not_forwarded_without_run_id(
     chess_game: ChessGame,
@@ -147,6 +173,23 @@ def test_coach_rejects_invalid_wandb_resume_policy(
             network,
             TrainingRunConfig(),
             wandb_resume=cast(WandbResumeMode, "sometimes"),
+        )
+
+
+@pytest.mark.parametrize("run_name", ["", "   ", " leading", "trailing "])
+def test_coach_rejects_invalid_wandb_display_name(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    run_name: str,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+
+    with pytest.raises(ValueError, match="wandb_run_name"):
+        Coach(
+            chess_game,
+            network,
+            TrainingRunConfig(),
+            wandb_run_name=run_name,
         )
 
 
@@ -223,7 +266,7 @@ def test_skipped_training_still_logs_iteration_observability(
         patch("luna.coach.wandb.run", object()),
         patch("luna.coach.wandb.log") as wandb_log,
     ):
-        coach._learn_iterations(start_iteration=1, total_train_steps=1, actor_pool=None)
+        coach._learn_iterations(start_iteration=1, actor_pool=None)
 
     metrics = wandb_log.call_args.args[0]
     assert metrics["iteration"] == 1
@@ -232,6 +275,12 @@ def test_skipped_training_still_logs_iteration_observability(
     assert metrics["selfplay/positions"] == 5
     assert metrics["selfplay/avg_ply"] == 2.5
     assert metrics["selfplay/max_ply_fraction"] == 0.5
+    assert metrics["selfplay/truncated_fraction"] == 0.5
+    assert metrics["selfplay/decisive_fraction"] == 0.0
+    assert metrics["selfplay/draw_fraction"] == 0.5
+    assert metrics["selfplay/white_win_fraction"] == 0.0
+    assert metrics["selfplay/black_win_fraction"] == 0.0
+    assert metrics["selfplay/policy_entropy"] > 0.0
     assert metrics["performance/self_play_seconds"] > 0.0
     assert metrics["performance/self_play_positions_per_second"] == pytest.approx(
         5 / metrics["performance/self_play_seconds"]
@@ -240,6 +289,37 @@ def test_skipped_training_still_logs_iteration_observability(
     assert metrics["performance/iteration_seconds"] >= metrics["performance/self_play_seconds"]
     assert metrics["replay/size"] == 5
     assert metrics["replay/beta"] == 0.4
+
+
+def test_selfplay_outcome_metrics_respect_ply_color_and_exclude_truncations(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    make_trajectory: TrajectoryFactory,
+) -> None:
+    coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), TrainingRunConfig())
+    white_win = make_trajectory(1)
+    white_win.rewards[-1] = 1.0
+    black_win = make_trajectory(2)
+    black_win.rewards[-1] = 1.0
+    draw = make_trajectory(3)
+    truncated = make_trajectory(4, truncated=True)
+
+    with (
+        patch("luna.coach.wandb.run", object()),
+        patch("luna.coach.wandb.log") as wandb_log,
+    ):
+        coach._log_iteration_metrics(
+            1,
+            [white_win, black_win, draw, truncated],
+            IterProfileStats(iter_index=1),
+        )
+
+    metrics = wandb_log.call_args.args[0]
+    assert metrics["selfplay/white_win_fraction"] == 0.25
+    assert metrics["selfplay/black_win_fraction"] == 0.25
+    assert metrics["selfplay/draw_fraction"] == 0.25
+    assert metrics["selfplay/decisive_fraction"] == 0.5
+    assert metrics["selfplay/truncated_fraction"] == 0.25
 
 
 def test_resume_defers_beta_configuration_until_replay_can_train(
@@ -264,7 +344,7 @@ def test_resume_defers_beta_configuration_until_replay_can_train(
         coach.learn()
 
     configure_beta.assert_not_called()
-    learn_iterations.assert_called_once_with(5, 70, actor_pool=None)
+    learn_iterations.assert_called_once_with(5, actor_pool=None)
 
 
 def test_resume_anneals_beta_over_actual_training_calls_after_skipped_iteration(
@@ -291,7 +371,8 @@ def test_resume_anneals_beta_over_actual_training_calls_after_skipped_iteration(
         total_train_steps: int,
         **_: object,
     ) -> dict[str, float]:
-        assert total_train_steps == 14
+        assert total_train_steps == 4
+        network._lr_schedule_total_steps = total_train_steps
         for _step in range(steps):
             replay.sample(batch_size=4, unroll_steps=0)
         return {}
@@ -306,7 +387,7 @@ def test_resume_anneals_beta_over_actual_training_calls_after_skipped_iteration(
         patch.object(network, "train_ezv2", side_effect=sample_for_each_optimizer_step) as train,
         patch.object(coach, "_publish_checkpoint"),
     ):
-        coach._learn_iterations(start_iteration=5, total_train_steps=14, actor_pool=None)
+        coach._learn_iterations(start_iteration=5, actor_pool=None)
 
     configure_beta.assert_called_once_with(4)
     assert train.call_count == 2
@@ -489,6 +570,18 @@ def test_corrupt_best_evaluation_metadata_fails_loudly(
         coach._update_best_from_stockfish(1, StockfishEvalScores(model_wins=1, draws=1, stockfish_wins=0))
     assert (tmp_path / "latest.pth.tar").is_file()
     assert not (tmp_path / "best.pth.tar").exists()
+
+
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), -0.1, 1.1])
+def test_best_evaluation_metadata_rejects_invalid_score(
+    tmp_path: Path,
+    score: float,
+) -> None:
+    metadata_path = tmp_path / "best_eval.json"
+    metadata_path.write_text(json.dumps({"score": score, "protocol": {}}), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="finite and between zero and one"):
+        Coach._previous_best_score(metadata_path, {})
 
 
 def test_best_evaluation_metadata_is_bound_to_its_protocol(

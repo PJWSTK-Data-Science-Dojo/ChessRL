@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import os
 import stat
 import sys
@@ -65,12 +66,14 @@ def build_config(
         raise LichessConfigurationError("Simulation counts must be positive.")
     if minimum_simulations > mcts_simulations:
         raise LichessConfigurationError("--minimum-sims cannot exceed --mcts-sims.")
-    if estimated_simulation_ms <= 0:
-        raise LichessConfigurationError("--estimated-sim-ms must be positive.")
+    if not math.isfinite(estimated_simulation_ms) or estimated_simulation_ms <= 0:
+        raise LichessConfigurationError("--estimated-sim-ms must be finite and positive.")
 
     repository = repository.resolve()
     engine_path = engine_path.resolve()
     checkpoint = checkpoint.resolve()
+    if not repository.is_dir():
+        raise LichessConfigurationError(f"Repository directory not found: {repository}")
     if not engine_path.is_file() or not os.access(engine_path, os.X_OK):
         raise LichessConfigurationError(
             f"UCI executable is missing or not executable: {engine_path}. Run 'uv sync' first."

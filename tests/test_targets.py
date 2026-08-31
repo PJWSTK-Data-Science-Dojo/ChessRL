@@ -98,3 +98,42 @@ def test_current_position_sve_override_directly_replaces_td_target(make_trajecto
     )
 
     assert val == 0.625
+
+
+@pytest.mark.parametrize("pos_idx", [-1, 3])
+def test_target_value_rejects_out_of_range_position(
+    make_trajectory: TrajectoryFactory,
+    pos_idx: int,
+) -> None:
+    trajectory = make_trajectory(length=3)
+
+    with pytest.raises(IndexError, match="pos_idx"):
+        compute_target_value(trajectory, pos_idx=pos_idx, td_steps=1)
+
+
+def test_target_value_rejects_non_finite_reanalysis_override(make_trajectory: TrajectoryFactory) -> None:
+    trajectory = make_trajectory(length=3)
+
+    with pytest.raises(ValueError, match=r"override.*must be finite"):
+        compute_target_value(
+            trajectory,
+            pos_idx=0,
+            td_steps=1,
+            root_value_override={0: float("nan")},
+        )
+
+
+def test_unroll_targets_reject_illegal_reanalysis_policy(make_trajectory: TrajectoryFactory) -> None:
+    trajectory = make_trajectory(length=3)
+    trajectory.valids[0, 1] = False
+    policy = np.zeros(ACTION_SIZE, dtype=np.float32)
+    policy[1] = 1.0
+
+    with pytest.raises(ValueError, match="probability to illegal actions"):
+        build_unroll_targets(
+            trajectory,
+            pos_idx=0,
+            unroll_steps=1,
+            td_steps=1,
+            policy_override={0: policy},
+        )

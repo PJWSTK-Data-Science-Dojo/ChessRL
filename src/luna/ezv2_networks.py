@@ -117,6 +117,8 @@ class DynamicsNetwork(nn.Module):
         """action_planes: ``(B, 5, 8, 8)`` spatial action encoding."""
         x = torch.cat([latent, action_planes], dim=1)
         x = F.relu(self.gn_in(self.conv_in(x)))
+        # Consistency supervision targets the next player's already-canonical
+        # representation, so this network learns that orientation directly.
         next_latent = self.blocks(x)
         reward_logits = self.reward_head(next_latent)
         return next_latent, reward_logits
@@ -192,7 +194,10 @@ class PredictionNetwork(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         policy_logits = self.policy_head(latent)
         if valid_mask is not None:
-            policy_logits = policy_logits - (1 - valid_mask) * 1e6
+            policy_logits = policy_logits.masked_fill(
+                valid_mask <= 0,
+                torch.finfo(policy_logits.dtype).min,
+            )
         value_logits = self.value_head(latent)
         return policy_logits, value_logits
 
@@ -368,10 +373,11 @@ def _scale_latent(latent: torch.Tensor) -> torch.Tensor:
     """Normalise latent per sample using mean/std for smooth gradient flow."""
     B = latent.size(0)
     flat = latent.reshape(B, -1)
-    mean = flat.mean(dim=1, keepdim=True)
-    std = flat.std(dim=1, keepdim=True).clamp(min=1e-5)
-    normalised = (flat - mean) / std
-    return normalised.reshape_as(latent)
+    stats_input = flat.float() if flat.dtype in {torch.float16, torch.bfloat16} else flat
+    mean = stats_input.mean(dim=1, keepdim=True)
+    std = stats_input.std(dim=1, keepdim=True, correction=0).clamp(min=1e-5)
+    normalised = (stats_input - mean) / std
+    return normalised.to(dtype=latent.dtype).reshape_as(latent)
 
 
 def scalar_to_support(x: torch.Tensor, support_size: int) -> torch.Tensor:

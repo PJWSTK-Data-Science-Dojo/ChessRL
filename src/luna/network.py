@@ -118,6 +118,10 @@ def _first_non_finite_path(value: object, path: str) -> str | None:
         if (value.is_floating_point() or value.is_complex()) and not bool(torch.isfinite(value).all()):
             return path
         return None
+    if isinstance(value, np.ndarray):
+        if np.issubdtype(value.dtype, np.number) and not bool(np.isfinite(value).all()):
+            return path
+        return None
     if isinstance(value, Mapping):
         for key, item in value.items():
             invalid = _first_non_finite_path(item, f"{path}.{key}")
@@ -128,7 +132,7 @@ def _first_non_finite_path(value: object, path: str) -> str | None:
             invalid = _first_non_finite_path(item, f"{path}[{index}]")
             if invalid is not None:
                 return invalid
-    elif isinstance(value, float) and not math.isfinite(value):
+    elif isinstance(value, float | np.floating) and not math.isfinite(float(value)):
         return path
     return None
 
@@ -499,6 +503,10 @@ class LunaNetwork:
                 )
             finally:
                 self.nnet.train(was_training)
+            if len(results) != len(requests):
+                raise RuntimeError(
+                    f"Reanalysis returned {len(results)} results for {len(requests)} requested positions"
+                )
             for (sample_idx, position), (pi, root_value, _obs, _valid) in zip(requests, results):
                 root_override = root_overrides[sample_idx]
                 if root_override is None:
@@ -794,22 +802,30 @@ class LunaNetwork:
                             current_latent = next_latent
 
                         num_valid = v_mask.sum(dim=1).clamp(min=1.0)
+                        normalized_pi = loss_pi_total / num_valid
+                        normalized_v = loss_v_total / num_valid
+                        normalized_r = loss_r_total / num_valid
+                        normalized_consist = loss_consist_total / num_valid
                         total = (
-                            L.policy_loss_weight * loss_pi_total
-                            + L.value_loss_weight * loss_v_total
-                            + L.reward_loss_weight * loss_r_total
-                            + L.consistency_loss_weight * loss_consist_total
-                        ) / num_valid
+                            L.policy_loss_weight * normalized_pi
+                            + L.value_loss_weight * normalized_v
+                            + L.reward_loss_weight * normalized_r
+                            + L.consistency_loss_weight * normalized_consist
+                        )
 
                         weighted = (total * is_w).mean() / grad_accum
+                        weighted_pi = (normalized_pi * is_w).mean() / grad_accum
+                        weighted_v = (normalized_v * is_w).mean() / grad_accum
+                        weighted_r = (normalized_r * is_w).mean() / grad_accum
+                        weighted_consist = (normalized_consist * is_w).mean() / grad_accum
 
                     torch.autograd.backward(self.scaler.scale(weighted))
 
                     accum_weighted = accum_weighted + weighted.detach()
-                    accum_pi_acc = accum_pi_acc + loss_pi_total.mean().detach().float()
-                    accum_v_acc = accum_v_acc + loss_v_total.mean().detach().float()
-                    accum_r_acc = accum_r_acc + loss_r_total.mean().detach().float()
-                    accum_c_acc = accum_c_acc + loss_consist_total.mean().detach().float()
+                    accum_pi_acc = accum_pi_acc + weighted_pi.detach().float()
+                    accum_v_acc = accum_v_acc + weighted_v.detach().float()
+                    accum_r_acc = accum_r_acc + weighted_r.detach().float()
+                    accum_c_acc = accum_c_acc + weighted_consist.detach().float()
                     all_priority_errors.append((value_pred_0.float() - t_values[:, 0]).abs().detach().cpu().numpy())
                     all_tree_indices.append(micro_tree_indices)
 
@@ -880,15 +896,15 @@ class LunaNetwork:
                 self._global_step = training_step
                 completed_steps += 1
 
-                for priority_error, tri in zip(all_priority_errors, all_tree_indices):
-                    replay.update_priorities(tri, priority_error)
+                priority_indices = [index for microbatch_indices in all_tree_indices for index in microbatch_indices]
+                priority_errors = np.concatenate(all_priority_errors)
+                replay.update_priorities(priority_indices, priority_errors)
 
-                scale_m = float(grad_accum)
                 total_loss_m.update(float(accum_weighted.item()), bs)
-                pi_loss_m.update(float((accum_pi_acc / scale_m).item()), bs)
-                v_loss_m.update(float((accum_v_acc / scale_m).item()), bs)
-                r_loss_m.update(float((accum_r_acc / scale_m).item()), bs)
-                consist_loss_m.update(float((accum_c_acc / scale_m).item()), bs)
+                pi_loss_m.update(float(accum_pi_acc.item()), bs)
+                v_loss_m.update(float(accum_v_acc.item()), bs)
+                r_loss_m.update(float(accum_r_acc.item()), bs)
+                consist_loss_m.update(float(accum_c_acc.item()), bs)
                 step_time_m.update(time.time() - t0)
 
                 if step % 50 == 0 or step == steps:
@@ -916,6 +932,7 @@ class LunaNetwork:
                                 "train/lr": new_lr,
                                 "train/grad_norm": float(grad_norm),
                                 "train/step_time": step_time_m.avg,
+                                "train/samples_per_second": bs / step_time_m.avg if step_time_m.avg > 0.0 else 0.0,
                                 "global_step": self._global_step,
                             }
                         )

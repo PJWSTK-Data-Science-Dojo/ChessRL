@@ -15,6 +15,7 @@ from luna.config import (
     validate_training_configuration,
     validate_wandb_resume,
     validate_wandb_run_id,
+    validate_wandb_run_name,
 )
 from luna.game.chess_game import ChessGame as Game
 from luna.network import LunaNetwork
@@ -43,7 +44,12 @@ def main() -> int:
     cfg = tyro.cli(TrainCliConfig)
 
     logger.remove()
-    logger.add(sys.stderr, level=cfg.log_level.upper())
+    try:
+        logger.add(sys.stderr, level=cfg.log_level.upper())
+    except ValueError:
+        logger.add(sys.stderr, level="INFO")
+        logger.error("Invalid log level: {!r}", cfg.log_level)
+        return 2
 
     run_cfg = cfg.to_training_run()
     learner = cfg.to_learner_config()
@@ -51,6 +57,7 @@ def main() -> int:
     try:
         validate_training_configuration(run_cfg, learner)
         validate_wandb_run_id(cfg.wandb_run_id)
+        validate_wandb_run_name(cfg.wandb_run_name)
         validate_wandb_resume(cfg.wandb_resume)
         if cfg.load_model and cfg.new_training_phase:
             raise ValueError("--load-model and --new-training-phase are mutually exclusive")
@@ -119,6 +126,7 @@ def main() -> int:
         run_cfg,
         wandb_project=cfg.wandb_project,
         wandb_run_id=cfg.wandb_run_id,
+        wandb_run_name=cfg.wandb_run_name,
         wandb_resume=cfg.wandb_resume,
         seed=cfg.seed,
     )

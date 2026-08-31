@@ -154,6 +154,58 @@ class TestRunStockfishEval:
         assert isinstance(out, StockfishEvalSkipped)
         assert out.reason == "no_engine"
 
+    def test_close_failure_is_reported_as_runtime_failure(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
+        class _Stockfish:
+            def new_game(self) -> None:
+                pass
+
+            def play(self, _board: chess.Board) -> int:
+                raise AssertionError("Patched Arena must not request a move")
+
+            def close(self) -> None:
+                raise RuntimeError("close failed")
+
+        network = LunaNetwork(chess_game, small_learner_config)
+        run = TrainingRunConfig(stockfish_eval_games=2, evaluation_num_mcts_sims=1)
+        with (
+            patch("luna.game.stockfish_eval._stockfish_player", return_value=_Stockfish()),
+            patch("luna.game.stockfish_eval.ArenaMCTSPlayer", return_value=lambda _board: 0),
+            patch.object(Arena, "play_game", return_value=0.0),
+        ):
+            outcome = run_stockfish_eval(chess_game, network, run)
+
+        assert outcome == StockfishEvalSkipped("runtime_error", "failed to close Stockfish: close failed")
+
+    def test_game_failure_is_not_overwritten_by_close_failure(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
+        class _Stockfish:
+            def new_game(self) -> None:
+                pass
+
+            def play(self, _board: chess.Board) -> int:
+                raise AssertionError("Patched Arena must not request a move")
+
+            def close(self) -> None:
+                raise RuntimeError("close failed")
+
+        network = LunaNetwork(chess_game, small_learner_config)
+        run = TrainingRunConfig(stockfish_eval_games=2, evaluation_num_mcts_sims=1)
+        with (
+            patch("luna.game.stockfish_eval._stockfish_player", return_value=_Stockfish()),
+            patch("luna.game.stockfish_eval.ArenaMCTSPlayer", return_value=lambda _board: 0),
+            patch.object(Arena, "play_game", side_effect=RuntimeError("game failed")),
+        ):
+            outcome = run_stockfish_eval(chess_game, network, run)
+
+        assert outcome == StockfishEvalSkipped("runtime_error", "game failed")
+
 
 def test_evaluation_mcts_params_matches_run() -> None:
     run = TrainingRunConfig(num_mcts_sims=40, evaluation_num_mcts_sims=7, dir_noise=True, recurrent_policy_topk=128)

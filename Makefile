@@ -5,10 +5,11 @@ CHECKPOINT_PATH = $(CHECKPOINT_DIR)/latest.pth.tar
 NEW_PHASE_SOURCE_DIR ?= ./runs/luna-stockfish16-continuation
 NEW_PHASE_SOURCE_FILE ?= best.pth.tar
 NEW_PHASE_SOURCE_SHA256 ?= b6ec9f2e5455f592a3833a285fe478dfba9bb9bdddba9207a2d66572277c7b8d
-NEW_PHASE_CHECKPOINT_DIR ?= ./runs/luna-throughput-phase
+NEW_PHASE_CHECKPOINT_DIR ?= ./runs/luna-strength-1500-v1
 TRAIN_ENV_FILE ?= .env
 WANDB_PROJECT ?= ChessRL
-NEW_PHASE_WANDB_RUN_ID ?= luna-throughput-phase-v1
+NEW_PHASE_WANDB_RUN_ID ?= luna-strength-1500-v1
+NEW_PHASE_WANDB_RUN_NAME ?= Luna Strength 1500 v1
 PUBLIC_ENV ?= .env.public
 RELEASE_DIR ?= ./release
 RELEASE_ID ?=
@@ -17,6 +18,7 @@ RELEASE_SOURCE ?= $(CHECKPOINT_DIR)/best.pth.tar
 PHASE_TRAIN_ARGS = \
 	--wandb-project "$(WANDB_PROJECT)" \
 	--wandb-run-id "$(NEW_PHASE_WANDB_RUN_ID)" \
+	--wandb-run-name "$(NEW_PHASE_WANDB_RUN_NAME)" \
 	--run.search-mode gumbel \
 	--run.gumbel-max-considered-actions 16 \
 	--run.num-iters 400 \

@@ -212,6 +212,7 @@ class GameRecord:
     last_simulations: int | None = None
     last_evaluation_white: float | None = None
     last_confidence: float | None = None
+    revision: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 
@@ -360,7 +361,7 @@ def _require_revision(payload: Mapping[str, Any], record: GameRecord) -> None:
     revision = payload.get("revision")
     if isinstance(revision, bool) or not isinstance(revision, int):
         raise ApiError(400, "missing_revision", "Include the current integer game revision.")
-    current_revision = len(record.board.move_stack)
+    current_revision = record.revision
     if revision != current_revision:
         raise ApiError(
             409,
@@ -449,7 +450,7 @@ def _game_payload(record: GameRecord, engine: LunaEngineService) -> dict[str, An
     profile = engine.strengths[record.strength]
     return {
         "id": record.game_id,
-        "revision": len(record.board.move_stack),
+        "revision": record.revision,
         "mode": record.mode,
         "human_color": record.human_color,
         "strength": {
@@ -484,6 +485,7 @@ def _apply_engine_move(record: GameRecord, engine: LunaEngineService) -> EngineD
     if decision.move not in record.board.legal_moves:
         raise RuntimeError("Engine produced an illegal move")
     record.board.push(decision.move)
+    record.revision += 1
     record.last_engine_move = decision.move.uci()
     record.last_think_time_ms = decision.think_time_ms
     record.last_simulations = decision.simulations
@@ -707,6 +709,7 @@ def create_app(engine: LunaEngineService | None = None, config: WebAppConfig | N
                 raise ApiError(422, "illegal_move", "That move is not legal in this position.")
 
             previous = record.board.copy(stack=True)
+            previous_revision = record.revision
             analytics = (
                 record.last_engine_move,
                 record.last_think_time_ms,
@@ -716,6 +719,7 @@ def create_app(engine: LunaEngineService | None = None, config: WebAppConfig | N
             )
             human_san = record.board.san(move)
             record.board.push(move)
+            record.revision += 1
             engine_decision: EngineDecision | None = None
             search_succeeded = False
             try:
@@ -735,6 +739,7 @@ def create_app(engine: LunaEngineService | None = None, config: WebAppConfig | N
             finally:
                 if not search_succeeded:
                     record.board = previous
+                    record.revision = previous_revision
                     (
                         record.last_engine_move,
                         record.last_think_time_ms,
@@ -769,10 +774,12 @@ def create_app(engine: LunaEngineService | None = None, config: WebAppConfig | N
             if record.board.is_game_over(claim_draw=True):
                 raise ApiError(409, "game_over", "The game is already over.")
             previous = record.board.copy(stack=True)
+            previous_revision = record.revision
             try:
                 decision = _apply_engine_move(record, active_engine)
             except (EngineBusyError, RuntimeError, ValueError) as exc:
                 record.board = previous
+                record.revision = previous_revision
                 if not isinstance(exc, EngineBusyError):
                     logger.exception("Self-play search failed")
                 raise _search_api_error(exc) from None
@@ -849,6 +856,7 @@ def create_app(engine: LunaEngineService | None = None, config: WebAppConfig | N
                     break
             if not removed_human_move:
                 raise RuntimeError("Undo invariant violated")
+            record.revision += 1
             record.last_engine_move = None
             record.last_think_time_ms = None
             record.last_simulations = None

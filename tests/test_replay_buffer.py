@@ -1,12 +1,29 @@
 """Tests for prioritized replay buffer."""
 
 import pickle
+from typing import Any
 
 import numpy as np
 import pytest
 
-from luna.replay_buffer import PrioritizedReplayBuffer
+from luna.game.chess_game import ACTION_SIZE, OBS_PLANES
+from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 from tests.conftest import TrajectoryFactory
+
+
+def _trajectory_inputs(length: int = 2) -> dict[str, Any]:
+    policies = np.zeros((length, ACTION_SIZE), dtype=np.float32)
+    policies[:, 0] = 1.0
+    valids = np.zeros((length, ACTION_SIZE), dtype=np.float32)
+    valids[:, 0] = 1.0
+    return {
+        "observations": np.zeros((length, 8, 8, OBS_PLANES), dtype=np.float32),
+        "actions": np.zeros(length, dtype=np.int64),
+        "rewards": np.zeros(length, dtype=np.float32),
+        "root_policies": policies,
+        "root_values": np.zeros(length, dtype=np.float32),
+        "valids": valids,
+    }
 
 
 class TestPrioritizedReplayBuffer:
@@ -34,6 +51,24 @@ class TestPrioritizedReplayBuffer:
         _, _, indices = buf.sample(batch_size=4, unroll_steps=5)
         td_errors = np.array([0.1, 0.5, 1.0, 2.0])
         buf.update_priorities(indices, td_errors)
+
+    def test_duplicate_priority_updates_keep_largest_error(self, make_trajectory: TrajectoryFactory) -> None:
+        buf = PrioritizedReplayBuffer(capacity=4, alpha=0.6)
+        buf.save_trajectory(make_trajectory(length=1))
+
+        buf.update_priorities([0, 0], np.array([0.9, 0.1], dtype=np.float32))
+
+        assert buf._tree.tree[buf.capacity] == pytest.approx((0.9 + 1e-6) ** 0.6)
+
+    def test_priority_update_rejects_inactive_index_atomically(self, make_trajectory: TrajectoryFactory) -> None:
+        buf = PrioritizedReplayBuffer(capacity=4)
+        buf.save_trajectory(make_trajectory(length=1))
+        initial_tree = buf._tree.tree.copy()
+
+        with pytest.raises(IndexError, match="not active"):
+            buf.update_priorities([0, 1], np.array([0.5, 0.6], dtype=np.float32))
+
+        np.testing.assert_array_equal(buf._tree.tree, initial_tree)
 
     def test_capacity_wraps(self, make_trajectory: TrajectoryFactory) -> None:
         buf = PrioritizedReplayBuffer(capacity=20)
@@ -91,3 +126,31 @@ class TestPrioritizedReplayBuffer:
         buf.save_trajectory(make_trajectory(length=2))
         with pytest.raises(ValueError, match="same length"):
             buf.update_priorities([0, 1], np.array([0.5], dtype=np.float32))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("actions", np.array([0.5, 0.0]), "actions must be integers"),
+        ("actions", np.array([0, ACTION_SIZE]), r"actions must be in \[0, 4288\)"),
+        ("valids", np.full((2, ACTION_SIZE), np.nan), "finite zero/one"),
+        ("root_values", np.array([0.0, np.inf]), "root values must be finite"),
+    ],
+)
+def test_trajectory_rejects_corrupt_scalar_data(field: str, replacement: object, message: str) -> None:
+    inputs = _trajectory_inputs()
+    inputs[field] = replacement
+
+    with pytest.raises(ValueError, match=message):
+        Trajectory(**inputs)
+
+
+def test_trajectory_rejects_illegal_policy_mass() -> None:
+    inputs = _trajectory_inputs()
+    policies = np.asarray(inputs["root_policies"]).copy()
+    policies[:, 1] = 0.25
+    policies[:, 0] = 0.75
+    inputs["root_policies"] = policies
+
+    with pytest.raises(ValueError, match="zero probability to illegal actions"):
+        Trajectory(**inputs)

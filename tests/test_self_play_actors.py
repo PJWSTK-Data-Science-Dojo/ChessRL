@@ -6,16 +6,20 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
 from luna.coach import Coach
 from luna.config import EzV2LearnerConfig, TrainingRunConfig, validate_training_configuration
-from luna.game.chess_game import ChessGame
+from luna.game.chess_game import ACTION_SIZE, OBS_PLANES, ChessGame
 from luna.network import LunaNetwork
+from luna.replay_buffer import Trajectory
 from luna.self_play_actors import (
     SelfPlayActorError,
     SelfPlayActorPool,
+    _ActorCollectionDone,
+    _ActorTrajectory,
     derive_actor_seed,
     partition_episode_counts,
 )
@@ -43,6 +47,21 @@ class _BlockingReceiveConnection:
         self._delegate.close()
 
 
+def _trajectory_with_action(action: int) -> Trajectory:
+    policy = np.zeros((1, ACTION_SIZE), dtype=np.float32)
+    policy[0, action] = 1.0
+    valids = np.zeros((1, ACTION_SIZE), dtype=np.bool_)
+    valids[0, action] = True
+    return Trajectory(
+        observations=np.zeros((1, 8, 8, OBS_PLANES), dtype=np.float32),
+        actions=[action],
+        rewards=[0.0],
+        root_policies=policy,
+        root_values=[0.0],
+        valids=valids,
+    )
+
+
 def test_actor_seeds_are_repeatable_and_unique() -> None:
     seeds = [derive_actor_seed(7, actor_id, generation=12) for actor_id in range(4)]
 
@@ -54,6 +73,40 @@ def test_actor_seeds_are_repeatable_and_unique() -> None:
 def test_episode_partition_is_balanced_and_does_not_create_empty_work() -> None:
     assert partition_episode_counts(10, 3) == [4, 3, 3]
     assert partition_episode_counts(2, 4) == [1, 1]
+
+
+def test_streamed_actor_trajectories_are_reassembled_in_episode_order() -> None:
+    context = torch.multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=True)
+    pool = object.__new__(SelfPlayActorPool)
+    pool._connections = [parent_connection]
+    try:
+        child_connection.send(_ActorTrajectory(0, 7, 1, _trajectory_with_action(20)))
+        child_connection.send(_ActorTrajectory(0, 7, 0, _trajectory_with_action(10)))
+        child_connection.send(_ActorCollectionDone(0, 7, 2))
+
+        trajectories = pool._receive_collection_blocking(0, episode_count=2, generation=7)
+
+        assert [int(trajectory.actions[0]) for trajectory in trajectories] == [10, 20]
+    finally:
+        parent_connection.close()
+        child_connection.close()
+
+
+def test_streamed_actor_collection_rejects_missing_trajectory() -> None:
+    context = torch.multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=True)
+    pool = object.__new__(SelfPlayActorPool)
+    pool._connections = [parent_connection]
+    try:
+        child_connection.send(_ActorTrajectory(0, 3, 1, _trajectory_with_action(20)))
+        child_connection.send(_ActorCollectionDone(0, 3, 2))
+
+        with pytest.raises(SelfPlayActorError, match="missing trajectory indices: \\[0\\]"):
+            pool._receive_collection_blocking(0, episode_count=2, generation=3)
+    finally:
+        parent_connection.close()
+        child_connection.close()
 
 
 def test_actor_configuration_rejects_invalid_worker_count_and_timeout() -> None:
@@ -93,7 +146,7 @@ def test_coach_owns_actor_pool_for_the_complete_training_loop(tmp_path: Path) ->
         coach.learn()
 
     actor_pool_type.assert_called_once_with(network, run, worker_count=2, base_seed=31)
-    learn_iterations.assert_called_once_with(1, run.train_steps_per_iter, actor_pool=actor_pool)
+    learn_iterations.assert_called_once_with(1, actor_pool=actor_pool)
 
 
 def test_spawned_actors_collect_compact_trajectories_and_fail_fast(

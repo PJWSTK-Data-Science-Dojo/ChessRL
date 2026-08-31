@@ -32,6 +32,13 @@ def test_main_rejects_resume_and_new_phase_together() -> None:
         assert training_entry.main() == 2
 
 
+def test_main_rejects_invalid_log_level() -> None:
+    config = TrainCliConfig(log_level="verbose")
+
+    with patch.object(training_entry.tyro, "cli", return_value=config):
+        assert training_entry.main() == 2
+
+
 @pytest.mark.parametrize("resume_mode", ["allow", "never", "must"])
 def test_cli_parses_stable_wandb_run_id_and_resume_mode(resume_mode: str) -> None:
     config = training_entry.tyro.cli(
@@ -40,14 +47,17 @@ def test_cli_parses_stable_wandb_run_id_and_resume_mode(resume_mode: str) -> Non
             "--wandb-project",
             "ChessRL",
             "--wandb-run-id",
-            "luna-throughput-phase-v1",
+            "luna-strength-1500-v1",
+            "--wandb-run-name",
+            "Luna Strength 1500 v1",
             "--wandb-resume",
             resume_mode,
         ],
     )
 
     assert config.wandb_project == "ChessRL"
-    assert config.wandb_run_id == "luna-throughput-phase-v1"
+    assert config.wandb_run_id == "luna-strength-1500-v1"
+    assert config.wandb_run_name == "Luna Strength 1500 v1"
     assert config.wandb_resume == resume_mode
 
 
@@ -71,6 +81,14 @@ def test_main_rejects_invalid_wandb_run_id(run_id: str) -> None:
         assert training_entry.main() == 2
 
 
+@pytest.mark.parametrize("run_name", ["", "   ", " leading", "trailing "])
+def test_main_rejects_invalid_wandb_run_name(run_name: str) -> None:
+    config = TrainCliConfig(wandb_run_name=run_name)
+
+    with patch.object(training_entry.tyro, "cli", return_value=config):
+        assert training_entry.main() == 2
+
+
 def test_main_routes_new_phase_to_weights_only_initializer(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -80,7 +98,8 @@ def test_main_routes_new_phase_to_weights_only_initializer(tmp_path: Path) -> No
         new_training_phase=True,
         load_checkpoint_dir=str(source),
         wandb_project="ChessRL",
-        wandb_run_id="luna-throughput-phase-v1",
+        wandb_run_id="luna-strength-1500-v1",
+        wandb_run_name="Luna Strength 1500 v1",
         wandb_resume="never",
         run=TrainingRunConfig(checkpoint=str(target), stockfish_eval_every=0),
         learner=EzV2LearnerConfig(device="cpu"),
@@ -98,7 +117,8 @@ def test_main_routes_new_phase_to_weights_only_initializer(tmp_path: Path) -> No
     network_type.return_value.initialize_training_phase.assert_called_once_with(str(source), "latest.pth.tar")
     network_type.return_value.load_checkpoint.assert_not_called()
     assert coach_type.call_args.kwargs["wandb_project"] == "ChessRL"
-    assert coach_type.call_args.kwargs["wandb_run_id"] == "luna-throughput-phase-v1"
+    assert coach_type.call_args.kwargs["wandb_run_id"] == "luna-strength-1500-v1"
+    assert coach_type.call_args.kwargs["wandb_run_name"] == "Luna Strength 1500 v1"
     assert coach_type.call_args.kwargs["wandb_resume"] == "never"
     coach_type.return_value.learn.assert_called_once_with()
 
@@ -118,7 +138,8 @@ def test_phase_make_target_sets_explicit_wandb_resume_policy(target: str, resume
         text=True,
     )
 
-    assert '--wandb-run-id "luna-throughput-phase-v1"' in result.stdout
+    assert '--wandb-run-id "luna-strength-1500-v1"' in result.stdout
+    assert '--wandb-run-name "Luna Strength 1500 v1"' in result.stdout
     assert f"--wandb-resume {resume_mode}" in result.stdout
     assert "--learner.reanalyze-prob 0.10" in result.stdout
 

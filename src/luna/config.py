@@ -434,6 +434,16 @@ def validate_wandb_run_id(run_id: str | None) -> None:
         raise ValueError(f"wandb_run_id cannot contain these characters: {reserved_characters}")
 
 
+def validate_wandb_run_name(run_name: str | None) -> None:
+    """Validate an optional human-readable W&B display name."""
+    if run_name is None:
+        return
+    if not run_name.strip():
+        raise ValueError("wandb_run_name cannot be blank")
+    if run_name != run_name.strip():
+        raise ValueError("wandb_run_name cannot start or end with whitespace")
+
+
 def validate_wandb_resume(mode: str) -> None:
     """Validate the W&B run-resume policy after programmatic config construction."""
     allowed_modes = ("allow", "never", "must")
@@ -460,6 +470,9 @@ class TrainCliConfig:
     wandb_project: str | None = None  # Optional WandB project name for experiment tracking
     wandb_run_id: str | None = None
     """Stable W&B run ID used to continue one run after a restart."""
+
+    wandb_run_name: str | None = None
+    """Human-readable W&B display name, independent of the stable run ID."""
 
     wandb_resume: WandbResumeMode = "allow"
     """Whether W&B may, must not, or must resume the stable run ID."""

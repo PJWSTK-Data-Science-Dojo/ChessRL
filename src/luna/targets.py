@@ -1,10 +1,36 @@
 """EfficientZeroV2 target generation: n-step bootstrap values, unroll targets."""
 
+import math
 from typing import Any
 
 import numpy as np
 
 from luna.replay_buffer import Trajectory
+
+
+def _validate_target_request(trajectory: Trajectory, pos_idx: int, td_steps: int, discount: float) -> None:
+    if isinstance(pos_idx, bool) or not isinstance(pos_idx, int) or not 0 <= pos_idx < trajectory.game_length:
+        raise IndexError(f"pos_idx must be in [0, {trajectory.game_length}), got {pos_idx}")
+    if isinstance(td_steps, bool) or not isinstance(td_steps, int) or td_steps < 0:
+        raise ValueError("td_steps must be a non-negative integer")
+    if not math.isfinite(discount) or not 0.0 <= discount <= 1.0:
+        raise ValueError("discount must be finite and between 0 and 1")
+
+
+def _validate_policy_override(trajectory: Trajectory, position: int, policy: np.ndarray) -> np.ndarray:
+    override = np.asarray(policy, dtype=np.float32)
+    expected_shape = trajectory.root_policies[position].shape
+    if override.shape != expected_shape:
+        raise ValueError(
+            f"Policy override at position {position} must have shape {expected_shape}, got {override.shape}"
+        )
+    if not np.isfinite(override).all() or np.any(override < 0.0):
+        raise ValueError(f"Policy override at position {position} must be finite and non-negative")
+    if np.any(override[~trajectory.valids[position]] != 0.0):
+        raise ValueError(f"Policy override at position {position} assigns probability to illegal actions")
+    if not np.isclose(float(override.sum()), 1.0, rtol=0.0, atol=1e-4):
+        raise ValueError(f"Policy override at position {position} must sum to one")
+    return override
 
 
 def compute_target_value(
@@ -20,9 +46,13 @@ def compute_target_value(
     A fresh search value at the current position takes precedence over the
     trajectory target instead of being interpreted as a later bootstrap.
     """
+    _validate_target_request(trajectory, pos_idx, td_steps, discount)
     game_len = trajectory.game_length
     if root_value_override is not None and pos_idx in root_value_override:
-        return float(root_value_override[pos_idx])
+        override = float(root_value_override[pos_idx])
+        if not math.isfinite(override):
+            raise ValueError(f"Root-value override at position {pos_idx} must be finite")
+        return override
     bootstrap_idx = pos_idx + td_steps
 
     end = min(bootstrap_idx, game_len)
@@ -40,6 +70,8 @@ def compute_target_value(
         sign = 1.0 if td_steps % 2 == 0 else -1.0
         if root_value_override is not None and bootstrap_idx in root_value_override:
             v_boot = float(root_value_override[bootstrap_idx])
+            if not math.isfinite(v_boot):
+                raise ValueError(f"Root-value override at position {bootstrap_idx} must be finite")
         else:
             v_boot = float(trajectory.root_values[bootstrap_idx])
         value += (discount**td_steps) * sign * v_boot
@@ -58,6 +90,9 @@ def build_unroll_targets(
     policy_override: dict[int, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """Build aligned policy, value, reward, legality, and consistency targets."""
+    if isinstance(unroll_steps, bool) or not isinstance(unroll_steps, int) or unroll_steps < 0:
+        raise ValueError("unroll_steps must be a non-negative integer")
+    _validate_target_request(trajectory, pos_idx, td_steps, discount)
     game_len = trajectory.game_length
 
     target_values: list[float] = []
@@ -101,7 +136,7 @@ def build_unroll_targets(
 
         if idx < game_len:
             if policy_override is not None and idx in policy_override:
-                target_policies.append(policy_override[idx])
+                target_policies.append(_validate_policy_override(trajectory, idx, policy_override[idx]))
             else:
                 target_policies.append(trajectory.root_policies[idx])
             observations_unroll.append(trajectory.observations[idx])

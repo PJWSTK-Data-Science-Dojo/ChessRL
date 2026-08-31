@@ -14,7 +14,7 @@ import pytest
 from luna.config import MCTSParams
 from luna.game.chess_game import ACTION_SIZE, ChessGame, mirror_move, move_to_action
 from luna.network import LunaNetwork
-from luna.uci import LunaUciEngine, UciOptions
+from luna.uci import MAX_MCTS_SIMULATIONS, MAX_MINIMUM_SIMULATIONS, LunaUciEngine, UciOptions
 
 
 class _PolicyMCTS:
@@ -97,6 +97,8 @@ def test_time_management_caps_and_floors_simulation_budget() -> None:
         engine._simulation_budget(["movetime", "invalid"])
     with pytest.raises(ValueError, match="requires an integer"):
         engine._simulation_budget(["movetime"])
+    with pytest.raises(ValueError, match="64-bit integer range"):
+        engine._simulation_budget(["movetime", str(1 << 63)])
 
     engine.options.mcts_simulations = 4
     assert engine._simulation_budget(["movetime", "1"]) == 4
@@ -217,6 +219,27 @@ def test_uci_handshake_and_runtime_options(monkeypatch: pytest.MonkeyPatch) -> N
     assert engine.options.mcts_simulations == 42
     assert engine.options.minimum_simulations == 6
     assert engine.options.estimated_simulation_ms == 2.5
+
+
+def test_uci_options_enforce_advertised_bounds_and_finite_timing() -> None:
+    options = UciOptions(
+        mcts_simulations=MAX_MCTS_SIMULATIONS + 1,
+        minimum_simulations=MAX_MINIMUM_SIMULATIONS + 1,
+    )
+    engine = LunaUciEngine(network=_network_stub(), options=options)
+
+    assert options.mcts_simulations == MAX_MCTS_SIMULATIONS
+    assert options.minimum_simulations == MAX_MINIMUM_SIMULATIONS
+
+    engine.set_option(["name", "MCTS", "Simulations", "value", str(MAX_MCTS_SIMULATIONS + 100)])
+    engine.set_option(["name", "Minimum", "Simulations", "value", str(MAX_MINIMUM_SIMULATIONS + 100)])
+    assert options.mcts_simulations == MAX_MCTS_SIMULATIONS
+    assert options.minimum_simulations == MAX_MINIMUM_SIMULATIONS
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        engine.set_option(["name", "Estimated", "Simulation", "ms", "value", "inf"])
+    with pytest.raises(ValueError, match="finite and positive"):
+        UciOptions(mcts_simulations=8, estimated_simulation_ms=float("nan"))
 
 
 def test_uci_warms_once_after_announcing_protocol_readiness(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -97,6 +97,24 @@ def test_build_config_uses_current_lichess_bot_shape_and_safe_defaults(tmp_path:
     assert config["future_upstream_key"] == {"preserved": True}
 
 
+def test_build_config_rejects_non_finite_timing(tmp_path: Path) -> None:
+    engine, checkpoint = _runtime_files(tmp_path)
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        build_config(
+            _template(),
+            repository=tmp_path,
+            engine_path=engine,
+            checkpoint=checkpoint,
+            device="cpu",
+            cuda_device=None,
+            mcts_simulations=32,
+            minimum_simulations=8,
+            estimated_simulation_ms=float("nan"),
+            compile_inference=False,
+        )
+
+
 def test_private_writer_is_atomic_owner_only_and_requires_force(tmp_path: Path) -> None:
     output = tmp_path / "config.yml"
     write_private_config({"setting": "first"}, output)

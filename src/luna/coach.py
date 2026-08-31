@@ -27,6 +27,7 @@ from luna.config import (
     validate_training_configuration,
     validate_wandb_resume,
     validate_wandb_run_id,
+    validate_wandb_run_name,
 )
 from luna.game.chess_game import ChessGame
 from luna.game.stockfish_eval import (
@@ -106,6 +107,7 @@ class Coach:
         run: TrainingRunConfig,
         wandb_project: str | None = None,
         wandb_run_id: str | None = None,
+        wandb_run_name: str | None = None,
         wandb_resume: WandbResumeMode = "allow",
         seed: int = 0,
     ) -> None:
@@ -127,6 +129,7 @@ class Coach:
         self._replay_beta_annealing_configured = False
         self._seed = seed
         validate_wandb_run_id(wandb_run_id)
+        validate_wandb_run_name(wandb_run_name)
         validate_wandb_resume(wandb_resume)
 
         if wandb_project:
@@ -138,11 +141,17 @@ class Coach:
                 "training_phase_provenance": (phase_provenance.as_config() if phase_provenance is not None else None),
             }
             if wandb_run_id is None:
-                wandb.init(project=wandb_project, config=init_config, tags=["chess", "ezv2"])
+                wandb.init(
+                    project=wandb_project,
+                    name=wandb_run_name,
+                    config=init_config,
+                    tags=["chess", "ezv2"],
+                )
             else:
                 wandb.init(
                     project=wandb_project,
                     id=wandb_run_id,
+                    name=wandb_run_name,
                     resume=wandb_resume,
                     config=init_config,
                     tags=["chess", "ezv2"],
@@ -386,8 +395,6 @@ class Coach:
         """Full EZV2 training loop: self-play -> store in replay -> train from replay -> evaluate."""
         self._assert_checkpoint_target()
         self._assert_checkpoint_lineage()
-        train_steps_per_iter = self.run.train_steps_per_iter
-        total_train_steps = self.run.num_iters * train_steps_per_iter
 
         start_iteration = self.nnet._trainer_iteration + 1
         if start_iteration > self.run.num_iters:
@@ -410,7 +417,7 @@ class Coach:
 
         worker_count = min(self.run.self_play_workers, self.run.num_episodes)
         if worker_count <= 1:
-            self._learn_iterations(start_iteration, total_train_steps, actor_pool=None)
+            self._learn_iterations(start_iteration, actor_pool=None)
             return
 
         logger.info(
@@ -424,12 +431,11 @@ class Coach:
             worker_count=worker_count,
             base_seed=self._seed,
         ) as actor_pool:
-            self._learn_iterations(start_iteration, total_train_steps, actor_pool=actor_pool)
+            self._learn_iterations(start_iteration, actor_pool=actor_pool)
 
     def _learn_iterations(
         self,
         start_iteration: int,
-        total_train_steps: int,
         actor_pool: SelfPlayActorPool | None,
     ) -> None:
         profile_rows: list[IterProfileStats] = []
@@ -502,10 +508,14 @@ class Coach:
                 )
             logger.info("Training from replay buffer ({} positions) ...", self.replay.size)
             t0 = time.perf_counter()
+            lr_schedule_total_steps = self.nnet._lr_schedule_total_steps
+            if lr_schedule_total_steps == 0:
+                remaining_iterations = self.run.num_iters - i + 1
+                lr_schedule_total_steps = self.nnet._global_step + remaining_iterations * self.run.train_steps_per_iter
             loss_info = self.nnet.train_ezv2(
                 self.replay,
                 steps=self.run.train_steps_per_iter,
-                total_train_steps=total_train_steps,
+                total_train_steps=lr_schedule_total_steps,
                 discount=self.run.discount,
                 mcts_for_reanalyze=self.run,
                 torch_profile_steps=self.run.profile_torch_steps if do_kineto else 0,
@@ -561,7 +571,30 @@ class Coach:
         games = len(trajectories)
         positions = sum(trajectory.game_length for trajectory in trajectories)
         average_ply = positions / games if games else 0.0
-        max_ply_fraction = sum(trajectory.truncated for trajectory in trajectories) / games if games else 0.0
+        truncated_games = sum(trajectory.truncated for trajectory in trajectories)
+        white_wins = 0
+        black_wins = 0
+        draws = 0
+        policy_entropy_sum = 0.0
+        for trajectory in trajectories:
+            probabilities = trajectory.root_policies.astype(np.float32)
+            positive = probabilities > 0.0
+            policy_entropy_sum -= float(np.sum(probabilities[positive] * np.log(probabilities[positive])))
+            if trajectory.truncated:
+                continue
+            terminal_reward = float(trajectory.rewards[-1])
+            if terminal_reward == 0.0:
+                draws += 1
+                continue
+            white_reward = terminal_reward if trajectory.game_length % 2 else -terminal_reward
+            if white_reward > 0.0:
+                white_wins += 1
+            else:
+                black_wins += 1
+
+        max_ply_fraction = truncated_games / games if games else 0.0
+        decisive_games = white_wins + black_wins
+        policy_entropy = policy_entropy_sum / positions if positions else 0.0
         positions_per_second = positions / stats.self_play_s if stats.self_play_s > 0.0 else 0.0
         wandb.log(
             {
@@ -571,6 +604,12 @@ class Coach:
                 "selfplay/positions": positions,
                 "selfplay/avg_ply": average_ply,
                 "selfplay/max_ply_fraction": max_ply_fraction,
+                "selfplay/truncated_fraction": max_ply_fraction,
+                "selfplay/decisive_fraction": decisive_games / games if games else 0.0,
+                "selfplay/draw_fraction": draws / games if games else 0.0,
+                "selfplay/white_win_fraction": white_wins / games if games else 0.0,
+                "selfplay/black_win_fraction": black_wins / games if games else 0.0,
+                "selfplay/policy_entropy": policy_entropy,
                 "performance/self_play_seconds": stats.self_play_s,
                 "performance/self_play_positions_per_second": positions_per_second,
                 "performance/train_seconds": stats.train_s,
@@ -599,8 +638,13 @@ class Coach:
             stored_protocol: object = payload["protocol"]
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise RuntimeError(f"Could not read external-evaluation metadata: {metadata_path}") from exc
-        if isinstance(score, bool) or not isinstance(score, int | float):
-            raise RuntimeError(f"External-evaluation score is not numeric: {metadata_path}")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, int | float)
+            or not math.isfinite(score)
+            or not 0.0 <= score <= 1.0
+        ):
+            raise RuntimeError(f"External-evaluation score must be finite and between zero and one: {metadata_path}")
         if stored_protocol != protocol:
             raise RuntimeError(
                 f"External-evaluation protocol differs from the score in {metadata_path}; "

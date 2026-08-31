@@ -76,11 +76,11 @@ from being merged accidentally.
 
 Use `uv run python src/main.py --help` for the complete Tyro-generated option reference. A bare `src/main.py` invocation uses the lighter dataclass defaults; `make train` applies the larger maintained experiment preset.
 
-## Throughput training phase
+## Strength training phase
 
 The continuation preset starts from the formally externally evaluated best snapshot,
 `runs/luna-stockfish16-continuation/best.pth.tar` (iteration 225), and writes a separate
-lineage to `runs/luna-throughput-phase`:
+lineage to `runs/luna-strength-1500-v1`:
 
 ```bash
 make train-phase
@@ -106,7 +106,8 @@ make resume-phase
 
 Resume restores the phase optimizer, scaler, counters, and original learning-rate
 schedule. Both commands pass the same `NEW_PHASE_WANDB_RUN_ID` (default
-`luna-throughput-phase-v1`) through `--wandb-run-id`. `make train-phase` uses
+`luna-strength-1500-v1`) through `--wandb-run-id` and the display name
+`Luna Strength 1500 v1` through `--wandb-run-name`. `make train-phase` uses
 `--wandb-resume never`, so it refuses to append a new phase to an existing remote run;
 `make resume-phase` uses `--wandb-resume must`, so a typo or missing remote run fails
 instead of silently creating a second dashboard. Change the run ID only when intentionally
@@ -223,7 +224,7 @@ make check               # format check + lint + types + tests
 make audit               # audit locked runtime dependencies (network required)
 make bench               # throughput benchmark
 make profile-smoke       # bounded end-to-end profile
-make train-phase         # start the dedicated throughput continuation phase
+make train-phase         # start the dedicated strength continuation phase
 make resume-phase        # resume that phase after an interruption
 make test-pipeline-cpu   # short CPU training smoke test
 make test-pipeline-mps   # short MPS training smoke test

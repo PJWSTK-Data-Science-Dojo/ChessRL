@@ -7,7 +7,9 @@ import torch
 from luna.config import EzV2LearnerConfig
 from luna.ezv2_networks import (
     EZV2Networks,
+    PredictionNetwork,
     _flatten_spatial_policy,
+    _scale_latent,
     _support_to_scalar,
     action_index_to_planes,
     scalar_to_support,
@@ -55,12 +57,37 @@ def test_support_transform_roundtrip() -> None:
     assert torch.allclose(values.clamp(-support_size, support_size), recovered, atol=0.1)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_latent_scaling_uses_stable_statistics_and_preserves_dtype(dtype: torch.dtype) -> None:
+    latent = torch.linspace(-3.0, 5.0, 2 * 8 * 8 * 8, dtype=dtype).reshape(2, 8, 8, 8)
+
+    scaled = _scale_latent(latent)
+    flat = scaled.float().flatten(1)
+
+    assert scaled.dtype == dtype
+    torch.testing.assert_close(flat.mean(dim=1), torch.zeros(2), atol=2e-2, rtol=0.0)
+    torch.testing.assert_close(flat.std(dim=1, correction=0), torch.ones(2), atol=2e-2, rtol=0.0)
+
+
 def test_action_spatial_encoding() -> None:
     actions = torch.tensor([0, 4095, 100])
     planes = action_index_to_planes(actions, torch.device("cpu"))
     assert planes.shape == (3, 5, 8, 8)
     assert planes[0, 0].sum().item() == 1.0
     assert planes[0, 1].sum().item() == 1.0
+
+
+def test_policy_mask_is_finite_for_float16_logits() -> None:
+    prediction = PredictionNetwork(channels=8, action_size=4288, support_size=1).half()
+    latent = torch.randn(1, 8, 8, 8, dtype=torch.float16)
+    valid = torch.zeros(1, 4288, dtype=torch.float16)
+    valid[:, :2] = 1
+
+    policy_logits, _value_logits = prediction(latent, valid)
+    log_policy = torch.log_softmax(policy_logits, dim=1)
+
+    assert torch.isfinite(log_policy).all()
+    assert torch.count_nonzero(torch.exp(log_policy[:, 2:])) == 0
 
 
 def test_spatial_policy_head_preserves_action_layout() -> None:
