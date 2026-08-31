@@ -141,6 +141,7 @@ def test_phase_make_target_sets_explicit_wandb_resume_policy(target: str, resume
     assert '--wandb-run-id "luna-strength-1500-v1"' in result.stdout
     assert '--wandb-run-name "Luna Strength 1500 v1"' in result.stdout
     assert f"--wandb-resume {resume_mode}" in result.stdout
+    assert "--run.self-play-workers 4" in result.stdout
     assert "--learner.reanalyze-prob 0.10" in result.stdout
 
 

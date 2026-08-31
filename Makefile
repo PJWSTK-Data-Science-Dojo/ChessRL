@@ -23,7 +23,7 @@ PHASE_TRAIN_ARGS = \
 	--run.gumbel-max-considered-actions 16 \
 	--run.num-iters 400 \
 	--run.num-episodes 128 \
-	--run.self-play-workers 2 \
+	--run.self-play-workers 4 \
 	--run.parallel-games 32 \
 	--run.num-mcts-sims 32 \
 	--run.recurrent-policy-topk 256 \

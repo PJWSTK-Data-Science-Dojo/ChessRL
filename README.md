@@ -116,7 +116,7 @@ starting a different phase. If the remote run was deliberately deleted while its
 checkpoint remains valid, recreate it explicitly with
 `make resume-phase ARGS='--wandb-resume allow'`. The general CLI defaults to `allow`.
 The maintained phase preset collects 128 self-play episodes
-with two persistent actors running up to 32 active games each, trains with batches of
+with four persistent actors running up to 32 active games each, trains with batches of
 256, reanalyzes 10% of eligible samples, and uses a fixed 20-game Stockfish sentinel.
 The actor pool is controlled by `--run.self-play-workers` and can be overridden through
 `ARGS`; set it to `1` for in-process self-play without the pool.
