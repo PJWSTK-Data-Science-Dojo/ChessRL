@@ -95,7 +95,8 @@ This imports the validated model weights but deliberately starts a fresh optimiz
 scaler, counters, replay buffer, and warm-up/cosine learning-rate schedule. The target
 directory must not exist or must be completely empty; the command refuses to merge it
 with an earlier lineage. A local, Git-ignored `.env` must define
-`WANDB_API_KEY` and `WANDB_ENTITY`. The preflight checks only that both variables are
+`WANDB_API_KEY` and `WANDB_ENTITY` (use `dsc-pjatk-warsaw` for the maintained
+experiment). The preflight checks only that both variables are
 non-empty and does not print their values.
 
 After a crash or reboot, continue the phase instead of starting it again:
