@@ -51,6 +51,23 @@ class RecurrentBatchResult(NamedTuple):
     next_latent: torch.Tensor
 
 
+class ReanalysisBatchStats(NamedTuple):
+    """Work actually performed while refreshing one sampled replay batch."""
+
+    selected_samples: int
+    searched_positions: int
+    duration_seconds: float
+
+
+class PreparedBatch(NamedTuple):
+    """Collated replay batch plus observable reanalysis work."""
+
+    collated: dict[str, np.ndarray]
+    is_weights: np.ndarray
+    tree_indices: list[int]
+    reanalysis: ReanalysisBatchStats
+
+
 @dataclass(frozen=True, slots=True)
 class TrainingPhaseProvenance:
     """Immutable identity of the checkpoint used to start a training phase."""
@@ -90,7 +107,6 @@ _PredictionInference = Callable[
     [torch.Tensor, torch.Tensor | None],
     tuple[torch.Tensor, torch.Tensor],
 ]
-_PreparedBatch = tuple[dict[str, np.ndarray], np.ndarray, list[int]]
 _RUNTIME_LEARNER_FIELDS = frozenset({"device", "cuda_device", "compile_inference", "compile_training"})
 _MODEL_LEARNER_FIELDS = frozenset(
     {"model_name", "num_channels", "support_size", "repr_blocks", "dyn_blocks", "proj_dim"}
@@ -456,7 +472,7 @@ class LunaNetwork:
         discount: float,
         training_step: int,
         mcts_for_reanalyze: MCTSParams | None,
-    ) -> _PreparedBatch:
+    ) -> PreparedBatch:
         """Sample and collate replay, replacing selected stale targets with fresh search."""
         L = self._learner
         game = self._game
@@ -491,6 +507,7 @@ class LunaNetwork:
                     if position + 1 < traj.game_length:
                         player = game.push_action(board, player, int(traj.actions[position]))
 
+        reanalysis_started_at = time.perf_counter() if boards else None
         if boards:
             mcts_r = replace(
                 mcts_base,
@@ -534,7 +551,17 @@ class LunaNetwork:
             )
 
         collated = collate_batch(batch_targets)
-        return collated, is_weights, tree_indices
+        reanalysis_seconds = time.perf_counter() - reanalysis_started_at if reanalysis_started_at is not None else 0.0
+        return PreparedBatch(
+            collated,
+            is_weights,
+            tree_indices,
+            ReanalysisBatchStats(
+                selected_samples=sum(override is not None for override in root_overrides),
+                searched_positions=len(boards),
+                duration_seconds=reanalysis_seconds,
+            ),
+        )
 
     def _validate_training_inputs(
         self,
@@ -630,6 +657,13 @@ class LunaNetwork:
         r_loss_m = AverageMeter()
         consist_loss_m = AverageMeter()
         step_time_m = AverageMeter()
+        grad_norm_preclip_m = AverageMeter()
+        grad_norm_postclip_m = AverageMeter()
+        grad_clip_coefficient_m = AverageMeter()
+        grad_clip_fraction_m = AverageMeter()
+        reanalysis_selected_samples_m = AverageMeter()
+        reanalysis_searched_positions_m = AverageMeter()
+        reanalysis_seconds_m = AverageMeter()
 
         L = self._learner
         unroll = L.unroll_steps
@@ -643,7 +677,7 @@ class LunaNetwork:
         async_pf = self._async_batch_prefetch(steps)
 
         self.optimizer.zero_grad(set_to_none=True)
-        prefetch_future: Future[_PreparedBatch] | None = None
+        prefetch_future: Future[PreparedBatch] | None = None
         prefetch_training_step: int | None = None
         if async_pf:
             prefetch_executor = self._prefetch_executor
@@ -663,7 +697,7 @@ class LunaNetwork:
 
         completed_steps = 0
         consecutive_amp_skips = 0
-        retry_batch: _PreparedBatch | None = None
+        retry_batch: PreparedBatch | None = None
         try:
             while completed_steps < steps:
                 step = completed_steps + 1
@@ -682,17 +716,18 @@ class LunaNetwork:
                 accum_c_acc = torch.zeros((), device=self.device, dtype=torch.float32)
                 all_priority_errors: list[np.ndarray] = []
                 all_tree_indices: list[list[int]] = []
+                latent_health: dict[str, float] = {}
 
                 if retry_batch is not None:
-                    collated, is_weights, tree_indices = retry_batch
+                    collated, is_weights, tree_indices, reanalysis_stats = retry_batch
                 elif async_pf and prefetch_future is not None:
                     if prefetch_training_step != training_step:
                         raise RuntimeError("Asynchronous replay prefetch is out of sequence")
-                    collated, is_weights, tree_indices = prefetch_future.result()
+                    collated, is_weights, tree_indices, reanalysis_stats = prefetch_future.result()
                     prefetch_future = None
                     prefetch_training_step = None
                 else:
-                    collated, is_weights, tree_indices = self._prepare_batch(
+                    collated, is_weights, tree_indices, reanalysis_stats = self._prepare_batch(
                         replay,
                         bs,
                         unroll,
@@ -805,10 +840,12 @@ class LunaNetwork:
                             current_latent = next_latent
 
                         num_valid = v_mask.sum(dim=1).clamp(min=1.0)
+                        num_unroll = u_mask.sum(dim=1).clamp(min=1.0)
+                        num_consistency = c_mask.sum(dim=1).clamp(min=1.0)
                         normalized_pi = loss_pi_total / num_valid
                         normalized_v = loss_v_total / num_valid
-                        normalized_r = loss_r_total / num_valid
-                        normalized_consist = loss_consist_total / num_valid
+                        normalized_r = loss_r_total / num_unroll
+                        normalized_consist = loss_consist_total / num_consistency
                         total = (
                             L.policy_loss_weight * normalized_pi
                             + L.value_loss_weight * normalized_v
@@ -821,6 +858,19 @@ class LunaNetwork:
                         weighted_v = (normalized_v * is_w).mean() / grad_accum
                         weighted_r = (normalized_r * is_w).mean() / grad_accum
                         weighted_consist = (normalized_consist * is_w).mean() / grad_accum
+
+                        if (step % 50 == 0 or step == steps) and accum_idx == grad_accum - 1:
+                            active_consistency = c_mask[:, -1].bool()
+                            latent_health["train/consistency_active_fraction"] = float(c_mask.mean().item())
+                            latent_health["train/latent_health_active_samples"] = float(active_consistency.sum().item())
+                            if bool(active_consistency.any()):
+                                latent_health.update(
+                                    _latent_health_metrics(
+                                        self.nnet.simsiam,
+                                        next_latent[active_consistency],
+                                        target_latent[active_consistency],
+                                    )
+                                )
 
                     torch.autograd.backward(self.scaler.scale(weighted))
 
@@ -877,7 +927,7 @@ class LunaNetwork:
 
                 if gradient_overflow:
                     consecutive_amp_skips += 1
-                    retry_batch = (collated, is_weights, tree_indices)
+                    retry_batch = PreparedBatch(collated, is_weights, tree_indices, reanalysis_stats)
                     if consecutive_amp_skips >= _MAX_CONSECUTIVE_AMP_SKIPS:
                         raise RuntimeError(
                             "Mixed-precision training stopped after "
@@ -898,6 +948,16 @@ class LunaNetwork:
                 consecutive_amp_skips = 0
                 self._global_step = training_step
                 completed_steps += 1
+
+                grad_norm_value = float(grad_norm)
+                grad_clip_coefficient = min(1.0, L.grad_clip_norm / max(grad_norm_value, 1e-12))
+                grad_norm_preclip_m.update(grad_norm_value)
+                grad_norm_postclip_m.update(grad_norm_value * grad_clip_coefficient)
+                grad_clip_coefficient_m.update(grad_clip_coefficient)
+                grad_clip_fraction_m.update(float(grad_clip_coefficient < 1.0))
+                reanalysis_selected_samples_m.update(float(reanalysis_stats.selected_samples))
+                reanalysis_searched_positions_m.update(float(reanalysis_stats.searched_positions))
+                reanalysis_seconds_m.update(reanalysis_stats.duration_seconds)
 
                 priority_indices = [index for microbatch_indices in all_tree_indices for index in microbatch_indices]
                 priority_errors = np.concatenate(all_priority_errors)
@@ -932,11 +992,21 @@ class LunaNetwork:
                                 "train/loss_value": v_loss_m.avg,
                                 "train/loss_reward": r_loss_m.avg,
                                 "train/loss_consistency": consist_loss_m.avg,
+                                "train/loss_consistency_weighted": (L.consistency_loss_weight * consist_loss_m.avg),
                                 "train/lr": new_lr,
-                                "train/grad_norm": float(grad_norm),
+                                "train/grad_norm": grad_norm_preclip_m.avg,
+                                "train/grad_norm_preclip": grad_norm_preclip_m.avg,
+                                "train/grad_norm_postclip": grad_norm_postclip_m.avg,
+                                "train/grad_clip_coefficient": grad_clip_coefficient_m.avg,
+                                "train/grad_clip_fraction": grad_clip_fraction_m.avg,
+                                "train/reanalysis_selected_samples": reanalysis_selected_samples_m.avg,
+                                "train/reanalysis_selected_fraction": reanalysis_selected_samples_m.avg / bs,
+                                "train/reanalysis_searched_positions": reanalysis_searched_positions_m.avg,
+                                "train/reanalysis_seconds": reanalysis_seconds_m.avg,
                                 "train/step_time": step_time_m.avg,
                                 "train/samples_per_second": bs / step_time_m.avg if step_time_m.avg > 0.0 else 0.0,
                                 "global_step": self._global_step,
+                                **latent_health,
                             }
                         )
 
@@ -1579,3 +1649,46 @@ def _simsiam_loss(
     p_pred = F.normalize(p_pred, dim=1)
     z_target = F.normalize(z_target, dim=1)
     return 1.0 - (p_pred * z_target).sum(dim=1)
+
+
+def _latent_health_metrics(
+    simsiam: SimSiamProjector,
+    predicted_latent: torch.Tensor,
+    target_latent: torch.Tensor,
+) -> dict[str, float]:
+    """Return detached collapse diagnostics for one reporting microbatch."""
+    with torch.no_grad():
+        predicted = predicted_latent.detach().float()
+        target = target_latent.detach().float()
+
+        def batch_feature_std(latent: torch.Tensor) -> float:
+            flattened = latent.flatten(1)
+            return float(flattened.std(dim=0, unbiased=False).mean().item())
+
+        def spatial_std(latent: torch.Tensor) -> float:
+            return float(latent.std(dim=(-2, -1), unbiased=False).mean().item())
+
+        projected_predicted = simsiam.project(predicted_latent.detach()).float()
+        projected_target = simsiam.project(target_latent.detach()).float()
+        normalized_predicted = F.normalize(projected_predicted, dim=1)
+        normalized_target = F.normalize(projected_target, dim=1)
+        alignment = (normalized_predicted * normalized_target).sum(dim=1).mean()
+        projector_batch_std = projected_target.std(dim=0, unbiased=False).mean()
+
+        batch = normalized_target.shape[0]
+        if batch > 1:
+            similarities = normalized_target @ normalized_target.T
+            off_diagonal_sum = similarities.abs().sum() - similarities.diagonal().abs().sum()
+            off_diagonal_cosine = off_diagonal_sum / (batch * (batch - 1))
+        else:
+            off_diagonal_cosine = torch.zeros((), device=normalized_target.device)
+
+        return {
+            "train/latent_predicted_batch_feature_std": batch_feature_std(predicted),
+            "train/latent_target_batch_feature_std": batch_feature_std(target),
+            "train/latent_predicted_spatial_std": spatial_std(predicted),
+            "train/latent_target_spatial_std": spatial_std(target),
+            "train/projector_target_batch_std": float(projector_batch_std.item()),
+            "train/projector_target_offdiag_cosine": float(off_diagonal_cosine.item()),
+            "train/consistency_cosine_alignment": float(alignment.item()),
+        }

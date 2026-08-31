@@ -22,6 +22,10 @@ class Trajectory:
         "actions",
         "game_length",
         "observations",
+        "repetition_guard_attempts",
+        "repetition_guard_excluded_actions",
+        "repetition_guard_forced_fallbacks",
+        "repetition_guard_interventions",
         "rewards",
         "root_policies",
         "root_values",
@@ -40,6 +44,10 @@ class Trajectory:
         valids: list[np.ndarray] | np.ndarray,
         truncated: bool = False,
         termination: chess.Termination | None = None,
+        repetition_guard_attempts: int = 0,
+        repetition_guard_interventions: int = 0,
+        repetition_guard_forced_fallbacks: int = 0,
+        repetition_guard_excluded_actions: int = 0,
     ) -> None:
         raw_actions = np.asarray(actions)
         if raw_actions.ndim != 1 or raw_actions.size == 0:
@@ -106,6 +114,21 @@ class Trajectory:
             raise TypeError("termination must be a chess.Termination or None")
         if truncated and termination is not None:
             raise ValueError("A truncated trajectory cannot have a terminal chess outcome")
+        guard_counts = {
+            "repetition_guard_attempts": repetition_guard_attempts,
+            "repetition_guard_interventions": repetition_guard_interventions,
+            "repetition_guard_forced_fallbacks": repetition_guard_forced_fallbacks,
+            "repetition_guard_excluded_actions": repetition_guard_excluded_actions,
+        }
+        for name, value in guard_counts.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if repetition_guard_attempts != repetition_guard_interventions + repetition_guard_forced_fallbacks:
+            raise ValueError("repetition guard attempts must equal interventions plus forced fallbacks")
+        if repetition_guard_attempts > game_length:
+            raise ValueError("repetition guard cannot be attempted more than once per trajectory position")
+        if repetition_guard_interventions > 0 and repetition_guard_excluded_actions < repetition_guard_interventions:
+            raise ValueError("each repetition guard intervention must exclude at least one action")
 
         self.observations = observations_array
         self.actions = actions_array
@@ -116,6 +139,10 @@ class Trajectory:
         self.game_length = game_length
         self.truncated = bool(truncated)
         self.termination = termination
+        self.repetition_guard_attempts = repetition_guard_attempts
+        self.repetition_guard_interventions = repetition_guard_interventions
+        self.repetition_guard_forced_fallbacks = repetition_guard_forced_fallbacks
+        self.repetition_guard_excluded_actions = repetition_guard_excluded_actions
 
 
 class _SumTree:

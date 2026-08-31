@@ -2,25 +2,37 @@ ARGS ?=
 TRAIN_ARGS ?=
 CHECKPOINT_DIR ?= ./runs/luna-main
 CHECKPOINT_PATH = $(CHECKPOINT_DIR)/latest.pth.tar
-NEW_PHASE_SOURCE_DIR ?= ./runs/luna-stockfish16-continuation
-NEW_PHASE_SOURCE_FILE ?= best.pth.tar
-NEW_PHASE_SOURCE_SHA256 ?= b6ec9f2e5455f592a3833a285fe478dfba9bb9bdddba9207a2d66572277c7b8d
+NEW_PHASE_SOURCE_DIR ?= ./runs/sources
+NEW_PHASE_SOURCE_FILE ?= luna-balanced-precollapse-iter40.pth.tar
+NEW_PHASE_SOURCE_SHA256 ?= dd07d8ddf2aa652719b405b4e3b6f7381bb652873a34d139fe37b95327ba99dd
 MIGRATION_SOURCE_DIR ?= ./runs/luna-strength-1500-v1
-NEW_PHASE_CHECKPOINT_DIR ?= ./runs/luna-fairy-ladder-v1
+NEW_PHASE_CHECKPOINT_DIR ?= ./runs/luna-balanced-ezv2-anti-collapse-v2
+MIGRATION_CHECKPOINT_DIR ?= ./runs/luna-fairy-ladder-v1
 FAIRY_STOCKFISH_PATH ?= ./vendor/stockfish/fairy-stockfish-14
 TRAIN_ENV_FILE ?= .env
 WANDB_PROJECT ?= ChessRL
-NEW_PHASE_WANDB_RUN_ID ?= luna-fairy-ladder-v1
-NEW_PHASE_WANDB_RUN_NAME ?= Luna Fairy Ladder 500+ · Benchmark 1500 v1
+NEW_PHASE_WANDB_RUN_ID ?= luna-balanced-ezv2-anti-collapse-v2
+NEW_PHASE_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · Anti-Collapse v2
+MIGRATION_WANDB_RUN_ID ?= luna-fairy-ladder-v1
+MIGRATION_WANDB_RUN_NAME ?= Luna Fairy Ladder 500+ · Benchmark 1500 v1
 PUBLIC_ENV ?= .env.public
 RELEASE_DIR ?= ./release
 RELEASE_ID ?=
 RELEASE_SOURCE ?= $(CHECKPOINT_DIR)/best.pth.tar
 
-PHASE_TRAIN_ARGS = \
+NEW_PHASE_IDENTITY_ARGS = \
 	--wandb-project "$(WANDB_PROJECT)" \
 	--wandb-run-id "$(NEW_PHASE_WANDB_RUN_ID)" \
 	--wandb-run-name "$(NEW_PHASE_WANDB_RUN_NAME)" \
+	--run.checkpoint "$(NEW_PHASE_CHECKPOINT_DIR)"
+
+MIGRATION_PHASE_IDENTITY_ARGS = \
+	--wandb-project "$(WANDB_PROJECT)" \
+	--wandb-run-id "$(MIGRATION_WANDB_RUN_ID)" \
+	--wandb-run-name "$(MIGRATION_WANDB_RUN_NAME)" \
+	--run.checkpoint "$(MIGRATION_CHECKPOINT_DIR)"
+
+PHASE_TRAIN_ARGS = \
 	--run.search-mode gumbel \
 	--run.gumbel-max-considered-actions 16 \
 	--run.gumbel-scale 1.0 \
@@ -31,10 +43,14 @@ PHASE_TRAIN_ARGS = \
 	--run.parallel-games 32 \
 	--run.num-mcts-sims 32 \
 	--run.recurrent-policy-topk 256 \
-	--run.temp-threshold 20 \
+	--run.temp-threshold 257 \
+	--run.self-play-repetition-guard \
 	--run.max-ply 256 \
-	--run.train-steps-per-iter 150 \
+	--run.train-steps-per-iter 200 \
+	--run.target-replay-ratio 2.0 \
+	--run.lr-schedule-total-steps 60000 \
 	--run.replay-capacity 300000 \
+	--run.replay-warmup-positions 50000 \
 	--run.stockfish-eval-every 25 \
 	--run.stockfish-eval-games 20 \
 	--run.stockfish-elo 1500 \
@@ -46,7 +62,6 @@ PHASE_TRAIN_ARGS = \
 	--run.ladder-required-passes 2 \
 	--run.ladder-depth 10 \
 	--run.ladder-path "$(FAIRY_STOCKFISH_PATH)" \
-	--run.checkpoint "$(NEW_PHASE_CHECKPOINT_DIR)" \
 	--run.checkpoint-top-k 3 \
 	--learner.device cuda \
 	--learner.cuda-device 0 \
@@ -73,9 +88,10 @@ PHASE_TRAIN_ARGS = \
 	--learner.dataloader-workers 4 \
 	--learner.compile-inference \
 	--learner.compile-training \
-	--learner.reanalyze-mcts-sims 16 \
-	--learner.reanalyze-prob 0.10 \
-	--learner.reanalyze-start-step 40000
+	--learner.reanalyze-mcts-sims 8 \
+	--learner.reanalyze-prob 0.02 \
+	--learner.no-reanalyze-policy \
+	--learner.reanalyze-start-step 10000
 
 WEB_COMPOSE = docker compose --env-file .env -f docker-compose.yml
 PUBLIC_COMPOSE = docker compose --env-file $(PUBLIC_ENV) -f docker-compose.yml -f docker-compose.public.yml
@@ -122,10 +138,14 @@ train:
 		--run.parallel-games 32 \
 		--run.num-mcts-sims 32 \
 		--run.recurrent-policy-topk 256 \
-		--run.temp-threshold 20 \
+		--run.temp-threshold 257 \
+		--run.self-play-repetition-guard \
 		--run.max-ply 256 \
-		--run.train-steps-per-iter 150 \
+		--run.train-steps-per-iter 200 \
+		--run.target-replay-ratio 2.0 \
+		--run.lr-schedule-total-steps 60000 \
 		--run.replay-capacity 300000 \
+		--run.replay-warmup-positions 50000 \
 		--run.stockfish-eval-every 25 \
 		--run.stockfish-eval-games 8 \
 		--run.stockfish-elo 1500 \
@@ -156,9 +176,10 @@ train:
 		--learner.dataloader-workers 4 \
 		--learner.compile-inference \
 		--learner.compile-training \
-		--learner.reanalyze-mcts-sims 16 \
-		--learner.reanalyze-prob 0.10 \
-		--learner.reanalyze-start-step 40000 \
+		--learner.reanalyze-mcts-sims 8 \
+		--learner.reanalyze-prob 0.02 \
+		--learner.no-reanalyze-policy \
+		--learner.reanalyze-start-step 10000 \
 		$(TRAIN_ARGS) $(ARGS)
 
 resume:
@@ -186,6 +207,7 @@ train-phase: _train-env-preflight _fairy-stockfish-preflight
 		--load-checkpoint-dir "$(NEW_PHASE_SOURCE_DIR)" \
 		--load-checkpoint-file "$(NEW_PHASE_SOURCE_FILE)" \
 		--wandb-resume never \
+		$(NEW_PHASE_IDENTITY_ARGS) \
 		$(PHASE_TRAIN_ARGS) $(ARGS)
 
 # Resume the same phase contract after an interruption without resetting
@@ -199,6 +221,7 @@ resume-phase: _train-env-preflight _fairy-stockfish-preflight
 		--load-checkpoint-dir "$(NEW_PHASE_CHECKPOINT_DIR)" \
 		--load-checkpoint-file latest.pth.tar \
 		--wandb-resume must \
+		$(NEW_PHASE_IDENTITY_ARGS) \
 		$(PHASE_TRAIN_ARGS) $(ARGS)
 
 # Continue the complete optimizer/checkpoint state in the new ladder contract.
@@ -212,6 +235,21 @@ migrate-ladder-phase: _train-env-preflight _fairy-stockfish-preflight
 		--load-checkpoint-dir "$(MIGRATION_SOURCE_DIR)" \
 		--load-checkpoint-file latest.pth.tar \
 		--wandb-resume never \
+		$(MIGRATION_PHASE_IDENTITY_ARGS) \
+		$(PHASE_TRAIN_ARGS) $(ARGS)
+
+# Resume the complete-state migration lineage without reusing the weights-only
+# phase target or W&B identity.
+resume-migrated-phase: _train-env-preflight _fairy-stockfish-preflight
+	@test -f "$(MIGRATION_CHECKPOINT_DIR)/latest.pth.tar" || \
+		find "$(MIGRATION_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'checkpoint_*.pth.tar' -print -quit | grep -q . || { \
+		echo "No migrated phase resume checkpoint found in $(MIGRATION_CHECKPOINT_DIR)" >&2; exit 2; }
+	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/main.py \
+		--load-model \
+		--load-checkpoint-dir "$(MIGRATION_CHECKPOINT_DIR)" \
+		--load-checkpoint-file latest.pth.tar \
+		--wandb-resume must \
+		$(MIGRATION_PHASE_IDENTITY_ARGS) \
 		$(PHASE_TRAIN_ARGS) $(ARGS)
 
 # Short end-to-end run with phase timings and a compact profiler trace.
@@ -323,7 +361,7 @@ test-pipeline-mps:
 	$(MAKE) test-pipeline-cpu ARGS="--learner.device mps $(ARGS)"
 
 .PHONY: _fairy-stockfish-preflight _train-env-preflight audit bench check eval-stockfish fmt format-check \
-	install-fairy-stockfish lichess-config lint migrate-ladder-phase profile-smoke release-web-model resume resume-phase \
+	install-fairy-stockfish lichess-config lint migrate-ladder-phase profile-smoke release-web-model resume resume-migrated-phase resume-phase \
 	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train-phase \
 	train types uci verify-web-model web-build web-config web-down web-logs web-public-config \
 	web-public-down web-public-logs web-public-up web-up

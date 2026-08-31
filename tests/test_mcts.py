@@ -372,6 +372,42 @@ class TestBatchedMCTS:
             assert valid.shape == (chess_game.get_action_size(),)
             assert np.count_nonzero(probs[valid == 0]) == 0
 
+    def test_allowed_root_actions_restrict_search_but_preserve_full_legal_masks(
+        self,
+        chess_game: ChessGame,
+        small_learner_config: EzV2LearnerConfig,
+    ) -> None:
+        network = LunaNetwork(chess_game, small_learner_config)
+        search = BatchedMCTS(
+            chess_game,
+            network,
+            MCTSParams(num_mcts_sims=3, dir_noise=False, recurrent_policy_topk=None),
+        )
+        boards = [chess_game.get_init_board(), chess_game.get_init_board()]
+        allowed_action = move_to_action(chess.Move.from_uci("e2e4"))
+        other_legal_action = move_to_action(chess.Move.from_uci("g1f3"))
+        expected_legal = chess_game.get_valid_moves(boards[0], 1)
+
+        results = search.search_batch(
+            boards,
+            num_sims=3,
+            add_exploration_noise=False,
+            allowed_root_actions=[{allowed_action}, None],
+        )
+
+        restricted_policy, _restricted_value, _restricted_obs, restricted_valid = results[0]
+        unrestricted_policy, _unrestricted_value, _unrestricted_obs, unrestricted_valid = results[1]
+        np.testing.assert_array_equal(restricted_valid, expected_legal)
+        np.testing.assert_array_equal(unrestricted_valid, expected_legal)
+        assert restricted_valid[other_legal_action] == 1.0
+        assert restricted_policy[other_legal_action] == 0.0
+        assert set(np.flatnonzero(restricted_policy)) == {allowed_action}
+        assert search.last_actions[0] == allowed_action
+        assert np.count_nonzero(unrestricted_policy[expected_legal == 0]) == 0
+
+        with pytest.raises(ValueError, match="one entry per batched root"):
+            search.search_batch(boards, allowed_root_actions=[{allowed_action}])
+
     @pytest.mark.parametrize("temperature", [1e-8, np.nextafter(0.0, 1.0)])
     def test_batch_puct_tiny_positive_temperature_returns_finite_policy(
         self,

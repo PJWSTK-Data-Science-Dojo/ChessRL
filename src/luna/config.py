@@ -97,14 +97,26 @@ class TrainingRunConfig(MCTSParams):
     temp_threshold: int = 15
     """Ply after which ordinary self-play exploration stops; Gumbel re-enables it for repeated roots."""
 
+    self_play_repetition_guard: bool = False
+    """Retry self-play root search without moves that immediately enable a threefold-repetition claim."""
+
     evaluation_num_mcts_sims: int | None = None
     """Independent external-evaluation budget; the self-play budget is used when unset."""
 
     train_steps_per_iter: int = 200
-    """Optimizer steps performed after each self-play collection phase."""
+    """Maximum optimizer steps performed after each self-play collection phase."""
+
+    target_replay_ratio: float | None = None
+    """Optional target learner samples per newly generated position; the step cap still applies."""
+
+    lr_schedule_total_steps: int | None = None
+    """Optional fixed optimizer-step horizon for warm-up and cosine decay."""
 
     replay_capacity: int = 100_000
     """Maximum number of positions retained in prioritized replay."""
+
+    replay_warmup_positions: int = 0
+    """Minimum replay positions required before training; zero falls back to one learner batch."""
 
     per_alpha: float = 0.6
     """Priority exponent; zero reduces sampling to uniform replay."""
@@ -365,6 +377,13 @@ def _validate_training_schedule(run: TrainingRunConfig) -> None:
     ):
         _positive_integer(name, getattr(run, name))
     _finite_at_least("self_play_actor_timeout_s", run.self_play_actor_timeout_s, math.ulp(0.0))
+    if run.target_replay_ratio is not None:
+        _finite_at_least("target_replay_ratio", run.target_replay_ratio, math.ulp(0.0))
+    if run.lr_schedule_total_steps is not None:
+        _positive_integer("lr_schedule_total_steps", run.lr_schedule_total_steps)
+    _non_negative_integer("replay_warmup_positions", run.replay_warmup_positions)
+    if run.replay_warmup_positions > run.replay_capacity:
+        raise ValueError("replay_warmup_positions cannot exceed replay_capacity")
     _non_negative_integer("temp_threshold", run.temp_threshold)
     _non_negative_integer("stockfish_eval_every", run.stockfish_eval_every)
     _non_negative_integer("ladder_eval_every", run.ladder_eval_every)

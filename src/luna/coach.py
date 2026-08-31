@@ -75,6 +75,65 @@ def _self_play_exploration_enabled(board: chess.Board, ply: int, run: TrainingRu
     return run.search_mode == "gumbel" and board.is_repetition(2)
 
 
+def _optimizer_steps_for_positions(
+    run: TrainingRunConfig,
+    *,
+    positions: int,
+    batch_size: int,
+) -> int:
+    """Choose an update count without amplifying short self-play trajectories."""
+    if positions <= 0:
+        return 0
+    if run.target_replay_ratio is None:
+        return run.train_steps_per_iter
+    desired_steps = max(1, math.floor(run.target_replay_ratio * positions / batch_size + 0.5))
+    return min(run.train_steps_per_iter, desired_steps)
+
+
+def _select_self_play_action(
+    run: TrainingRunConfig,
+    policy: np.ndarray | list[float],
+    *,
+    explore: bool,
+    gumbel_proposal: int | None,
+) -> int:
+    """Select the action actually executed by a self-play actor."""
+    if run.search_mode == "gumbel":
+        if gumbel_proposal is None:
+            raise RuntimeError("Gumbel search did not propose an action")
+        return gumbel_proposal
+    probabilities = np.asarray(policy, dtype=np.float64)
+    if explore:
+        return int(np.random.choice(len(probabilities), p=probabilities))
+    return int(np.argmax(probabilities))
+
+
+def _enables_threefold_claim(
+    game: ChessGame,
+    board: chess.Board,
+    player: int,
+    action: int,
+) -> bool:
+    """Return whether an action gives the opponent an immediate threefold claim."""
+    child, _next_player = game.get_next_state(board, player, action)
+    outcome = child.outcome(claim_draw=True)
+    return outcome is not None and outcome.termination == chess.Termination.THREEFOLD_REPETITION
+
+
+def _non_repetition_actions(
+    game: ChessGame,
+    board: chess.Board,
+    player: int,
+    legal_mask: np.ndarray,
+) -> list[int]:
+    """Return legal root actions that do not immediately enable a threefold claim."""
+    return [
+        int(action)
+        for action in np.flatnonzero(legal_mask)
+        if not _enables_threefold_claim(game, board, player, int(action))
+    ]
+
+
 def _configure_wandb_metrics() -> None:
     wandb.define_metric("global_step")
     wandb.define_metric("train/*", step_metric="global_step")
@@ -168,7 +227,6 @@ class Coach:
         self._profile_sp_env_s: float = 0.0
         self._checkpoint_lineage_iteration: int | None = None
         self._checkpoint_target_validated = False
-        self._replay_beta_annealing_configured = False
         self._initialize_evaluation_state = initialize_evaluation_state
         self._seed = seed
         validate_wandb_run_id(wandb_run_id)
@@ -219,6 +277,10 @@ class Coach:
         board = self.game.get_init_board()
         current_player = 1
         episode_step = 0
+        guard_attempts = 0
+        guard_interventions = 0
+        guard_forced_fallbacks = 0
+        guard_excluded_actions = 0
 
         while True:
             episode_step += 1
@@ -236,19 +298,42 @@ class Coach:
             obs = self.game.to_array(canonical_board)
             valid = self.game.get_valid_moves(canonical_board, 1)
 
+            action = _select_self_play_action(
+                self.run,
+                pi,
+                explore=explore,
+                gumbel_proposal=mcts.last_action,
+            )
+            if self.run.self_play_repetition_guard and _enables_threefold_claim(
+                self.game,
+                board,
+                current_player,
+                action,
+            ):
+                guard_attempts += 1
+                safe_actions = _non_repetition_actions(self.game, board, current_player, valid)
+                if safe_actions:
+                    guard_interventions += 1
+                    guard_excluded_actions += int(np.count_nonzero(valid)) - len(safe_actions)
+                    pi, root_v = mcts.search_latent(
+                        canonical_board,
+                        temp=1.0,
+                        add_exploration_noise=True,
+                        allowed_root_actions=safe_actions,
+                    )
+                    action = _select_self_play_action(
+                        self.run,
+                        pi,
+                        explore=True,
+                        gumbel_proposal=mcts.last_action,
+                    )
+                else:
+                    guard_forced_fallbacks += 1
+
             observations.append(obs)
             root_policies.append(np.array(pi, dtype=np.float32))
             root_values.append(root_v)
             valids_list.append(valid)
-
-            if self.run.search_mode == "gumbel":
-                if mcts.last_action is None:
-                    raise RuntimeError("Gumbel search did not propose an action")
-                action = mcts.last_action
-            elif explore:
-                action = int(np.random.choice(len(pi), p=pi))
-            else:
-                action = int(np.argmax(pi))
 
             current_player = self.game.push_action(board, current_player, action)
             actions.append(action)
@@ -266,6 +351,10 @@ class Coach:
                     valids_list,
                     terminal_value_for_next_player=outcome,
                     termination=terminal_outcome.termination,
+                    repetition_guard_attempts=guard_attempts,
+                    repetition_guard_interventions=guard_interventions,
+                    repetition_guard_forced_fallbacks=guard_forced_fallbacks,
+                    repetition_guard_excluded_actions=guard_excluded_actions,
                 )
 
             if self.run.max_ply is not None and episode_step >= self.run.max_ply:
@@ -277,6 +366,10 @@ class Coach:
                     valids_list,
                     terminal_value_for_next_player=0.0,
                     truncated=True,
+                    repetition_guard_attempts=guard_attempts,
+                    repetition_guard_interventions=guard_interventions,
+                    repetition_guard_forced_fallbacks=guard_forced_fallbacks,
+                    repetition_guard_excluded_actions=guard_excluded_actions,
                 )
 
     def execute_episodes_batched(self, num_episodes: int, *, progress: bool = True) -> list[Trajectory]:
@@ -312,6 +405,10 @@ class Coach:
         value_lists: list[list[float]] = [[] for _ in range(p)]
         valid_lists: list[list[np.ndarray]] = [[] for _ in range(p)]
         terminal_rewards: list[float] = [0.0] * p
+        guard_attempts = [0] * p
+        guard_interventions = [0] * p
+        guard_forced_fallbacks = [0] * p
+        guard_excluded_actions = [0] * p
 
         completed: list[Trajectory] = []
 
@@ -325,6 +422,10 @@ class Coach:
             value_lists[i].clear()
             valid_lists[i].clear()
             terminal_rewards[i] = 0.0
+            guard_attempts[i] = 0
+            guard_interventions[i] = 0
+            guard_forced_fallbacks[i] = 0
+            guard_excluded_actions[i] = 0
 
         while len(completed) < num_episodes:
             if self.run.profile:
@@ -348,6 +449,53 @@ class Coach:
                 temp=1.0,
                 add_exploration_noise=explore,
             )
+            first_proposals = list(bmcts.last_actions)
+            selected_actions = [
+                _select_self_play_action(
+                    self.run,
+                    output[0],
+                    explore=explore[j],
+                    gumbel_proposal=first_proposals[j],
+                )
+                for j, output in enumerate(batch_out)
+            ]
+
+            retry_rows: list[int] = []
+            retry_safe_actions: list[list[int]] = []
+            if self.run.self_play_repetition_guard:
+                for j, idx in enumerate(active_indices):
+                    action = selected_actions[j]
+                    if not _enables_threefold_claim(self.game, boards[idx], players[idx], action):
+                        continue
+                    guard_attempts[idx] += 1
+                    valid_row = batch_out[j][3]
+                    safe_actions = _non_repetition_actions(self.game, boards[idx], players[idx], valid_row)
+                    if safe_actions:
+                        guard_interventions[idx] += 1
+                        guard_excluded_actions[idx] += int(np.count_nonzero(valid_row)) - len(safe_actions)
+                        retry_rows.append(j)
+                        retry_safe_actions.append(safe_actions)
+                    else:
+                        guard_forced_fallbacks[idx] += 1
+
+            if retry_rows:
+                retry_out = bmcts.search_batch(
+                    [canonical_boards[j] for j in retry_rows],
+                    temp=1.0,
+                    add_exploration_noise=[True] * len(retry_rows),
+                    allowed_root_actions=retry_safe_actions,
+                )
+                retry_proposals = list(bmcts.last_actions)
+                for retry_index, row in enumerate(retry_rows):
+                    retry_pi, retry_root_v, _retry_obs, _retry_valid = retry_out[retry_index]
+                    _old_pi, _old_root_v, original_obs, original_valid = batch_out[row]
+                    batch_out[row] = (retry_pi, retry_root_v, original_obs, original_valid)
+                    selected_actions[row] = _select_self_play_action(
+                        self.run,
+                        retry_pi,
+                        explore=True,
+                        gumbel_proposal=retry_proposals[retry_index],
+                    )
             results_by_idx = dict(zip(active_indices, batch_out))
 
             if self.run.profile:
@@ -362,15 +510,7 @@ class Coach:
                 value_lists[idx].append(root_v)
                 valid_lists[idx].append(valid_row)
 
-                if self.run.search_mode == "gumbel":
-                    proposed_action = bmcts.last_actions[j]
-                    if proposed_action is None:
-                        raise RuntimeError("Batched Gumbel search did not propose an action")
-                    action = proposed_action
-                elif explore[j]:
-                    action = int(np.random.choice(len(pi), p=pi))
-                else:
-                    action = int(np.argmax(pi))
+                action = selected_actions[j]
 
                 players[idx] = self.game.push_action(boards[idx], players[idx], action)
                 action_lists[idx].append(action)
@@ -389,6 +529,10 @@ class Coach:
                         valid_lists[idx],
                         terminal_value_for_next_player=terminal_rewards[idx],
                         termination=terminal_outcome.termination,
+                        repetition_guard_attempts=guard_attempts[idx],
+                        repetition_guard_interventions=guard_interventions[idx],
+                        repetition_guard_forced_fallbacks=guard_forced_fallbacks[idx],
+                        repetition_guard_excluded_actions=guard_excluded_actions[idx],
                     )
                     if len(completed) < num_episodes:
                         completed.append(traj)
@@ -407,6 +551,10 @@ class Coach:
                         valid_lists[idx],
                         terminal_value_for_next_player=terminal_rewards[idx],
                         truncated=True,
+                        repetition_guard_attempts=guard_attempts[idx],
+                        repetition_guard_interventions=guard_interventions[idx],
+                        repetition_guard_forced_fallbacks=guard_forced_fallbacks[idx],
+                        repetition_guard_excluded_actions=guard_excluded_actions[idx],
                     )
                     if len(completed) < num_episodes:
                         completed.append(traj)
@@ -431,6 +579,10 @@ class Coach:
         terminal_value_for_next_player: float,
         truncated: bool = False,
         termination: chess.Termination | None = None,
+        repetition_guard_attempts: int = 0,
+        repetition_guard_interventions: int = 0,
+        repetition_guard_forced_fallbacks: int = 0,
+        repetition_guard_excluded_actions: int = 0,
     ) -> Trajectory:
         game_len = len(actions)
         rewards = [0.0] * game_len
@@ -446,6 +598,10 @@ class Coach:
             valids=valids_list,
             truncated=truncated,
             termination=termination,
+            repetition_guard_attempts=repetition_guard_attempts,
+            repetition_guard_interventions=repetition_guard_interventions,
+            repetition_guard_forced_fallbacks=repetition_guard_forced_fallbacks,
+            repetition_guard_excluded_actions=repetition_guard_excluded_actions,
         )
 
     def _external_checkpoint_path(self, iteration: int) -> Path:
@@ -672,16 +828,19 @@ class Coach:
             stats.replay_save_s = time.perf_counter() - t0
 
             learner_batch_size = self.nnet._learner.batch_size
-            if self.replay.size < learner_batch_size:
-                logger.warning("Replay buffer too small ({}), skipping training.", self.replay.size)
+            replay_warmup = max(learner_batch_size, self.run.replay_warmup_positions)
+            if self.replay.size < replay_warmup:
+                logger.warning(
+                    "Replay buffer warm-up ({}/{} positions), skipping training.",
+                    self.replay.size,
+                    replay_warmup,
+                )
                 stats.total_s = time.perf_counter() - iter_t0
                 self._log_iteration_metrics(i, trajectories, stats)
                 if self.run.profile:
                     profile_rows.append(stats)
                     logger.info("\n{}\n", stats.to_log_lines())
                 continue
-
-            self._configure_replay_beta_annealing(i)
 
             do_kineto = (
                 self.run.profile
@@ -699,15 +858,32 @@ class Coach:
                     "profile_torch_steps>0 but both profile_export_chrome=False and no "
                     "profile_tensorboard_logdir — no Kineto export will be produced."
                 )
-            logger.info("Training from replay buffer ({} positions) ...", self.replay.size)
+            new_positions = sum(trajectory.game_length for trajectory in trajectories)
+            optimizer_steps = _optimizer_steps_for_positions(
+                self.run,
+                positions=new_positions,
+                batch_size=learner_batch_size,
+            )
+            self._configure_replay_beta_annealing(i, optimizer_steps)
+            logger.info(
+                "Training from replay buffer ({} positions) for {} optimizer steps (new positions={}) ...",
+                self.replay.size,
+                optimizer_steps,
+                new_positions,
+            )
             t0 = time.perf_counter()
             lr_schedule_total_steps = self.nnet._lr_schedule_total_steps
             if lr_schedule_total_steps == 0:
-                remaining_iterations = self.run.num_iters - i + 1
-                lr_schedule_total_steps = self.nnet._global_step + remaining_iterations * self.run.train_steps_per_iter
+                if self.run.lr_schedule_total_steps is not None:
+                    lr_schedule_total_steps = self.run.lr_schedule_total_steps
+                else:
+                    remaining_iterations = self.run.num_iters - i + 1
+                    lr_schedule_total_steps = (
+                        self.nnet._global_step + remaining_iterations * self.run.train_steps_per_iter
+                    )
             loss_info = self.nnet.train_ezv2(
                 self.replay,
-                steps=self.run.train_steps_per_iter,
+                steps=optimizer_steps,
                 total_train_steps=lr_schedule_total_steps,
                 discount=self.run.discount,
                 mcts_for_reanalyze=self.run,
@@ -730,7 +906,7 @@ class Coach:
                 i,
                 trajectories,
                 stats,
-                optimizer_steps=self.run.train_steps_per_iter,
+                optimizer_steps=optimizer_steps,
             )
             self._reconcile_current_evaluations(i)
             if self.run.profile:
@@ -742,15 +918,12 @@ class Coach:
             write_iter_summaries_json(str(summary_path), profile_rows)
             logger.info("Wrote aggregated phase timings to {}", summary_path.resolve())
 
-    def _configure_replay_beta_annealing(self, iteration: int) -> None:
-        if self._replay_beta_annealing_configured:
-            return
+    def _configure_replay_beta_annealing(self, iteration: int, optimizer_steps: int) -> None:
         remaining_iterations = self.run.num_iters - iteration + 1
-        remaining_sample_calls = remaining_iterations * self.run.train_steps_per_iter
+        remaining_sample_calls = remaining_iterations * optimizer_steps
         self.replay.configure_beta_annealing(remaining_sample_calls)
-        self._replay_beta_annealing_configured = True
         logger.info(
-            "PER beta annealing starts at iteration {} over {} optimizer sample calls",
+            "PER beta annealing updated at iteration {} over {} estimated optimizer sample calls",
             iteration,
             remaining_sample_calls,
         )
@@ -801,6 +974,10 @@ class Coach:
         replay_samples_per_new_position = (
             optimizer_steps * self.nnet._learner.batch_size / positions if positions else 0.0
         )
+        guard_attempts = sum(trajectory.repetition_guard_attempts for trajectory in trajectories)
+        guard_interventions = sum(trajectory.repetition_guard_interventions for trajectory in trajectories)
+        guard_forced_fallbacks = sum(trajectory.repetition_guard_forced_fallbacks for trajectory in trajectories)
+        guard_excluded_actions = sum(trajectory.repetition_guard_excluded_actions for trajectory in trajectories)
         wandb.log(
             {
                 "iteration": iteration,
@@ -841,12 +1018,29 @@ class Coach:
                 "selfplay/unknown_termination_fraction": unknown_terminations / games if games else 0.0,
                 "selfplay/policy_entropy": policy_entropy,
                 "selfplay/replay_samples_per_new_position": replay_samples_per_new_position,
+                "selfplay/repetition_guard_attempts": guard_attempts,
+                "selfplay/repetition_guard_interventions": guard_interventions,
+                "selfplay/repetition_guard_forced_fallbacks": guard_forced_fallbacks,
+                "selfplay/repetition_guard_excluded_actions": guard_excluded_actions,
+                "selfplay/repetition_guard_intervention_fraction": (
+                    guard_interventions / positions if positions else 0.0
+                ),
+                "selfplay/repetition_guard_attempt_fraction": guard_attempts / positions if positions else 0.0,
                 "performance/self_play_seconds": stats.self_play_s,
                 "performance/self_play_positions_per_second": positions_per_second,
                 "performance/train_seconds": stats.train_s,
                 "performance/iteration_seconds": stats.total_s,
                 "replay/size": self.replay.size,
                 "replay/beta": self.replay.beta,
+                "replay/optimizer_steps": optimizer_steps,
+                "replay/step_cap_reached": int(
+                    optimizer_steps > 0 and optimizer_steps == self.run.train_steps_per_iter
+                ),
+                "replay/target_samples_per_new_position": self.run.target_replay_ratio or 0.0,
+                "replay/warmup_positions": max(
+                    self.nnet._learner.batch_size,
+                    self.run.replay_warmup_positions,
+                ),
             }
         )
 

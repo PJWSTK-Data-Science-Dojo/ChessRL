@@ -16,11 +16,14 @@ from torch.amp import GradScaler
 
 from luna.balanced_networks import BalancedNetworks
 from luna.config import EzV2LearnerConfig, MCTSParams, TrainingRunConfig
+from luna.ezv2_networks import SimSiamProjector
 from luna.game.chess_game import ACTION_SIZE, OBS_PLANES, ChessGame
 from luna.network import (
     LunaNetwork,
+    PreparedBatch,
     TrainingPhaseProvenance,
     _configure_dynamic_cudagraphs,
+    _latent_health_metrics,
     _scale_gradient,
 )
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
@@ -56,6 +59,56 @@ def test_dynamic_cudagraphs_are_skipped_for_compiled_mcts(monkeypatch: pytest.Mo
     _configure_dynamic_cudagraphs()
 
     assert torch_inductor_config.triton.cudagraph_skip_dynamic_graphs is True
+
+
+def test_latent_health_metrics_detect_collapsed_batch() -> None:
+    projector = SimSiamProjector(in_dim=2, proj_dim=2)
+    projector.projection = torch.nn.Identity()
+    collapsed = torch.tensor([1.0, 0.0]).reshape(1, 2, 1, 1).repeat(4, 1, 1, 1)
+
+    metrics = _latent_health_metrics(projector, collapsed, collapsed)
+
+    assert all(math.isfinite(value) for value in metrics.values())
+    assert metrics["train/latent_predicted_batch_feature_std"] == pytest.approx(0.0)
+    assert metrics["train/latent_target_batch_feature_std"] == pytest.approx(0.0)
+    assert metrics["train/projector_target_batch_std"] == pytest.approx(0.0)
+    assert metrics["train/projector_target_offdiag_cosine"] == pytest.approx(1.0)
+    assert metrics["train/consistency_cosine_alignment"] == pytest.approx(1.0)
+
+
+def test_latent_health_metrics_distinguish_diverse_batch() -> None:
+    projector = SimSiamProjector(in_dim=2, proj_dim=2)
+    projector.projection = torch.nn.Identity()
+    diverse = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+            [0.0, -1.0],
+        ]
+    ).reshape(4, 2, 1, 1)
+
+    metrics = _latent_health_metrics(projector, diverse, diverse)
+
+    assert all(math.isfinite(value) for value in metrics.values())
+    assert metrics["train/latent_target_batch_feature_std"] > 0.5
+    assert metrics["train/projector_target_batch_std"] > 0.5
+    assert metrics["train/projector_target_offdiag_cosine"] == pytest.approx(1.0 / 3.0)
+    assert metrics["train/consistency_cosine_alignment"] == pytest.approx(1.0)
+
+
+def test_latent_health_metrics_are_finite_for_single_sample() -> None:
+    projector = SimSiamProjector(in_dim=2, proj_dim=2)
+    projector.projection = torch.nn.Identity()
+    sample = torch.tensor([1.0, -1.0]).reshape(1, 2, 1, 1)
+
+    metrics = _latent_health_metrics(projector, sample, sample)
+
+    assert all(math.isfinite(value) for value in metrics.values())
+    assert metrics["train/latent_predicted_batch_feature_std"] == pytest.approx(0.0)
+    assert metrics["train/latent_target_batch_feature_std"] == pytest.approx(0.0)
+    assert metrics["train/projector_target_batch_std"] == pytest.approx(0.0)
+    assert metrics["train/projector_target_offdiag_cosine"] == pytest.approx(0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -249,6 +302,106 @@ def test_reported_total_loss_is_invariant_to_identical_gradient_accumulation() -
     assert accumulated_microbatches == pytest.approx(single_microbatch, rel=1e-5)
 
 
+def test_reward_and_consistency_losses_use_their_own_active_masks(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        batch_size=2,
+        unroll_steps=3,
+        td_steps=1,
+        mixed_precision=False,
+        dataloader_workers=0,
+        lr=0.0,
+        lr_min=0.0,
+        policy_loss_weight=0.0,
+        value_loss_weight=0.0,
+        reward_loss_weight=1.0,
+        consistency_loss_weight=1.0,
+    )
+    network = LunaNetwork(ChessGame(), config)
+    replay = PrioritizedReplayBuffer(capacity=8)
+    replay.save_trajectory(_make_trajectory(length=4))
+    prepared = network._prepare_batch(
+        replay,
+        bs=2,
+        unroll=3,
+        td=1,
+        discount=1.0,
+        training_step=1,
+        mcts_for_reanalyze=None,
+    )
+    prepared.collated["unroll_mask"][:] = np.array(
+        [[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    prepared.collated["consistency_mask"][:] = np.array(
+        [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    controlled = PreparedBatch(
+        prepared.collated,
+        np.ones(2, dtype=np.float32),
+        prepared.tree_indices,
+        prepared.reanalysis,
+    )
+
+    def constant_support_loss(logits: torch.Tensor, _targets: torch.Tensor) -> torch.Tensor:
+        return logits.sum(dim=1) * 0.0 + 2.0
+
+    def constant_consistency_loss(
+        _projector: SimSiamProjector,
+        predicted: torch.Tensor,
+        _target: torch.Tensor,
+    ) -> torch.Tensor:
+        return predicted.flatten(1).sum(dim=1) * 0.0 + 3.0
+
+    with (
+        patch.object(network, "_prepare_batch", return_value=controlled),
+        patch("luna.network._soft_ce_with_support", side_effect=constant_support_loss),
+        patch("luna.network._simsiam_loss", side_effect=constant_consistency_loss),
+    ):
+        metrics = network.train_ezv2(replay, steps=1)
+
+    assert metrics["reward"] == pytest.approx(2.0)
+    assert metrics["consistency"] == pytest.approx(3.0)
+    assert metrics["total"] == pytest.approx(5.0)
+
+
+def test_wandb_reports_gradient_clipping_health_metrics(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        batch_size=1,
+        unroll_steps=1,
+        td_steps=1,
+        mixed_precision=False,
+        dataloader_workers=0,
+        lr=0.0,
+        lr_min=0.0,
+        grad_clip_norm=2.0,
+    )
+    network = LunaNetwork(ChessGame(), config)
+    replay = PrioritizedReplayBuffer(capacity=2)
+    replay.save_trajectory(_make_trajectory(length=2))
+
+    with (
+        patch("luna.network.torch.nn.utils.clip_grad_norm_", return_value=torch.tensor(10.0)),
+        patch("luna.network.wandb.run", object()),
+        patch("luna.network.wandb.log") as wandb_log,
+    ):
+        network.train_ezv2(replay, steps=1)
+
+    wandb_log.assert_called_once()
+    metrics = wandb_log.call_args.args[0]
+    assert metrics["train/grad_norm"] == pytest.approx(10.0)
+    assert metrics["train/grad_norm_preclip"] == pytest.approx(10.0)
+    assert metrics["train/grad_norm_postclip"] == pytest.approx(2.0)
+    assert metrics["train/grad_clip_coefficient"] == pytest.approx(0.2)
+    assert metrics["train/grad_clip_fraction"] == pytest.approx(1.0)
+
+
 def test_accumulation_samples_one_configured_batch_per_optimizer_step(
     monkeypatch: pytest.MonkeyPatch,
     small_learner_config: EzV2LearnerConfig,
@@ -295,7 +448,7 @@ def test_accumulation_updates_duplicate_replay_index_atomically_with_largest_err
     network = LunaNetwork(ChessGame(), small_learner_config)
     replay = PrioritizedReplayBuffer(capacity=1)
     replay.save_trajectory(_make_trajectory(length=1))
-    collated, weights, _indices = network._prepare_batch(
+    collated, weights, _indices, reanalysis = network._prepare_batch(
         replay,
         bs=2,
         unroll=1,
@@ -305,7 +458,7 @@ def test_accumulation_updates_duplicate_replay_index_atomically_with_largest_err
         mcts_for_reanalyze=None,
     )
     collated["target_values"][:, 0] = np.array([-1.0, 1.0], dtype=np.float32)
-    prepared = (collated, weights, [0, 0])
+    prepared = PreparedBatch(collated, weights, [0, 0], reanalysis)
 
     with (
         patch.object(network, "_prepare_batch", return_value=prepared),
@@ -510,7 +663,7 @@ def test_reanalysis_restores_training_mode_and_uses_direct_sve(
     monkeypatch.setattr("luna.network.BatchedMCTS", _FakeBatchedMCTS)
     nnet.nnet.train()
 
-    collated, _weights, _indices = nnet._prepare_batch(
+    collated, _weights, _indices, _reanalysis = nnet._prepare_batch(
         replay,
         bs=1,
         unroll=0,

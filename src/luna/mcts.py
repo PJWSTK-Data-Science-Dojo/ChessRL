@@ -604,6 +604,7 @@ class BatchedMCTS:
         temp: float = 1.0,
         *,
         add_exploration_noise: bool | Sequence[bool] | None = None,
+        allowed_root_actions: Sequence[Collection[int] | None] | None = None,
     ) -> list[tuple[np.ndarray, float, np.ndarray, np.ndarray]]:
         """Run batched latent MCTS for multiple positions.
 
@@ -613,6 +614,8 @@ class BatchedMCTS:
         the actual Sequential Halving proposals; see :meth:`MCTS.search_latent`.
         Exploration noise accepts either one flag for all roots or one flag per
         root for sliding self-play pools at different ply counts.
+        ``allowed_root_actions`` optionally restricts individual search roots while
+        returned validity masks retain the complete chess-legal action set.
         """
         self.last_actions = []
         if num_sims is None:
@@ -630,6 +633,12 @@ class BatchedMCTS:
             exploration_noise = [bool(enabled) for enabled in add_exploration_noise]
             if len(exploration_noise) != N:
                 raise ValueError("add_exploration_noise must contain one flag per batched root")
+        if allowed_root_actions is None:
+            root_action_restrictions: list[Collection[int] | None] = [None] * N
+        else:
+            root_action_restrictions = list(allowed_root_actions)
+            if len(root_action_restrictions) != N:
+                raise ValueError("allowed_root_actions must contain one entry per batched root")
         action_size = self.game.get_action_size()
         root_boards = [board.copy(stack=board.halfmove_clock) for board in canonical_boards]
         root_outcomes = [self.game.get_game_outcome(board, 1) for board in root_boards]
@@ -643,10 +652,23 @@ class BatchedMCTS:
 
         sample_obs = self.game.to_array(canonical_boards[0])
         obs_batch = np.empty((N, *sample_obs.shape), dtype=np.float32)
-        valid_batch = np.empty((N, action_size), dtype=np.float32)
+        legal_batch = np.empty((N, action_size), dtype=np.float32)
         for i, (canonical_board, root_board) in enumerate(zip(canonical_boards, root_boards)):
             obs_batch[i] = self.game.to_array(canonical_board)
-            valid_batch[i] = self.game.get_valid_moves(root_board, 1)
+            legal_batch[i] = self.game.get_valid_moves(root_board, 1)
+        search_valid_batch = legal_batch.copy()
+        for row, restriction in enumerate(root_action_restrictions):
+            if restriction is None:
+                continue
+            root_mask = np.zeros(action_size, dtype=np.float32)
+            for action in restriction:
+                if isinstance(action, bool) or not isinstance(action, int | np.integer):
+                    raise ValueError("Root actions must be integer action indices")
+                normalized_action = int(action)
+                if not 0 <= normalized_action < action_size:
+                    raise ValueError(f"Root action must be in [0, {action_size}), got {normalized_action}")
+                root_mask[normalized_action] = 1.0
+            search_valid_batch[row] *= root_mask
 
         if tm is not None:
             tm.encode_s += time.perf_counter() - t0
@@ -657,7 +679,7 @@ class BatchedMCTS:
         if len(active_indices) == N:
             active_policies, active_predictions, active_latents = self.nnet.batched_initial_inference(
                 obs_batch,
-                valid_batch,
+                search_valid_batch,
             )
             policies_np = np.asarray(active_policies, dtype=np.float32)
             root_predictions = np.asarray(active_predictions, dtype=np.float32).reshape(N)
@@ -668,7 +690,7 @@ class BatchedMCTS:
             if active_indices:
                 active_policies, active_predictions, active_latents = self.nnet.batched_initial_inference(
                     obs_batch[active_indices],
-                    valid_batch[active_indices],
+                    search_valid_batch[active_indices],
                 )
                 for batch_index, root_index in enumerate(active_indices):
                     policies_np[root_index] = active_policies[batch_index]
@@ -693,7 +715,7 @@ class BatchedMCTS:
                 raise RuntimeError("Initial inference returned no latent state for a non-terminal root")
             root.latent = root_latent
 
-            valid_indices = np.flatnonzero(valid_batch[i])
+            valid_indices = np.flatnonzero(search_valid_batch[i])
             pi = policies_np[i]
 
             if (
@@ -924,7 +946,7 @@ class BatchedMCTS:
             else:
                 probs_arr = np.zeros(action_size, dtype=np.float32)
 
-            results.append((probs_arr, root_value, obs_batch[i].copy(), valid_batch[i].copy()))
+            results.append((probs_arr, root_value, obs_batch[i].copy(), legal_batch[i].copy()))
 
         if tm is not None:
             tm.finalize_s += time.perf_counter() - t_fin
