@@ -165,8 +165,9 @@ train-phase: _train-env-preflight _fairy-stockfish-preflight
 # Resume the same phase contract after an interruption without resetting
 # optimizer, scaler, counters, or the LR schedule horizon.
 resume-phase: _train-env-preflight _fairy-stockfish-preflight
-	@test -f "$(NEW_PHASE_CHECKPOINT_DIR)/latest.pth.tar" || { \
-		echo "Phase resume checkpoint not found: $(NEW_PHASE_CHECKPOINT_DIR)/latest.pth.tar" >&2; exit 2; }
+	@test -f "$(NEW_PHASE_CHECKPOINT_DIR)/latest.pth.tar" || \
+		find "$(NEW_PHASE_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'checkpoint_*.pth.tar' -print -quit | grep -q . || { \
+		echo "No phase resume checkpoint found in $(NEW_PHASE_CHECKPOINT_DIR)" >&2; exit 2; }
 	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/main.py \
 		--load-model \
 		--load-checkpoint-dir "$(NEW_PHASE_CHECKPOINT_DIR)" \

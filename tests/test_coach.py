@@ -293,6 +293,34 @@ def test_skipped_training_still_logs_iteration_observability(
     assert metrics["replay/beta"] == 0.4
 
 
+def test_completed_iteration_is_logged_before_external_evaluation(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    make_trajectory: TrajectoryFactory,
+) -> None:
+    small_learner_config.batch_size = 1
+    network = LunaNetwork(chess_game, small_learner_config)
+    coach = Coach(
+        chess_game,
+        network,
+        TrainingRunConfig(num_iters=1, num_episodes=1, train_steps_per_iter=1, checkpoint="", stockfish_eval_every=0),
+    )
+    events: list[str] = []
+
+    with (
+        patch.object(coach, "execute_episodes_batched", return_value=[make_trajectory(2)]),
+        patch.object(network, "train_ezv2", return_value={}),
+        patch.object(coach, "_publish_checkpoint", side_effect=lambda _iteration: events.append("checkpoint")),
+        patch.object(coach, "_log_iteration_metrics", side_effect=lambda *_args: events.append("metrics")),
+        patch.object(
+            coach, "_reconcile_current_evaluations", side_effect=lambda _iteration: events.append("evaluation")
+        ),
+    ):
+        coach._learn_iterations(start_iteration=1, actor_pool=None)
+
+    assert events == ["checkpoint", "metrics", "evaluation"]
+
+
 def test_selfplay_outcome_metrics_respect_ply_color_and_exclude_truncations(
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,

@@ -25,6 +25,49 @@ def test_new_training_phase_target_must_be_dedicated_and_empty(tmp_path: Path) -
         training_entry.validate_new_training_phase_target("")
 
 
+def test_resume_selects_newest_numbered_checkpoint_when_latest_lags(tmp_path: Path) -> None:
+    target = tmp_path / "run"
+    target.mkdir()
+    latest = target / "latest.pth.tar"
+    newest = target / "checkpoint_12.pth.tar"
+    latest.write_bytes(b"old")
+    newest.write_bytes(b"new")
+
+    with patch.object(
+        training_entry.LunaNetwork,
+        "checkpoint_trainer_iteration",
+        side_effect=lambda path: 11 if Path(path).name == latest.name else 12,
+    ):
+        selected = training_entry.resolve_resume_checkpoint(latest, target)
+
+    assert selected == newest
+
+
+def test_resume_recovers_numbered_checkpoint_when_latest_is_missing(tmp_path: Path) -> None:
+    target = tmp_path / "run"
+    target.mkdir()
+    numbered = target / "checkpoint_3.pth.tar"
+    numbered.write_bytes(b"checkpoint")
+
+    with patch.object(training_entry.LunaNetwork, "checkpoint_trainer_iteration", return_value=3):
+        selected = training_entry.resolve_resume_checkpoint(target / "latest.pth.tar", target)
+
+    assert selected == numbered
+
+
+def test_resume_rejects_numbered_checkpoint_with_mismatched_iteration(tmp_path: Path) -> None:
+    target = tmp_path / "run"
+    target.mkdir()
+    numbered = target / "checkpoint_4.pth.tar"
+    numbered.write_bytes(b"checkpoint")
+
+    with (
+        patch.object(training_entry.LunaNetwork, "checkpoint_trainer_iteration", return_value=3),
+        pytest.raises(RuntimeError, match="differs from its filename"),
+    ):
+        training_entry.resolve_resume_checkpoint(target / "latest.pth.tar", target)
+
+
 def test_main_rejects_resume_and_new_phase_together() -> None:
     config = TrainCliConfig(load_model=True, new_training_phase=True)
 

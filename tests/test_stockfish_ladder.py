@@ -332,7 +332,8 @@ def test_skipped_match_does_not_change_persisted_state(ladder_run: TrainingRunCo
     skipped = StockfishEvalSkipped(reason="runtime_error", message="engine exited")
 
     with (
-        patch("luna.game.stockfish_ladder.run_stockfish_eval", return_value=skipped),
+        patch("luna.game.stockfish_ladder.run_stockfish_eval", return_value=skipped) as evaluate,
+        patch("luna.game.stockfish_eval.time.sleep"),
         patch("luna.game.stockfish_ladder.wandb.run", None),
         pytest.raises(RuntimeError, match="did not complete"),
     ):
@@ -347,6 +348,7 @@ def test_skipped_match_does_not_change_persisted_state(ladder_run: TrainingRunCo
 
     assert path.read_bytes() == before
     assert load_fairy_ladder_state(path, ladder_run, required=True) == initial
+    assert evaluate.call_count == ladder_run.external_eval_attempts
 
 
 def test_wandb_failure_cannot_roll_back_ladder_progress(ladder_run: TrainingRunConfig) -> None:

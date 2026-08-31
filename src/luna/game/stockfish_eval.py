@@ -6,6 +6,7 @@ import hashlib
 import math
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
@@ -60,6 +61,38 @@ class StockfishEvalSkipped:
 
 
 StockfishEvalOutcome = StockfishEvalScores | StockfishEvalSkipped
+
+
+def retry_stockfish_eval(
+    evaluate: Callable[[], StockfishEvalOutcome],
+    *,
+    attempts: int,
+    retry_seconds: float,
+) -> StockfishEvalOutcome:
+    """Retry transient UCI failures without weakening fail-closed evaluation."""
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    if not math.isfinite(retry_seconds) or retry_seconds < 0.0:
+        raise ValueError("retry_seconds must be finite and non-negative")
+    outcome = evaluate()
+    for attempt in range(2, attempts + 1):
+        if not isinstance(outcome, StockfishEvalSkipped) or outcome.reason not in {
+            "no_engine",
+            "runtime_error",
+        }:
+            return outcome
+        logger.warning(
+            "External-engine evaluation attempt {}/{} failed ({}): {}; retrying in {}s",
+            attempt - 1,
+            attempts,
+            outcome.reason,
+            outcome.message,
+            retry_seconds,
+        )
+        if retry_seconds > 0.0:
+            time.sleep(retry_seconds)
+        outcome = evaluate()
+    return outcome
 
 
 @dataclass(frozen=True)

@@ -54,10 +54,10 @@ app = create_app(
         trusted_hosts=_trusted_hosts(),
         proxy_hops=_environment_int("PROXY_HOPS", 0),
         hsts_max_age_seconds=_environment_int("HSTS_MAX_AGE_SECONDS", 0),
+        secure_cookies=_environment_bool("SESSION_COOKIE_SECURE", True),
     ),
 )
 app.config.update(
     SECRET_KEY=web_secret,
     SESSION_COOKIE_NAME="luna_session",
-    SESSION_COOKIE_SECURE=_environment_bool("SESSION_COOKIE_SECURE", True),
 )

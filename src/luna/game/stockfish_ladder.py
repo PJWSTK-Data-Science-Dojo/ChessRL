@@ -21,6 +21,7 @@ from luna.game.stockfish_eval import (
     _wandb_metrics,
     engine_binary_sha256,
     ladder_match_settings,
+    retry_stockfish_eval,
     run_stockfish_eval,
 )
 from luna.network import LunaNetwork
@@ -413,13 +414,17 @@ def run_fairy_ladder_eval(
         return state
     tested_elo = state.current_elo
     started_at = time.perf_counter()
-    outcome = run_stockfish_eval(
-        game,
-        nnet,
-        run,
-        iteration=iteration,
-        settings=ladder_match_settings(run, tested_elo),
-        metric_prefix=None,
+    outcome = retry_stockfish_eval(
+        lambda: run_stockfish_eval(
+            game,
+            nnet,
+            run,
+            iteration=iteration,
+            settings=ladder_match_settings(run, tested_elo),
+            metric_prefix=None,
+        ),
+        attempts=run.external_eval_attempts,
+        retry_seconds=run.external_eval_retry_seconds,
     )
     if isinstance(outcome, StockfishEvalSkipped):
         raise RuntimeError(f"Fairy ladder evaluation did not complete ({outcome.reason}): {outcome.message}")

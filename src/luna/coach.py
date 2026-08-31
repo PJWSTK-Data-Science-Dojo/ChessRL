@@ -43,6 +43,7 @@ from luna.game.stockfish_eval import (
     StockfishEvalScores,
     StockfishEvalSkipped,
     _wandb_metrics,
+    retry_stockfish_eval,
     run_stockfish_eval,
     stockfish_evaluation_protocol,
     validate_ladder_configuration,
@@ -490,12 +491,16 @@ class Coach:
             duration_seconds = None
         else:
             started_at = time.perf_counter()
-            outcome = run_stockfish_eval(
-                self.game,
-                self.nnet,
-                self.run,
-                iteration=iteration,
-                metric_prefix=None,
+            outcome = retry_stockfish_eval(
+                lambda: run_stockfish_eval(
+                    self.game,
+                    self.nnet,
+                    self.run,
+                    iteration=iteration,
+                    metric_prefix=None,
+                ),
+                attempts=self.run.external_eval_attempts,
+                retry_seconds=self.run.external_eval_retry_seconds,
             )
             if isinstance(outcome, StockfishEvalSkipped):
                 raise RuntimeError(f"External evaluation did not complete ({outcome.reason}): {outcome.message}")
@@ -702,10 +707,9 @@ class Coach:
             self._publish_checkpoint(i)
             stats.checkpoint_publish_s = time.perf_counter() - t0
 
-            self._reconcile_current_evaluations(i)
-
             stats.total_s = time.perf_counter() - iter_t0
             self._log_iteration_metrics(i, trajectories, stats)
+            self._reconcile_current_evaluations(i)
             if self.run.profile:
                 profile_rows.append(stats)
                 logger.info("\n{}\n", stats.to_log_lines())

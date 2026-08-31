@@ -16,6 +16,7 @@ from luna.game.stockfish_eval import (
     _score_game_for_model,
     _StockfishException,
     _wandb_metrics,
+    retry_stockfish_eval,
     run_stockfish_eval,
     validate_ladder_configuration,
     validate_stockfish_configuration,
@@ -33,6 +34,31 @@ class TestScoreGameForModel:
         assert _score_game_for_model(-1.0, model_is_player1=False) == "model"
         assert _score_game_for_model(1.0, model_is_player1=False) == "sf"
         assert _score_game_for_model(0.0, model_is_player1=False) == "draw"
+
+
+def test_transient_stockfish_failure_is_retried_until_success() -> None:
+    skipped = StockfishEvalSkipped("runtime_error", "engine exited")
+    success = StockfishEvalScores(model_wins=1, draws=0, stockfish_wins=1)
+    outcomes = iter((skipped, skipped, success))
+
+    with patch("luna.game.stockfish_eval.time.sleep") as sleep:
+        outcome = retry_stockfish_eval(lambda: next(outcomes), attempts=3, retry_seconds=2.0)
+
+    assert outcome == success
+    assert sleep.call_count == 2
+
+
+def test_non_retryable_stockfish_configuration_failure_returns_immediately() -> None:
+    skipped = StockfishEvalSkipped("too_many_games", "opening suite exhausted")
+    calls = 0
+
+    def evaluate() -> StockfishEvalSkipped:
+        nonlocal calls
+        calls += 1
+        return skipped
+
+    assert retry_stockfish_eval(evaluate, attempts=3, retry_seconds=0.0) == skipped
+    assert calls == 1
 
 
 class TestRunStockfishEval:

@@ -161,6 +161,12 @@ class TrainingRunConfig(MCTSParams):
     stockfish_eval_max_ply: int | None = None
     """Optional evaluation-game safety bound; unfinished games score as draws."""
 
+    external_eval_attempts: int = 3
+    """Maximum attempts for a transient external-engine evaluation failure."""
+
+    external_eval_retry_seconds: float = 5.0
+    """Delay between transient external-engine evaluation attempts."""
+
     ladder_eval_every: int = 0
     """Adaptive Fairy-Stockfish ladder interval; zero disables the ladder."""
 
@@ -370,6 +376,8 @@ def _validate_training_schedule(run: TrainingRunConfig) -> None:
 def _validate_external_evaluation(run: TrainingRunConfig) -> None:
     _positive_integer("stockfish_depth", run.stockfish_depth)
     _positive_integer("stockfish_elo", run.stockfish_elo)
+    _positive_integer("external_eval_attempts", run.external_eval_attempts)
+    _finite_at_least("external_eval_retry_seconds", run.external_eval_retry_seconds, 0.0)
     if run.stockfish_eval_every > 0 and (run.stockfish_eval_games < 2 or run.stockfish_eval_games % 2):
         raise ValueError("stockfish_eval_games must be an even integer of at least 2 when evaluation is enabled")
     if run.stockfish_eval_every > 0 and run.stockfish_eval_games > MAX_STOCKFISH_EVAL_GAMES:

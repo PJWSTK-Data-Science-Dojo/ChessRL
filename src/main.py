@@ -47,6 +47,36 @@ def validate_new_training_phase_target(checkpoint_dir: str) -> None:
         )
 
 
+def resolve_resume_checkpoint(requested: Path, target: Path) -> Path:
+    """Select the newest immutable checkpoint when ``latest`` lags after a crash."""
+    resolved = requested.expanduser().resolve()
+    if resolved.name != "latest.pth.tar" or resolved.parent != target.expanduser().resolve():
+        return resolved
+
+    candidates: list[tuple[int, bool, Path]] = []
+    if resolved.is_file():
+        candidates.append((LunaNetwork.checkpoint_trainer_iteration(resolved), False, resolved))
+    for numbered in resolved.parent.glob("checkpoint_*.pth.tar"):
+        suffix = numbered.name.removeprefix("checkpoint_").removesuffix(".pth.tar")
+        try:
+            filename_iteration = int(suffix)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid numbered checkpoint name: {numbered}") from exc
+        checkpoint_iteration = LunaNetwork.checkpoint_trainer_iteration(numbered)
+        if checkpoint_iteration != filename_iteration:
+            raise RuntimeError(
+                f"Numbered checkpoint iteration {checkpoint_iteration} differs from its filename: {numbered}"
+            )
+        candidates.append((checkpoint_iteration, True, numbered))
+    if not candidates:
+        raise FileNotFoundError(f"No resumable checkpoint in {resolved.parent}")
+
+    _, _, selected = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+    if selected != resolved:
+        logger.warning('Recovering from newest immutable checkpoint "{}" instead of "{}"', selected, resolved)
+    return selected
+
+
 def main() -> int:
     torch.set_float32_matmul_precision("medium")
 
@@ -84,6 +114,8 @@ def main() -> int:
             and not cfg.initialize_evaluation_state
         ):
             raise ValueError("Cross-directory resume with external evaluation requires --initialize-evaluation-state")
+        if cfg.load_model and not cross_directory_resume:
+            source_checkpoint = resolve_resume_checkpoint(source_checkpoint, target)
         loaded_iteration = 0
         if cfg.load_model:
             if not source_checkpoint.expanduser().is_file():
@@ -175,11 +207,10 @@ def main() -> int:
 
     if cfg.load_model:
         logger.info(
-            'Loading checkpoint "{}" / "{}"...',
-            cfg.load_checkpoint_dir,
-            cfg.load_checkpoint_file,
+            'Loading checkpoint "{}"...',
+            source_checkpoint,
         )
-        nnet.load_checkpoint(cfg.load_checkpoint_dir, cfg.load_checkpoint_file)
+        nnet.load_checkpoint(str(source_checkpoint.parent), source_checkpoint.name)
     elif cfg.new_training_phase:
         logger.info(
             'Starting a new training phase from weights in "{}" / "{}"; '

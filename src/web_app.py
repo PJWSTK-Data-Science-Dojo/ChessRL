@@ -70,6 +70,7 @@ class WebAppConfig:
     trusted_hosts: tuple[str, ...] = ()
     proxy_hops: int = 0
     hsts_max_age_seconds: int = 0
+    secure_cookies: bool = False
     rate_limit_storage_uri: str = "memory://"
 
 
@@ -500,6 +501,8 @@ def _configure_security(application: Flask, config: WebAppConfig) -> None:
         raise ValueError("proxy_hops cannot be negative")
     if config.hsts_max_age_seconds < 0:
         raise ValueError("hsts_max_age_seconds cannot be negative")
+    if not isinstance(config.secure_cookies, bool):
+        raise ValueError("secure_cookies must be boolean")
     if config.proxy_hops:
         application.__dict__["wsgi_app"] = ProxyFix(
             application.wsgi_app,
@@ -537,6 +540,7 @@ def create_app(engine: LunaEngineService | None = None, config: WebAppConfig | N
         MAX_CONTENT_LENGTH=16 * 1024,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=web_config.secure_cookies,
     )
     _configure_security(application, web_config)
     application.extensions["luna_engine"] = engine

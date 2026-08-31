@@ -211,7 +211,11 @@ def test_unexpected_engine_failure_rolls_back_the_human_move() -> None:
 def test_security_headers_and_trusted_hosts() -> None:
     application = create_app(
         _DeterministicEngine(),
-        WebAppConfig(trusted_hosts=("play.example.test",), hsts_max_age_seconds=31_536_000),
+        WebAppConfig(
+            trusted_hosts=("play.example.test",),
+            hsts_max_age_seconds=31_536_000,
+            secure_cookies=True,
+        ),
     )
     application.config.update(TESTING=True, SECRET_KEY="test-secret")
     client = application.test_client()
@@ -222,7 +226,14 @@ def test_security_headers_and_trusted_hosts() -> None:
     assert response.headers["Cache-Control"] == "no-store"
     assert response.headers["Content-Security-Policy"].startswith("default-src 'self'")
     assert response.headers["Strict-Transport-Security"].startswith("max-age=31536000")
+    assert application.config["SESSION_COOKIE_SECURE"] is True
     assert client.get("/api/v1/health", headers={"Host": "untrusted.example.test"}).status_code == 400
+
+
+def test_local_web_app_keeps_cookie_usable_over_http() -> None:
+    application = create_app(_DeterministicEngine(), WebAppConfig())
+
+    assert application.config["SESSION_COOKIE_SECURE"] is False
 
 
 @pytest.mark.parametrize("value", ["", "*.example.test", ".example.test", "https://example.test"])
