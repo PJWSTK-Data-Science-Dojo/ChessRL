@@ -24,7 +24,7 @@ dependencies = [
 dev = [
     "ruff",
     "mypy",
-    "pytest",
+    "pytest>=9.0.3",
     "types-PyYAML",
     "types-tqdm",
 ]
