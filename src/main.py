@@ -250,7 +250,11 @@ def main() -> int:
     )
 
     logger.info("Starting EfficientZeroV2 learning process")
-    c.learn()
+    try:
+        c.learn()
+    except KeyboardInterrupt:
+        logger.info("Training interrupted; the latest completed checkpoint remains available for resume.")
+        return 130
 
     return 0
 

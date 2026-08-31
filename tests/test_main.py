@@ -133,6 +133,23 @@ def test_main_rejects_invalid_log_level() -> None:
         assert training_entry.main() == 2
 
 
+def test_main_handles_training_interrupt_without_traceback(tmp_path: Path) -> None:
+    config = TrainCliConfig(
+        run=TrainingRunConfig(checkpoint=str(tmp_path / "run"), stockfish_eval_every=0),
+        learner=EzV2LearnerConfig(device="cpu"),
+    )
+
+    with (
+        patch.object(training_entry.tyro, "cli", return_value=config),
+        patch.object(training_entry, "LunaNetwork") as network_type,
+        patch.object(training_entry, "Coach") as coach_type,
+    ):
+        network_type.__name__ = "LunaNetwork"
+        coach_type.return_value.learn.side_effect = KeyboardInterrupt
+
+        assert training_entry.main() == 130
+
+
 @pytest.mark.parametrize("resume_mode", ["allow", "never", "must"])
 def test_cli_parses_stable_wandb_run_id_and_resume_mode(resume_mode: str) -> None:
     config = training_entry.tyro.cli(
