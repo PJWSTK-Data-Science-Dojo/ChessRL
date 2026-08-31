@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 
-from luna.balanced_networks import BalancedNetworks
+from luna.balanced_networks import BalancedNetworks, BalancedReconstructionNetworks
 from luna.config import MODEL_NAMES, EzV2LearnerConfig, ModelName
 from luna.ezv2_networks import EZV2Networks
 from luna.game.chess_game import ChessGame
@@ -12,6 +12,7 @@ ModelBuilder = Callable[[ChessGame, EzV2LearnerConfig], EZV2Networks]
 _MODEL_BUILDERS: dict[ModelName, ModelBuilder] = {
     "baseline": EZV2Networks,
     "balanced": BalancedNetworks,
+    "balanced_reconstruction": BalancedReconstructionNetworks,
 }
 
 

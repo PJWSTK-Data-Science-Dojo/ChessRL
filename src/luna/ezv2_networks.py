@@ -249,6 +249,7 @@ class EZV2Networks(nn.Module):
 
         latent_flat_dim = channels * 8 * 8
         self.simsiam = SimSiamProjector(latent_flat_dim, cfg.proj_dim)
+        self.piece_reconstruction: nn.Module | None = None
 
         self.support_size = support_size
         self.action_size = action_size

@@ -9,7 +9,9 @@ import torch
 from luna.balanced_networks import (
     BalancedDynamicsNetwork,
     BalancedNetworks,
+    BalancedReconstructionNetworks,
     LayerNorm2d,
+    PieceReconstructionHead,
     SEResBlock,
 )
 from luna.config import EzV2LearnerConfig
@@ -120,13 +122,55 @@ def test_model_factory_builds_all_registered_architectures(
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
 ) -> None:
-    assert available_models() == ("baseline", "balanced")
+    assert available_models() == ("baseline", "balanced", "balanced_reconstruction")
 
     baseline = build_model(chess_game, small_learner_config)
     balanced = build_model(chess_game, replace(small_learner_config, model_name="balanced"))
+    reconstructed = build_model(
+        chess_game,
+        replace(small_learner_config, model_name="balanced_reconstruction"),
+    )
 
     assert type(baseline) is EZV2Networks
-    assert isinstance(balanced, BalancedNetworks)
+    assert type(balanced) is BalancedNetworks
+    assert isinstance(reconstructed, BalancedReconstructionNetworks)
+    assert isinstance(reconstructed.piece_reconstruction, PieceReconstructionHead)
+
+
+def test_state_anchored_model_decodes_piece_classes_only_during_training(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(small_learner_config, model_name="balanced_reconstruction")
+    model = build_model(chess_game, config)
+    assert model.piece_reconstruction is not None
+
+    observation = torch.randn(2, 8, 8, OBS_PLANES)
+    latent, log_policy, value = model.initial_inference_with_latent(observation)
+    piece_logits = model.piece_reconstruction(latent)
+
+    assert piece_logits.shape == (2, 13, 8, 8)
+    assert log_policy.shape == (2, chess_game.get_action_size())
+    assert value.shape == (2,)
+
+
+def test_state_anchor_decoder_is_not_called_by_mcts_inference(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    class ForbiddenDecoder(torch.nn.Module):
+        def forward(self, _latent: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("training-only decoder was called by inference")
+
+    config = replace(small_learner_config, model_name="balanced_reconstruction")
+    model = build_model(chess_game, config)
+    model.piece_reconstruction = ForbiddenDecoder()
+    observation = torch.randn(2, 8, 8, OBS_PLANES)
+    valid = torch.ones(2, chess_game.get_action_size())
+
+    latent, _log_policy, _value = model.initial_inference_with_latent(observation, valid)
+    actions = action_index_to_planes(torch.tensor([0, 100]), latent.device)
+    _ = model.recurrent_inference(latent, actions, valid)
 
 
 def test_balanced_model_uses_dense_asymmetric_se_trunks(

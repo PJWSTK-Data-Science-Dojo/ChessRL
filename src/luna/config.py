@@ -8,8 +8,8 @@ MAX_STOCKFISH_EVAL_GAMES = 20
 FAIRY_STOCKFISH_MIN_ELO = 500
 FAIRY_STOCKFISH_MAX_ELO = 2850
 WandbResumeMode = Literal["allow", "never", "must"]
-ModelName = Literal["baseline", "balanced"]
-MODEL_NAMES: tuple[ModelName, ...] = ("baseline", "balanced")
+ModelName = Literal["baseline", "balanced", "balanced_reconstruction"]
+MODEL_NAMES: tuple[ModelName, ...] = ("baseline", "balanced", "balanced_reconstruction")
 
 
 @dataclass
@@ -234,7 +234,7 @@ class EzV2LearnerConfig:
     """Optimizer, architecture, unroll training, and loss weights for :class:`LunaNetwork`."""
 
     model_name: ModelName = "baseline"
-    """Model factory key: ``baseline`` or the asymmetric ``balanced`` architecture."""
+    """Model factory key, including the state-anchored ``balanced_reconstruction`` variant."""
 
     lr: float = 2e-4
     """Peak AdamW learning rate after warm-up."""
@@ -292,6 +292,9 @@ class EzV2LearnerConfig:
 
     consistency_loss_weight: float = 2.0
     """Relative weight of latent SimSiam consistency."""
+
+    reconstruction_loss_weight: float = 0.0
+    """Relative weight of the training-only piece-position reconstruction objective."""
 
     device: str = "cuda"
     """Learner backend: ``cuda``, ``mps``, or ``cpu``."""
@@ -455,7 +458,7 @@ def _validate_optimizer(learner: EzV2LearnerConfig) -> None:
 
 def _validate_model(learner: EzV2LearnerConfig) -> None:
     if learner.model_name not in MODEL_NAMES:
-        raise ValueError("model_name must be 'baseline' or 'balanced'")
+        raise ValueError(f"model_name must be one of {MODEL_NAMES}")
     _positive_integer("num_channels", learner.num_channels)
     _positive_integer("proj_dim", learner.proj_dim)
     _positive_integer("support_size", learner.support_size)
@@ -478,11 +481,14 @@ def _validate_learning_objective(learner: EzV2LearnerConfig) -> None:
         learner.value_loss_weight,
         learner.reward_loss_weight,
         learner.consistency_loss_weight,
+        learner.reconstruction_loss_weight,
     )
-    for name, value in zip(("policy", "value", "reward", "consistency"), weights):
+    for name, value in zip(("policy", "value", "reward", "consistency", "reconstruction"), weights):
         _finite_at_least(f"{name}_loss_weight", value, 0.0)
     if not any(weights):
         raise ValueError("at least one training loss weight must be positive")
+    if learner.reconstruction_loss_weight > 0.0 and learner.model_name != "balanced_reconstruction":
+        raise ValueError("reconstruction_loss_weight requires model_name='balanced_reconstruction'")
     _non_negative_integer("dataloader_workers", learner.dataloader_workers)
     _non_negative_integer("reanalyze_mcts_sims", learner.reanalyze_mcts_sims)
     _probability("reanalyze_prob", learner.reanalyze_prob)

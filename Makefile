@@ -124,12 +124,13 @@ audit:
 bench:
 	uv run --frozen python tests/bench_throughput.py $(ARGS)
 
-# A bounded, high-throughput single-accelerator training recipe. ARGS is
-# appended last so every setting can be overridden without editing this file.
+# Fresh, state-anchored single-accelerator recipe. It deliberately uses full-game
+# Monte Carlo targets and no self-predictive consistency during the cold start.
+# ARGS is appended last so every setting can be overridden without editing this file.
 train:
 	uv run --frozen python src/main.py \
 		--run.search-mode gumbel \
-		--run.gumbel-max-considered-actions 16 \
+		--run.gumbel-max-considered-actions 8 \
 		--run.gumbel-scale 1.0 \
 		--run.gumbel-value-scale 0.1 \
 		--run.num-iters 400 \
@@ -147,39 +148,48 @@ train:
 		--run.replay-capacity 300000 \
 		--run.replay-warmup-positions 50000 \
 		--run.stockfish-eval-every 25 \
-		--run.stockfish-eval-games 8 \
+		--run.stockfish-eval-games 20 \
 		--run.stockfish-elo 1500 \
+		--run.ladder-eval-every 5 \
+		--run.ladder-eval-games 20 \
+		--run.ladder-start-elo 500 \
+		--run.ladder-step-elo 100 \
+		--run.ladder-max-elo 2800 \
+		--run.ladder-required-passes 2 \
+		--run.ladder-depth 10 \
+		--run.ladder-path "$(FAIRY_STOCKFISH_PATH)" \
 		--run.checkpoint "$(CHECKPOINT_DIR)" \
 		--run.checkpoint-top-k 3 \
 		--learner.device cuda \
 		--learner.cuda-device 0 \
-		--learner.model-name balanced \
+		--learner.model-name balanced_reconstruction \
 		--learner.batch-size 256 \
 		--learner.num-channels 128 \
 		--learner.repr-blocks 10 \
 		--learner.dyn-blocks 1 \
 		--learner.proj-dim 256 \
-		--learner.lr 2e-4 \
+		--learner.lr 1e-4 \
 		--learner.lr-min 1e-5 \
 		--learner.lr-warmup-steps 1000 \
 		--learner.weight-decay 1e-4 \
 		--learner.amp-dtype bfloat16 \
 		--learner.unroll-steps 5 \
-		--learner.td-steps 5 \
+		--learner.td-steps 256 \
 		--learner.policy-loss-weight 1.0 \
-		--learner.value-loss-weight 0.25 \
-		--learner.reward-loss-weight 1.0 \
-		--learner.consistency-loss-weight 2.0 \
+		--learner.value-loss-weight 1.0 \
+		--learner.reward-loss-weight 0.1 \
+		--learner.consistency-loss-weight 0.0 \
+		--learner.reconstruction-loss-weight 0.5 \
 		--learner.grad-accum-steps 2 \
 		--learner.grad-clip-norm 5 \
 		--learner.recurrent-gradient-scale 0.5 \
 		--learner.dataloader-workers 4 \
 		--learner.compile-inference \
 		--learner.compile-training \
-		--learner.reanalyze-mcts-sims 8 \
-		--learner.reanalyze-prob 0.02 \
+		--learner.reanalyze-mcts-sims 0 \
+		--learner.reanalyze-prob 0.0 \
 		--learner.no-reanalyze-policy \
-		--learner.reanalyze-start-step 10000 \
+		--learner.reanalyze-start-step 20000 \
 		$(TRAIN_ARGS) $(ARGS)
 
 resume:

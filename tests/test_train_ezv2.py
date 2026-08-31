@@ -21,9 +21,11 @@ from luna.game.chess_game import ACTION_SIZE, OBS_PLANES, ChessGame
 from luna.network import (
     LunaNetwork,
     PreparedBatch,
+    RepresentationCollapseError,
     TrainingPhaseProvenance,
     _configure_dynamic_cudagraphs,
     _latent_health_metrics,
+    _piece_class_targets,
     _scale_gradient,
 )
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
@@ -162,6 +164,98 @@ def test_balanced_model_completes_unrolled_optimizer_step(
     assert math.isfinite(metrics["total"])
 
 
+def test_state_anchor_reconstructs_empty_and_piece_classes() -> None:
+    observation = torch.zeros(1, 8, 8, OBS_PLANES)
+    observation[0, 1, 2, 0] = 1.0
+    observation[0, 6, 5, 11] = 1.0
+
+    target = _piece_class_targets(observation)
+
+    assert target.shape == (1, 8, 8)
+    assert target[0, 0, 0].item() == 0
+    assert target[0, 1, 2].item() == 1
+    assert target[0, 6, 5].item() == 12
+
+
+def test_reconstruction_model_trains_without_simsiam_target_branch(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        model_name="balanced_reconstruction",
+        batch_size=1,
+        dataloader_workers=0,
+        mixed_precision=False,
+        td_steps=4,
+        unroll_steps=1,
+        policy_loss_weight=0.0,
+        value_loss_weight=0.0,
+        reward_loss_weight=0.0,
+        consistency_loss_weight=0.0,
+        reconstruction_loss_weight=0.5,
+    )
+    network = LunaNetwork(ChessGame(), config)
+    replay = PrioritizedReplayBuffer(capacity=8)
+    replay.save_trajectory(_make_trajectory(length=4))
+    representation_before = network.nnet.representation.conv_in.weight.detach().clone()
+    dynamics_before = network.nnet.dynamics.conv_in.weight.detach().clone()
+    assert network.nnet.piece_reconstruction is not None
+    reconstruction_before = network.nnet.piece_reconstruction.classifier.weight.detach().clone()
+
+    with (
+        patch.object(
+            network,
+            "_training_representation",
+            side_effect=AssertionError("disabled SimSiam target branch was evaluated"),
+        ),
+        patch("luna.network._simsiam_loss", side_effect=AssertionError("SimSiam loss was evaluated")),
+    ):
+        metrics = network.train_ezv2(replay, steps=1, total_train_steps=1)
+
+    assert network._global_step == 1
+    assert metrics["consistency"] == pytest.approx(0.0)
+    assert metrics["reconstruction"] > 0.0
+    assert not torch.equal(representation_before, network.nnet.representation.conv_in.weight)
+    assert not torch.equal(dynamics_before, network.nnet.dynamics.conv_in.weight)
+    assert not torch.equal(
+        reconstruction_before,
+        network.nnet.piece_reconstruction.classifier.weight,
+    )
+
+
+def test_state_anchor_collapse_guard_requires_three_consecutive_reports(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        model_name="balanced_reconstruction",
+        reconstruction_loss_weight=0.5,
+    )
+    network = LunaNetwork(ChessGame(), config)
+
+    network._check_representation_diversity(0.001, 100)
+    network._check_representation_diversity(0.001, 150)
+    with pytest.raises(RepresentationCollapseError, match="consecutive collapsed-latent reports"):
+        network._check_representation_diversity(0.001, 200)
+
+
+def test_state_anchor_collapse_guard_resets_after_healthy_report(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        model_name="balanced_reconstruction",
+        reconstruction_loss_weight=0.5,
+    )
+    network = LunaNetwork(ChessGame(), config)
+
+    network._check_representation_diversity(0.001, 100)
+    network._check_representation_diversity(0.5, 150)
+    network._check_representation_diversity(0.001, 200)
+
+    assert network._low_diversity_reports == 1
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_reanalyze_disables_async_prefetch_paths() -> None:
     game = ChessGame()
@@ -228,7 +322,7 @@ def test_recurrent_inference_copies_only_legal_policy_candidates(
 @pytest.mark.parametrize(
     ("field_name", "value", "message"),
     [
-        ("model_name", "unknown", "model_name must be 'baseline' or 'balanced'"),
+        ("model_name", "unknown", "model_name must be one of"),
         ("grad_accum_steps", 0, "grad_accum_steps must be a positive integer"),
         ("dataloader_workers", -1, "dataloader_workers must be a non-negative integer"),
         ("support_size", 0, "support_size must be a positive integer"),
@@ -237,6 +331,7 @@ def test_recurrent_inference_copies_only_legal_policy_candidates(
         ("lr", float("nan"), "lr must be finite"),
         ("reanalyze_prob", 1.1, "reanalyze_prob must be between 0 and 1"),
         ("consistency_loss_weight", float("inf"), "consistency_loss_weight must be finite"),
+        ("reconstruction_loss_weight", float("inf"), "reconstruction_loss_weight must be finite"),
     ],
 )
 def test_invalid_execution_settings_fail_loudly(
@@ -257,6 +352,15 @@ def test_learner_rejects_zero_unroll_horizon(
     small_learner_config.unroll_steps = 0
 
     with pytest.raises(ValueError, match="unroll_steps must be a positive integer"):
+        LunaNetwork(ChessGame(), small_learner_config)
+
+
+def test_reconstruction_loss_requires_matching_model(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    small_learner_config.reconstruction_loss_weight = 0.5
+
+    with pytest.raises(ValueError, match="requires model_name='balanced_reconstruction'"):
         LunaNetwork(ChessGame(), small_learner_config)
 
 
@@ -366,6 +470,61 @@ def test_reward_and_consistency_losses_use_their_own_active_masks(
     assert metrics["reward"] == pytest.approx(2.0)
     assert metrics["consistency"] == pytest.approx(3.0)
     assert metrics["total"] == pytest.approx(5.0)
+
+
+def test_reconstruction_loss_ignores_padded_unroll_states(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        model_name="balanced_reconstruction",
+        batch_size=2,
+        unroll_steps=3,
+        td_steps=4,
+        mixed_precision=False,
+        dataloader_workers=0,
+        lr=0.0,
+        lr_min=0.0,
+        policy_loss_weight=0.0,
+        value_loss_weight=0.0,
+        reward_loss_weight=0.0,
+        consistency_loss_weight=0.0,
+        reconstruction_loss_weight=1.0,
+    )
+    network = LunaNetwork(ChessGame(), config)
+    replay = PrioritizedReplayBuffer(capacity=8)
+    replay.save_trajectory(_make_trajectory(length=4))
+    prepared = network._prepare_batch(
+        replay,
+        bs=2,
+        unroll=3,
+        td=4,
+        discount=1.0,
+        training_step=1,
+        mcts_for_reanalyze=None,
+    )
+    prepared.collated["consistency_mask"][:] = np.array(
+        [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    controlled = PreparedBatch(
+        prepared.collated,
+        np.ones(2, dtype=np.float32),
+        prepared.tree_indices,
+        prepared.reanalysis,
+    )
+
+    def constant_reconstruction_loss(logits: torch.Tensor, _target: torch.Tensor) -> torch.Tensor:
+        return logits.flatten(1).sum(dim=1) * 0.0 + 4.0
+
+    with (
+        patch.object(network, "_prepare_batch", return_value=controlled),
+        patch("luna.network._piece_reconstruction_loss", side_effect=constant_reconstruction_loss),
+    ):
+        metrics = network.train_ezv2(replay, steps=1)
+
+    assert metrics["reconstruction"] == pytest.approx(4.0)
+    assert metrics["total"] == pytest.approx(4.0)
 
 
 def test_wandb_reports_gradient_clipping_health_metrics(
@@ -740,6 +899,77 @@ def test_checkpoint_reconstructs_balanced_model_from_factory_metadata(
     assert isinstance(restored.nnet, BalancedNetworks)
     for name, tensor in network.nnet.state_dict().items():
         torch.testing.assert_close(tensor, restored.nnet.state_dict()[name])
+
+
+def test_checkpoint_reconstructs_state_anchored_model_from_factory_metadata(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        model_name="balanced_reconstruction",
+        reconstruction_loss_weight=0.5,
+    )
+    network = LunaNetwork(chess_game, config)
+    network.save_checkpoint(str(tmp_path), "state-anchored.pth.tar")
+
+    restored = LunaNetwork.from_checkpoint(
+        chess_game,
+        tmp_path / "state-anchored.pth.tar",
+        device="cpu",
+    )
+
+    assert restored._learner.model_name == "balanced_reconstruction"
+    assert restored._learner.reconstruction_loss_weight == pytest.approx(0.5)
+    assert isinstance(restored.nnet, BalancedNetworks)
+    assert restored.nnet.piece_reconstruction is not None
+    for name, tensor in network.nnet.state_dict().items():
+        torch.testing.assert_close(tensor, restored.nnet.state_dict()[name])
+
+
+def test_checkpoint_loader_defaults_missing_reconstruction_weight_to_zero(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    network.save_checkpoint(str(tmp_path), "current.pth.tar")
+    checkpoint = torch.load(tmp_path / "current.pth.tar", map_location="cpu", weights_only=True)
+    del checkpoint["learner_config"]["reconstruction_loss_weight"]
+    torch.save(checkpoint, tmp_path / "pre-reconstruction-objective.pth.tar")
+
+    restored = LunaNetwork.from_checkpoint(
+        chess_game,
+        tmp_path / "pre-reconstruction-objective.pth.tar",
+        device="cpu",
+    )
+
+    assert restored._learner.reconstruction_loss_weight == pytest.approx(0.0)
+
+
+def test_checkpoint_loader_rejects_missing_reconstruction_weight_for_state_anchored_model(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        model_name="balanced_reconstruction",
+        reconstruction_loss_weight=0.5,
+    )
+    network = LunaNetwork(chess_game, config)
+    network.save_checkpoint(str(tmp_path), "state-anchored.pth.tar")
+    checkpoint = torch.load(tmp_path / "state-anchored.pth.tar", map_location="cpu", weights_only=True)
+    del checkpoint["learner_config"]["reconstruction_loss_weight"]
+    torch.save(checkpoint, tmp_path / "missing-state-anchor-weight.pth.tar")
+
+    with pytest.raises(ValueError, match=r"missing=.*reconstruction_loss_weight"):
+        LunaNetwork.from_checkpoint(
+            chess_game,
+            tmp_path / "missing-state-anchor-weight.pth.tar",
+            device="cpu",
+        )
 
 
 def test_checkpoint_without_model_factory_metadata_defaults_to_baseline(

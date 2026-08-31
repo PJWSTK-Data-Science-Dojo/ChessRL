@@ -27,7 +27,7 @@ from luna.game.stockfish_eval import (
     validate_stockfish_configuration,
 )
 from luna.game.stockfish_ladder import LADDER_STATE_NAME, load_fairy_ladder_state
-from luna.network import LunaNetwork
+from luna.network import LunaNetwork, RepresentationCollapseError
 
 
 def validate_new_training_phase_target(checkpoint_dir: str) -> None:
@@ -255,6 +255,9 @@ def main() -> int:
     except KeyboardInterrupt:
         logger.info("Training interrupted; the latest completed checkpoint remains available for resume.")
         return 130
+    except RepresentationCollapseError as exc:
+        logger.critical("Training stopped by the representation-collapse guard: {}", exc)
+        return 78
 
     return 0
 

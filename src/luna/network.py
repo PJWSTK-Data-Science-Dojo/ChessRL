@@ -68,6 +68,10 @@ class PreparedBatch(NamedTuple):
     reanalysis: ReanalysisBatchStats
 
 
+class RepresentationCollapseError(RuntimeError):
+    """Raised when repeated diversity canaries show a collapsed representation."""
+
+
 @dataclass(frozen=True, slots=True)
 class TrainingPhaseProvenance:
     """Immutable identity of the checkpoint used to start a training phase."""
@@ -305,6 +309,10 @@ def _get_device(device_type: str = "cuda", cuda_device_index: int | None = None)
 class LunaNetwork:
     """EfficientZeroV2 learner with persistent optimizer, mixed-precision, and unroll training."""
 
+    _COLLAPSE_GUARD_THRESHOLD = 0.05
+    _COLLAPSE_GUARD_PATIENCE = 3
+    _COLLAPSE_GUARD_START_STEP = 100
+
     _learner: EzV2LearnerConfig
 
     def __init__(self, game: ChessGame, learner: EzV2LearnerConfig | None = None) -> None:
@@ -339,6 +347,7 @@ class LunaNetwork:
         self._lr_schedule_mismatch_warned = False
         self._loaded_checkpoint_path: Path | None = None
         self._training_phase_provenance: TrainingPhaseProvenance | None = None
+        self._low_diversity_reports = 0
         self._mcts_inference_compiled = False
         self._training_compiled = False
 
@@ -431,6 +440,34 @@ class LunaNetwork:
             return L.lr * step_in_run / warmup_steps
         progress = (step_in_run - warmup_steps) / max(total_steps - warmup_steps, 1)
         return L.lr_min + 0.5 * (L.lr - L.lr_min) * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+
+    def _check_representation_diversity(self, root_batch_feature_std: float, training_step: int) -> None:
+        """Fail closed after repeated low-diversity reports in the state-anchored model."""
+        if (
+            self._learner.model_name != "balanced_reconstruction"
+            or self._learner.reconstruction_loss_weight <= 0.0
+            or training_step < self._COLLAPSE_GUARD_START_STEP
+        ):
+            return
+        if not math.isfinite(root_batch_feature_std):
+            raise RepresentationCollapseError("Root latent diversity is non-finite")
+        if root_batch_feature_std >= self._COLLAPSE_GUARD_THRESHOLD:
+            self._low_diversity_reports = 0
+            return
+        self._low_diversity_reports += 1
+        logger.warning(
+            "Representation diversity canary {}/{}: root batch-feature std {:.6f} < {:.3f}",
+            self._low_diversity_reports,
+            self._COLLAPSE_GUARD_PATIENCE,
+            root_batch_feature_std,
+            self._COLLAPSE_GUARD_THRESHOLD,
+        )
+        if self._low_diversity_reports >= self._COLLAPSE_GUARD_PATIENCE:
+            raise RepresentationCollapseError(
+                "Stopping state-anchored training after "
+                f"{self._low_diversity_reports} consecutive collapsed-latent reports "
+                f"(root batch-feature std={root_batch_feature_std:.6f})"
+            )
 
     def _resolve_lr_schedule_total(self, requested_total: int, current_call_steps: int) -> int:
         candidate = requested_total if requested_total > 0 else self._global_step + current_call_steps
@@ -656,6 +693,7 @@ class LunaNetwork:
         v_loss_m = AverageMeter()
         r_loss_m = AverageMeter()
         consist_loss_m = AverageMeter()
+        reconstruction_loss_m = AverageMeter()
         step_time_m = AverageMeter()
         grad_norm_preclip_m = AverageMeter()
         grad_norm_postclip_m = AverageMeter()
@@ -675,6 +713,12 @@ class LunaNetwork:
         grad_accum = L.grad_accum_steps
         train_discount = discount if discount is not None else L.discount
         async_pf = self._async_batch_prefetch(steps)
+        consistency_enabled = L.consistency_loss_weight > 0.0
+        reconstruction_head = self.nnet.piece_reconstruction
+        if L.reconstruction_loss_weight <= 0.0:
+            reconstruction_head = None
+        elif reconstruction_head is None:
+            raise RuntimeError("The configured reconstruction objective has no reconstruction head")
 
         self.optimizer.zero_grad(set_to_none=True)
         prefetch_future: Future[PreparedBatch] | None = None
@@ -714,6 +758,7 @@ class LunaNetwork:
                 accum_v_acc = torch.zeros((), device=self.device, dtype=torch.float32)
                 accum_r_acc = torch.zeros((), device=self.device, dtype=torch.float32)
                 accum_c_acc = torch.zeros((), device=self.device, dtype=torch.float32)
+                accum_reconstruction_acc = torch.zeros((), device=self.device, dtype=torch.float32)
                 all_priority_errors: list[np.ndarray] = []
                 all_tree_indices: list[list[int]] = []
                 latent_health: dict[str, float] = {}
@@ -794,14 +839,29 @@ class LunaNetwork:
                         loss_pi_total = loss_pi * v_mask[:, 0]
                         loss_v_total = loss_v_pred * v_mask[:, 0]
                         loss_consist_total = torch.zeros(micro_bs, device=self.device)
+                        loss_reconstruction_total = torch.zeros(micro_bs, device=self.device)
+                        reconstruction_logits_0: torch.Tensor | None = None
+                        reconstruction_target_0: torch.Tensor | None = None
+                        last_reconstruction_logits: torch.Tensor | None = None
+                        last_reconstruction_target: torch.Tensor | None = None
 
-                        with torch.no_grad():
-                            flat_obs = obs_unroll[:, 1:].reshape(-1, *obs_unroll.shape[2:])
-                            flat_planes = self.nnet._obs_to_planes(flat_obs)
-                            all_target_latents = _scale_latent(self._training_representation(flat_planes))
-                            all_target_latents = all_target_latents.view(
-                                micro_bs, unroll, *all_target_latents.shape[1:]
+                        if reconstruction_head is not None:
+                            reconstruction_logits_0 = reconstruction_head(latent)
+                            reconstruction_target_0 = _piece_class_targets(obs)
+                            loss_reconstruction_total = _piece_reconstruction_loss(
+                                reconstruction_logits_0,
+                                reconstruction_target_0,
                             )
+
+                        all_target_latents: torch.Tensor | None = None
+                        if consistency_enabled:
+                            with torch.no_grad():
+                                flat_obs = obs_unroll[:, 1:].reshape(-1, *obs_unroll.shape[2:])
+                                flat_planes = self.nnet._obs_to_planes(flat_obs)
+                                all_target_latents = _scale_latent(self._training_representation(flat_planes))
+                                all_target_latents = all_target_latents.view(
+                                    micro_bs, unroll, *all_target_latents.shape[1:]
+                                )
 
                         current_latent = latent
                         for k in range(unroll):
@@ -829,8 +889,24 @@ class LunaNetwork:
                             v_target_k = scalar_to_support(t_values[:, k + 1], support)
                             loss_v_k = _soft_ce_with_support(value_logits_k, v_target_k) * v_mask[:, k + 1]
 
-                            target_latent = all_target_latents[:, k]
-                            loss_consist = _simsiam_loss(self.nnet.simsiam, next_latent, target_latent) * c_mask[:, k]
+                            if all_target_latents is not None:
+                                target_latent = all_target_latents[:, k]
+                                loss_consist = (
+                                    _simsiam_loss(self.nnet.simsiam, next_latent, target_latent) * c_mask[:, k]
+                                )
+                            else:
+                                loss_consist = torch.zeros(micro_bs, device=self.device)
+
+                            if reconstruction_head is not None:
+                                last_reconstruction_logits = reconstruction_head(next_latent)
+                                last_reconstruction_target = _piece_class_targets(obs_unroll[:, k + 1])
+                                loss_reconstruction_total = loss_reconstruction_total + (
+                                    _piece_reconstruction_loss(
+                                        last_reconstruction_logits,
+                                        last_reconstruction_target,
+                                    )
+                                    * c_mask[:, k]
+                                )
 
                             loss_r_total = loss_r_total + loss_r
                             loss_pi_total = loss_pi_total + loss_pi_k
@@ -842,15 +918,18 @@ class LunaNetwork:
                         num_valid = v_mask.sum(dim=1).clamp(min=1.0)
                         num_unroll = u_mask.sum(dim=1).clamp(min=1.0)
                         num_consistency = c_mask.sum(dim=1).clamp(min=1.0)
+                        num_reconstruction = 1.0 + c_mask.sum(dim=1)
                         normalized_pi = loss_pi_total / num_valid
                         normalized_v = loss_v_total / num_valid
                         normalized_r = loss_r_total / num_unroll
                         normalized_consist = loss_consist_total / num_consistency
+                        normalized_reconstruction = loss_reconstruction_total / num_reconstruction
                         total = (
                             L.policy_loss_weight * normalized_pi
                             + L.value_loss_weight * normalized_v
                             + L.reward_loss_weight * normalized_r
                             + L.consistency_loss_weight * normalized_consist
+                            + L.reconstruction_loss_weight * normalized_reconstruction
                         )
 
                         weighted = (total * is_w).mean() / grad_accum
@@ -858,17 +937,58 @@ class LunaNetwork:
                         weighted_v = (normalized_v * is_w).mean() / grad_accum
                         weighted_r = (normalized_r * is_w).mean() / grad_accum
                         weighted_consist = (normalized_consist * is_w).mean() / grad_accum
+                        weighted_reconstruction = (normalized_reconstruction * is_w).mean() / grad_accum
 
                         if (step % 50 == 0 or step == steps) and accum_idx == grad_accum - 1:
+                            latent_health.update(_raw_latent_health_metrics("root", latent))
+                            active_dynamics = u_mask[:, -1].bool()
+                            if bool(active_dynamics.any()):
+                                latent_health.update(
+                                    _raw_latent_health_metrics("predicted", next_latent[active_dynamics])
+                                )
+                            active_values = v_mask.bool()
+                            active_value_count = active_values.sum().clamp(min=1)
+                            latent_health["train/value_target_nonzero_fraction"] = float(
+                                ((t_values.abs() > 0.5) & active_values).sum().item() / active_value_count.item()
+                            )
+                            latent_health["train/value_target_mean_abs"] = float(
+                                (t_values.abs() * v_mask).sum().item() / active_value_count.item()
+                            )
                             active_consistency = c_mask[:, -1].bool()
+                            latent_health["train/next_observation_active_fraction"] = float(c_mask.mean().item())
+                            latent_health["train/next_observation_active_samples"] = float(
+                                active_consistency.sum().item()
+                            )
+                            latent_health["train/consistency_objective_enabled"] = float(consistency_enabled)
+                            # Retain the original names for dashboard compatibility.
                             latent_health["train/consistency_active_fraction"] = float(c_mask.mean().item())
                             latent_health["train/latent_health_active_samples"] = float(active_consistency.sum().item())
-                            if bool(active_consistency.any()):
+                            if all_target_latents is not None and bool(active_consistency.any()):
                                 latent_health.update(
                                     _latent_health_metrics(
                                         self.nnet.simsiam,
                                         next_latent[active_consistency],
-                                        target_latent[active_consistency],
+                                        all_target_latents[:, -1][active_consistency],
+                                    )
+                                )
+                            if reconstruction_logits_0 is not None and reconstruction_target_0 is not None:
+                                latent_health.update(
+                                    _piece_reconstruction_accuracy_metrics(
+                                        "root",
+                                        reconstruction_logits_0,
+                                        reconstruction_target_0,
+                                    )
+                                )
+                            if (
+                                last_reconstruction_logits is not None
+                                and last_reconstruction_target is not None
+                                and bool(active_consistency.any())
+                            ):
+                                latent_health.update(
+                                    _piece_reconstruction_accuracy_metrics(
+                                        "predicted",
+                                        last_reconstruction_logits[active_consistency],
+                                        last_reconstruction_target[active_consistency],
                                     )
                                 )
 
@@ -879,6 +999,7 @@ class LunaNetwork:
                     accum_v_acc = accum_v_acc + weighted_v.detach().float()
                     accum_r_acc = accum_r_acc + weighted_r.detach().float()
                     accum_c_acc = accum_c_acc + weighted_consist.detach().float()
+                    accum_reconstruction_acc = accum_reconstruction_acc + weighted_reconstruction.detach().float()
                     all_priority_errors.append((value_pred_0.float() - t_values[:, 0]).abs().detach().cpu().numpy())
                     all_tree_indices.append(micro_tree_indices)
 
@@ -886,7 +1007,7 @@ class LunaNetwork:
                 if not torch.isfinite(accum_weighted).all():
                     logger.error(
                         "Non-finite loss detected at step {}/{}! "
-                        "total={:.4f} pi={:.4f} v={:.4f} r={:.4f} consist={:.4f}",
+                        "total={:.4f} pi={:.4f} v={:.4f} r={:.4f} consist={:.4f} reconstruct={:.4f}",
                         step,
                         steps,
                         accum_weighted.item(),
@@ -894,6 +1015,7 @@ class LunaNetwork:
                         accum_v_acc.item(),
                         accum_r_acc.item(),
                         accum_c_acc.item(),
+                        accum_reconstruction_acc.item(),
                     )
                     raise RuntimeError(
                         f"Training diverged at step {step}/{steps}: loss is NaN or Inf. "
@@ -968,11 +1090,13 @@ class LunaNetwork:
                 v_loss_m.update(float(accum_v_acc.item()), bs)
                 r_loss_m.update(float(accum_r_acc.item()), bs)
                 consist_loss_m.update(float(accum_c_acc.item()), bs)
+                reconstruction_loss_m.update(float(accum_reconstruction_acc.item()), bs)
                 step_time_m.update(time.time() - t0)
 
                 if step % 50 == 0 or step == steps:
                     logger.info(
-                        "(step {}/{}) {:.3f}s lr={:.1e} | loss={:.4f} pi={:.4f} v={:.4f} r={:.4f} c={:.4f}",
+                        "(step {}/{}) {:.3f}s lr={:.1e} | "
+                        "loss={:.4f} pi={:.4f} v={:.4f} r={:.4f} c={:.4f} reconstruct={:.4f}",
                         step,
                         steps,
                         step_time_m.avg,
@@ -982,6 +1106,7 @@ class LunaNetwork:
                         v_loss_m.avg,
                         r_loss_m.avg,
                         consist_loss_m.avg,
+                        reconstruction_loss_m.avg,
                     )
 
                     if wandb.run is not None:
@@ -993,6 +1118,10 @@ class LunaNetwork:
                                 "train/loss_reward": r_loss_m.avg,
                                 "train/loss_consistency": consist_loss_m.avg,
                                 "train/loss_consistency_weighted": (L.consistency_loss_weight * consist_loss_m.avg),
+                                "train/loss_reconstruction": reconstruction_loss_m.avg,
+                                "train/loss_reconstruction_weighted": (
+                                    L.reconstruction_loss_weight * reconstruction_loss_m.avg
+                                ),
                                 "train/lr": new_lr,
                                 "train/grad_norm": grad_norm_preclip_m.avg,
                                 "train/grad_norm_preclip": grad_norm_preclip_m.avg,
@@ -1009,6 +1138,9 @@ class LunaNetwork:
                                 **latent_health,
                             }
                         )
+                    root_diversity = latent_health.get("train/latent_root_batch_feature_std")
+                    if root_diversity is not None:
+                        self._check_representation_diversity(root_diversity, self._global_step)
 
                 if prof is not None:
                     prof.step()
@@ -1022,6 +1154,7 @@ class LunaNetwork:
             "value": v_loss_m.avg,
             "reward": r_loss_m.avg,
             "consistency": consist_loss_m.avg,
+            "reconstruction": reconstruction_loss_m.avg,
         }
 
     def _persist_compiled_mcts_latent(self, latent: torch.Tensor) -> torch.Tensor:
@@ -1409,9 +1542,17 @@ class LunaNetwork:
 
     @staticmethod
     def _checkpoint_learner_config(checkpoint: Mapping[str, Any], filepath: str | os.PathLike[str]) -> dict[str, Any]:
-        stored = checkpoint["learner_config"]
-        if not isinstance(stored, dict) or not all(isinstance(key, str) for key in stored):
+        raw_stored = checkpoint["learner_config"]
+        if not isinstance(raw_stored, dict) or not all(isinstance(key, str) for key in raw_stored):
             raise ValueError(f"Checkpoint learner_config must be a string-keyed mapping: {filepath}")
+        stored = dict(raw_stored)
+        # Format-v2 checkpoints written before the state-anchor objective did not
+        # contain this additive, zero-default field. Preserve their inference and
+        # exact-resume contract without relaxing validation for any other field.
+        model_spec = checkpoint.get("model_spec")
+        stored_model_name = model_spec.get("model_name", "baseline") if isinstance(model_spec, dict) else None
+        if "reconstruction_loss_weight" not in stored and stored_model_name != "balanced_reconstruction":
+            stored["reconstruction_loss_weight"] = 0.0
         expected_fields = {field.name for field in fields(EzV2LearnerConfig)} - {"model_name"}
         stored_fields = set(stored)
         if stored_fields != expected_fields:
@@ -1632,6 +1773,61 @@ def _soft_ce_with_support(logits: torch.Tensor, target_probs: torch.Tensor) -> t
     """Cross-entropy with soft categorical support targets."""
     log_probs = F.log_softmax(logits, dim=1)
     return -(target_probs * log_probs).sum(dim=1)
+
+
+def _piece_class_targets(observation: torch.Tensor) -> torch.Tensor:
+    """Map the current 12 piece planes to empty-or-piece class indices."""
+    if observation.ndim != 4 or observation.shape[-1] < 12:
+        raise ValueError(
+            "Piece reconstruction observations must have shape (batch, 8, 8, planes>=12), "
+            f"got {tuple(observation.shape)}"
+        )
+    piece_planes = observation[..., :12]
+    occupied = piece_planes.amax(dim=-1) > 0.5
+    piece_class = piece_planes.argmax(dim=-1) + 1
+    return torch.where(occupied, piece_class, torch.zeros_like(piece_class)).long()
+
+
+def _piece_reconstruction_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Balance occupied-piece and empty-square cross-entropy per sample."""
+    expected_shape = (target.shape[0], 13, target.shape[1], target.shape[2])
+    if tuple(logits.shape) != expected_shape:
+        raise ValueError(f"Piece reconstruction logits must have shape {expected_shape}, got {tuple(logits.shape)}")
+    per_square = F.cross_entropy(logits, target, reduction="none")
+    occupied = (target > 0).to(per_square.dtype)
+    empty = 1.0 - occupied
+    occupied_loss = (per_square * occupied).sum(dim=(-2, -1)) / occupied.sum(dim=(-2, -1)).clamp(min=1.0)
+    empty_loss = (per_square * empty).sum(dim=(-2, -1)) / empty.sum(dim=(-2, -1)).clamp(min=1.0)
+    return 0.5 * (occupied_loss + empty_loss)
+
+
+def _raw_latent_health_metrics(prefix: str, latent: torch.Tensor) -> dict[str, float]:
+    """Report representation diversity without depending on a consistency projector."""
+    with torch.no_grad():
+        detached = latent.detach().float()
+        flattened = detached.flatten(1)
+        return {
+            f"train/latent_{prefix}_batch_feature_std": float(flattened.std(dim=0, unbiased=False).mean().item()),
+            f"train/latent_{prefix}_spatial_std": float(detached.std(dim=(-2, -1), unbiased=False).mean().item()),
+        }
+
+
+def _piece_reconstruction_accuracy_metrics(
+    prefix: str,
+    logits: torch.Tensor,
+    target: torch.Tensor,
+) -> dict[str, float]:
+    """Return all-square and occupied-square decoder accuracy."""
+    with torch.no_grad():
+        prediction = logits.detach().argmax(dim=1)
+        correct = prediction == target
+        occupied = target > 0
+        occupied_total = int(occupied.sum().item())
+        occupied_accuracy = float(correct[occupied].float().mean().item()) if occupied_total > 0 else 0.0
+        return {
+            f"train/reconstruction_{prefix}_accuracy": float(correct.float().mean().item()),
+            f"train/reconstruction_{prefix}_occupied_accuracy": occupied_accuracy,
+        }
 
 
 def _simsiam_loss(

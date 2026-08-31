@@ -1,6 +1,6 @@
 # Luna ChessRL
 
-Luna is a model-based reinforcement-learning chess engine trained from self-play. It combines an EfficientZeroV2-style latent world model with Gumbel MuZero search, prioritized replay, search-value reanalysis, and an unrolled consistency objective. The repository includes training, evaluation, an interactive browser experience, a UCI adapter, and a secure Lichess deployment helper.
+Luna is a model-based reinforcement-learning chess engine trained from self-play. It combines an EfficientZeroV2-style latent world model with Gumbel MuZero search, prioritized replay, full-game outcome targets, and optional auxiliary representation objectives. The repository includes training, evaluation, an interactive browser experience, a UCI adapter, and a secure Lichess deployment helper.
 
 This is a research and portfolio project, not a claim of engine parity with established tournament systems. Playing strength depends on training data, compute budget, search settings, and evaluation methodology.
 
@@ -13,7 +13,7 @@ This is a research and portfolio project, not a claim of engine parity with esta
 - Five spatial dynamics action planes: from, to, and one plane for each underpromotion identity.
 - A convolutional policy head aligned to source squares, destination squares, and underpromotion identity.
 - A 119-plane observation tensor with eight positions of piece/repetition history and complete current rule state.
-- K-step unrolled policy, value, reward, and SimSiam-style consistency losses.
+- K-step unrolled policy, value, and reward losses; optional SimSiam consistency and training-only board reconstruction.
 - Three-bin categorical value and reward targets for the exact `{-1, 0, 1}` chess outcome range.
 - Prioritized trajectory replay with compact `float16` observations/policies and boolean legal masks.
 - AdamW, learning-rate warm-up followed by cosine decay, mixed precision, gradient clipping, accumulation, and recurrent gradient scaling.
@@ -21,7 +21,7 @@ This is a research and portfolio project, not a claim of engine parity with esta
 - Versioned, atomic checkpoints that include architecture, optimizer, scaler, step,
   trainer iteration, and the learning-rate schedule horizon.
 
-The implementation follows ideas from [MuZero](https://arxiv.org/abs/1911.08265), [EfficientZero](https://arxiv.org/abs/2111.00210), [EfficientZero V2](https://proceedings.mlr.press/v235/wang24at.html), [Gumbel MuZero](https://openreview.net/forum?id=bERaNdoegnO), and [SimSiam](https://arxiv.org/abs/2011.10566).
+The implementation follows ideas from [MuZero](https://arxiv.org/abs/1911.08265), [EfficientZero](https://arxiv.org/abs/2111.00210), [EfficientZero V2](https://proceedings.mlr.press/v235/wang24at.html), and [Gumbel MuZero](https://openreview.net/forum?id=bERaNdoegnO).
 
 ## Quick start
 
@@ -80,10 +80,13 @@ from being merged accidentally.
 Use `uv run python src/main.py --help` for the complete Tyro-generated option reference. A bare `src/main.py` invocation uses the lighter dataclass defaults; `make train` applies the larger maintained experiment preset.
 
 The maintained preset uses four persistent self-play actors with 32 games each, a
-256-position learner batch split into two microbatches, a five-step unroll and TD
-horizon, and a 300,000-position replay window. It keeps Gumbel Sequential Halving,
-categorical value targets, SimSiam consistency, BF16, reanalysis, and compiled
-inference/training enabled. Root exploration remains active throughout the bounded
+256-position learner batch split into two microbatches, a five-step latent unroll,
+a 256-ply Monte Carlo value horizon, and a 300,000-position replay window. It selects
+`balanced_reconstruction`: the 128-channel asymmetric SE-ResNet plus a training-only
+13-class piece decoder. SimSiam and reanalysis are disabled during this cold-start
+phase so the learner cannot minimize its objective by copying a collapsed target or
+bootstrapping almost every position from its own near-zero value. BF16 and compiled
+inference/training remain enabled. Root exploration remains active throughout the bounded
 256-ply self-play game, and a self-play-only guard reruns a root search when the chosen
 move would immediately enable a threefold-repetition claim. The full legal mask is still
 stored as the learning target. The replay capacity counts positions, not trajectories.
@@ -91,12 +94,11 @@ stored as the learning target. The replay capacity counts positions, not traject
 After a fresh process or resume, learning waits for 50,000 replay positions. Thereafter
 the learner targets two sampled positions per newly generated position, capped at 200
 optimizer steps per iteration, while the cosine schedule keeps an explicit 60,000-step
-horizon. Reanalysis starts after 10,000 optimizer steps, refreshes 2% of eligible samples
-with eight simulations, and initially updates value targets only. These limits avoid
-letting unusually short self-play games multiply their own distribution through a fixed
-update count.
+horizon. Reanalysis starts disabled and should be introduced only as a separately named
+ablation after value and latent-diversity metrics are healthy. These limits avoid letting
+unusually short self-play games multiply their own distribution through a fixed update count.
 
-## Anti-collapse training phase
+## Historical phase commands
 
 To carry the complete model, optimizer, scaler, counters, and LR horizon from the current
 `runs/luna-strength-1500-v1/latest.pth.tar` into the separate ladder contract, run this
@@ -112,14 +114,12 @@ Replay is process memory and therefore starts empty. If the first migration proc
 interrupted after creating its W&B run but before publishing target `latest.pth.tar`, retry
 explicitly with `make migrate-ladder-phase ARGS='--wandb-resume allow'`.
 
-`make train-phase` is the maintained path: it imports only weights from the pinned,
-pre-collapse `runs/sources/luna-balanced-precollapse-iter40.pth.tar`, then starts a fresh
-optimizer, scaler, counters, replay, and learning-rate schedule. It verifies the source
-against `NEW_PHASE_SOURCE_SHA256`; override the source and hash together only when
-deliberately starting a different lineage. `make migrate-ladder-phase` remains available
-for the distinct case where the complete optimizer state of `MIGRATION_SOURCE_DIR` must
-be carried forward. The maintained weights-only target defaults to
-`runs/luna-balanced-ezv2-anti-collapse-v2` and must initially be absent or empty.
+`make train-phase` and `make resume-phase` preserve the old weights-only experiment
+contract for forensic reproducibility. Do not use their default iter-40 source for new
+training: diversity audits showed that it was already collapsed. New experiments must
+use `make train` with a new checkpoint directory and W&B identity, which starts from
+random weights. `make migrate-ladder-phase` remains available only for deliberate
+complete-state migrations of a known healthy lineage.
 
 A local, Git-ignored `.env` must define
 `WANDB_API_KEY` and `WANDB_ENTITY` (use `dsc-pjatk-warsaw` for the maintained
@@ -143,7 +143,7 @@ starting a different phase. If the remote run was deliberately deleted while its
 checkpoint remains valid, recreate it explicitly with
 `make resume-phase ARGS='--wandb-resume allow'`. The general CLI defaults to `allow`.
 
-The maintained phase preset collects 128 self-play episodes with four persistent actors
+The historical phase preset collects 128 self-play episodes with four persistent actors
 running up to 32 active games each, trains with batches of 256 after replay warm-up, and
 reanalyzes 2% of eligible samples for value only. Every five iterations it plays a 20-game
 paired-opening match at the current Fairy-Stockfish rung. The ladder starts at native
@@ -162,7 +162,8 @@ batches improve the GPU kernel less than they increase CPU chess-rule and tree-m
 work at that scale; multiple actors keep the accelerator fed more effectively. W&B logs
 `selfplay/*` workload data, `performance/*` phase timings and throughput, and `replay/*`
 buffer state. Repetition-guard interventions, actual optimizer steps, gradient clipping,
-reanalysis work, and latent-collapse diagnostics are explicit metrics. Fixed-opponent
+reanalysis work, board-reconstruction accuracy, grounded-value coverage, and raw latent
+diversity are explicit metrics. Fixed-opponent
 results use `benchmark/*`; adaptive results use `ladder/*`
 with their own monotonic evaluation step, current/highest Elo, decisions, outcomes,
 duration, and approximate 95% score interval. The fixed match is a regression sentinel, not a
@@ -300,7 +301,7 @@ src/luna/coach.py              self-play/training/checkpoint orchestration
 src/luna/network.py            learner, inference, and checkpoint I/O
 src/luna/model_factory.py      configured model architecture selection
 src/luna/ezv2_networks.py      baseline architecture and support transforms
-src/luna/balanced_networks.py  asymmetric SE-ResNet architecture
+src/luna/balanced_networks.py  asymmetric SE-ResNet and state-anchored variant
 src/luna/mcts.py               Gumbel MuZero and PUCT latent search
 src/luna/replay_buffer.py      prioritized trajectory replay
 src/luna/targets.py            TD and unroll targets
@@ -313,7 +314,7 @@ tests/                         unit, integration, protocol, and regression tests
 ## Reproducibility notes
 
 - `--seed` seeds Python, NumPy, and PyTorch. Some accelerator kernels may remain nondeterministic.
-- `--learner.model-name` selects `baseline` or `balanced`; the maintained `make train` preset uses `balanced` with 128 channels, 10 representation blocks, and one dynamics block.
+- `--learner.model-name` selects `baseline`, `balanced`, or `balanced_reconstruction`; the maintained `make train` preset uses the last option with 128 channels, 10 representation blocks, one dynamics block, and a training-only piece decoder.
 - Gumbel search does not use Dirichlet root noise. Barlow Twins, playout-cap randomization, FP8/TensorRT, and alternative chess-rule backends remain ablation candidates rather than defaults; each changes training semantics or runtime behavior and requires a controlled benchmark.
 - Training checkpoints restore optimizer, scaler, global step, and trainer iteration. The in-memory replay buffer is not serialized.
 - `torch.compile` is optional. Disable it with `--learner.no-compile-inference` or the corresponding web flag when unsupported.

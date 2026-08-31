@@ -152,6 +152,19 @@ class BalancedPredictionNetwork(PredictionNetwork):
         return policy_logits, self.value_head(latent)
 
 
+class PieceReconstructionHead(nn.Module):
+    """Decode empty/white/black piece identity at every square during training."""
+
+    NUM_CLASSES = 13
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.classifier = nn.Conv2d(channels, self.NUM_CLASSES, 1)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return cast(torch.Tensor, self.classifier(latent))
+
+
 class BalancedNetworks(EZV2Networks):
     """EfficientZeroV2 API backed by the balanced asymmetric architecture."""
 
@@ -164,6 +177,7 @@ class BalancedNetworks(EZV2Networks):
         self.dynamics = BalancedDynamicsNetwork(cfg.num_channels, cfg.support_size, cfg.dyn_blocks)
         self.prediction = BalancedPredictionNetwork(cfg.num_channels, action_size, cfg.support_size)
         self.simsiam = SimSiamProjector(cfg.num_channels, cfg.proj_dim, pool_spatial=True)
+        self.piece_reconstruction: PieceReconstructionHead | None = None
         self.support_size = cfg.support_size
         self.action_size = action_size
 
@@ -183,3 +197,11 @@ class BalancedNetworks(EZV2Networks):
             log_policy,
             _support_to_scalar(value_logits, self.support_size),
         )
+
+
+class BalancedReconstructionNetworks(BalancedNetworks):
+    """Balanced inference model with a training-only chess-state anchor."""
+
+    def __init__(self, game: ChessGame, cfg: EzV2LearnerConfig) -> None:
+        super().__init__(game, cfg)
+        self.piece_reconstruction = PieceReconstructionHead(cfg.num_channels)

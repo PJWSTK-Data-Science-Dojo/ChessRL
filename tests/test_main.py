@@ -150,6 +150,23 @@ def test_main_handles_training_interrupt_without_traceback(tmp_path: Path) -> No
         assert training_entry.main() == 130
 
 
+def test_main_returns_non_restarting_exit_for_representation_collapse(tmp_path: Path) -> None:
+    config = TrainCliConfig(
+        run=TrainingRunConfig(checkpoint=str(tmp_path / "run"), stockfish_eval_every=0),
+        learner=EzV2LearnerConfig(device="cpu"),
+    )
+
+    with (
+        patch.object(training_entry.tyro, "cli", return_value=config),
+        patch.object(training_entry, "LunaNetwork") as network_type,
+        patch.object(training_entry, "Coach") as coach_type,
+    ):
+        network_type.__name__ = "LunaNetwork"
+        coach_type.return_value.learn.side_effect = training_entry.RepresentationCollapseError("collapsed")
+
+        assert training_entry.main() == 78
+
+
 @pytest.mark.parametrize("resume_mode", ["allow", "never", "must"])
 def test_cli_parses_stable_wandb_run_id_and_resume_mode(resume_mode: str) -> None:
     config = training_entry.tyro.cli(
@@ -318,7 +335,7 @@ def test_train_phase_make_target_keeps_pinned_source_preflight() -> None:
     assert "dd07d8ddf2aa652719b405b4e3b6f7381bb652873a34d139fe37b95327ba99dd" in result.stdout
 
 
-def test_maintained_train_target_uses_balanced_ezv2_contract() -> None:
+def test_maintained_train_target_uses_fresh_state_anchored_contract() -> None:
     repository = Path(__file__).resolve().parents[1]
 
     result = subprocess.run(
@@ -331,25 +348,36 @@ def test_maintained_train_target_uses_balanced_ezv2_contract() -> None:
 
     expected_flags = (
         "--run.search-mode gumbel",
-        "--run.gumbel-max-considered-actions 16",
+        "--run.gumbel-max-considered-actions 8",
         "--run.num-mcts-sims 32",
         "--run.self-play-workers 4",
-        "--learner.model-name balanced",
+        "--run.stockfish-eval-every 25",
+        "--run.stockfish-elo 1500",
+        "--run.ladder-eval-every 5",
+        "--run.ladder-start-elo 500",
+        "--learner.model-name balanced_reconstruction",
         "--learner.batch-size 256",
         "--learner.repr-blocks 10",
         "--learner.dyn-blocks 1",
         "--learner.unroll-steps 5",
-        "--learner.td-steps 5",
+        "--learner.td-steps 256",
+        "--learner.lr 1e-4",
+        "--learner.value-loss-weight 1.0",
+        "--learner.reward-loss-weight 0.1",
+        "--learner.consistency-loss-weight 0.0",
+        "--learner.reconstruction-loss-weight 0.5",
         "--learner.compile-inference",
         "--learner.compile-training",
         "--run.self-play-repetition-guard",
         "--run.target-replay-ratio 2.0",
         "--run.lr-schedule-total-steps 60000",
         "--run.replay-warmup-positions 50000",
-        "--learner.reanalyze-mcts-sims 8",
-        "--learner.reanalyze-prob 0.02",
+        "--learner.reanalyze-mcts-sims 0",
+        "--learner.reanalyze-prob 0.0",
         "--learner.no-reanalyze-policy",
-        "--learner.reanalyze-start-step 10000",
+        "--learner.reanalyze-start-step 20000",
     )
     for flag in expected_flags:
         assert flag in result.stdout
+    assert "--load-model" not in result.stdout
+    assert "--new-training-phase" not in result.stdout
