@@ -5,6 +5,8 @@ from dataclasses import dataclass, field, fields
 from typing import Literal
 
 MAX_STOCKFISH_EVAL_GAMES = 20
+FAIRY_STOCKFISH_MIN_ELO = 500
+FAIRY_STOCKFISH_MAX_ELO = 2850
 WandbResumeMode = Literal["allow", "never", "must"]
 
 
@@ -147,8 +149,8 @@ class TrainingRunConfig(MCTSParams):
     stockfish_eval_games: int = 20
     """Even number of paired-opening games, up to ``MAX_STOCKFISH_EVAL_GAMES``."""
 
-    stockfish_elo: int = 1320
-    """Fixed UCI Elo for the external benchmark; 1320 is Stockfish's supported floor."""
+    stockfish_elo: int = 1500
+    """Fixed official-Stockfish UCI Elo used only for comparable checkpoint promotion."""
 
     stockfish_depth: int = 10
     """Maximum Stockfish search depth per move."""
@@ -158,6 +160,33 @@ class TrainingRunConfig(MCTSParams):
 
     stockfish_eval_max_ply: int | None = None
     """Optional evaluation-game safety bound; unfinished games score as draws."""
+
+    ladder_eval_every: int = 0
+    """Adaptive Fairy-Stockfish ladder interval; zero disables the ladder."""
+
+    ladder_eval_games: int = 20
+    """Even number of paired-opening games played at each ladder rung."""
+
+    ladder_start_elo: int = FAIRY_STOCKFISH_MIN_ELO
+    """First real UCI Elo rung; current Fairy-Stockfish supports no value below 500."""
+
+    ladder_step_elo: int = 100
+    """Elo increment after Luna scores more wins than losses at a rung."""
+
+    ladder_max_elo: int = 2800
+    """Highest 100-point Fairy-Stockfish rung below its native 2850 ceiling."""
+
+    ladder_required_passes: int = 2
+    """Consecutive majority-score matches required before advancing one rung."""
+
+    ladder_depth: int = 10
+    """Maximum Fairy-Stockfish search depth per move."""
+
+    ladder_path: str = "./vendor/stockfish/fairy-stockfish-14"
+    """Pinned Fairy-Stockfish executable used by the adaptive ladder."""
+
+    ladder_eval_max_ply: int | None = None
+    """Optional ladder-game safety bound; unfinished games score as draws."""
 
 
 def evaluation_mcts_params(run: TrainingRunConfig) -> MCTSParams:
@@ -327,6 +356,7 @@ def _validate_training_schedule(run: TrainingRunConfig) -> None:
     _finite_at_least("self_play_actor_timeout_s", run.self_play_actor_timeout_s, math.ulp(0.0))
     _non_negative_integer("temp_threshold", run.temp_threshold)
     _non_negative_integer("stockfish_eval_every", run.stockfish_eval_every)
+    _non_negative_integer("ladder_eval_every", run.ladder_eval_every)
     _non_negative_integer("profile_torch_steps", run.profile_torch_steps)
     _positive_integer("profile_torch_iter", run.profile_torch_iter)
     if run.evaluation_num_mcts_sims is not None:
@@ -346,6 +376,29 @@ def _validate_external_evaluation(run: TrainingRunConfig) -> None:
         raise ValueError(f"stockfish_eval_games cannot exceed {MAX_STOCKFISH_EVAL_GAMES}")
     if run.stockfish_eval_max_ply is not None:
         _positive_integer("stockfish_eval_max_ply", run.stockfish_eval_max_ply)
+    _positive_integer("ladder_depth", run.ladder_depth)
+    _positive_integer("ladder_start_elo", run.ladder_start_elo)
+    _positive_integer("ladder_step_elo", run.ladder_step_elo)
+    _positive_integer("ladder_max_elo", run.ladder_max_elo)
+    _positive_integer("ladder_required_passes", run.ladder_required_passes)
+    if run.ladder_eval_every > 0 and (run.ladder_eval_games < 2 or run.ladder_eval_games % 2):
+        raise ValueError("ladder_eval_games must be an even integer of at least 2 when the ladder is enabled")
+    if run.ladder_eval_every > 0 and run.ladder_eval_games > MAX_STOCKFISH_EVAL_GAMES:
+        raise ValueError(f"ladder_eval_games cannot exceed {MAX_STOCKFISH_EVAL_GAMES}")
+    if run.ladder_start_elo < FAIRY_STOCKFISH_MIN_ELO:
+        raise ValueError(f"ladder_start_elo cannot be below Fairy-Stockfish's {FAIRY_STOCKFISH_MIN_ELO} floor")
+    if run.ladder_max_elo > FAIRY_STOCKFISH_MAX_ELO:
+        raise ValueError(f"ladder_max_elo cannot exceed Fairy-Stockfish's {FAIRY_STOCKFISH_MAX_ELO} ceiling")
+    if run.ladder_start_elo > run.ladder_max_elo:
+        raise ValueError("ladder_start_elo cannot exceed ladder_max_elo")
+    if (run.ladder_max_elo - run.ladder_start_elo) % run.ladder_step_elo:
+        raise ValueError("ladder_max_elo must be reachable from ladder_start_elo in exact ladder_step_elo increments")
+    if run.ladder_eval_every > 0 and not run.ladder_path.strip():
+        raise ValueError("ladder_path cannot be blank when the ladder is enabled")
+    if run.ladder_eval_every > 0 and not run.checkpoint.strip():
+        raise ValueError("checkpoint cannot be blank when the persistent ladder is enabled")
+    if run.ladder_eval_max_ply is not None:
+        _positive_integer("ladder_eval_max_ply", run.ladder_eval_max_ply)
     if run.profile and not run.profile_dir.strip():
         raise ValueError("profile_dir cannot be blank when profiling is enabled")
     if run.profile and not run.profile_summary_json.strip():
@@ -464,6 +517,9 @@ class TrainCliConfig:
     load_model: bool = False
     new_training_phase: bool = False
     """Load only model weights and reset all optimizer and training counters."""
+
+    initialize_evaluation_state: bool = False
+    """Explicitly initialize sidecars when migrating a checkpoint into a new evaluation contract."""
 
     load_checkpoint_dir: str = "./runs/luna-main"
     load_checkpoint_file: str = "latest.pth.tar"

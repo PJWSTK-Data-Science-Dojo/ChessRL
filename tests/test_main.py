@@ -32,6 +32,43 @@ def test_main_rejects_resume_and_new_phase_together() -> None:
         assert training_entry.main() == 2
 
 
+def test_main_requires_explicit_evaluation_state_initialization_for_cross_directory_resume(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "latest.pth.tar").write_bytes(b"checkpoint placeholder")
+    config = TrainCliConfig(
+        load_model=True,
+        load_checkpoint_dir=str(source),
+        run=TrainingRunConfig(
+            checkpoint=str(tmp_path / "target"),
+            stockfish_eval_every=0,
+            ladder_eval_every=5,
+        ),
+        learner=EzV2LearnerConfig(device="cpu"),
+    )
+
+    with patch.object(training_entry.tyro, "cli", return_value=config):
+        assert training_entry.main() == 2
+
+
+def test_main_rejects_evaluation_state_initialization_without_migration(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "run" / "latest.pth.tar"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"checkpoint placeholder")
+    config = TrainCliConfig(
+        load_model=True,
+        initialize_evaluation_state=True,
+        load_checkpoint_dir=str(checkpoint.parent),
+        run=TrainingRunConfig(checkpoint=str(checkpoint.parent), stockfish_eval_every=0),
+        learner=EzV2LearnerConfig(device="cpu"),
+    )
+
+    with patch.object(training_entry.tyro, "cli", return_value=config):
+        assert training_entry.main() == 2
+
+
 def test_main_rejects_invalid_log_level() -> None:
     config = TrainCliConfig(log_level="verbose")
 
@@ -125,7 +162,7 @@ def test_main_routes_new_phase_to_weights_only_initializer(tmp_path: Path) -> No
 
 @pytest.mark.parametrize(
     ("target", "resume_mode"),
-    [("train-phase", "never"), ("resume-phase", "must")],
+    [("train-phase", "never"), ("resume-phase", "must"), ("migrate-ladder-phase", "never")],
 )
 def test_phase_make_target_sets_explicit_wandb_resume_policy(target: str, resume_mode: str) -> None:
     repository = Path(__file__).resolve().parents[1]
@@ -138,11 +175,16 @@ def test_phase_make_target_sets_explicit_wandb_resume_policy(target: str, resume
         text=True,
     )
 
-    assert '--wandb-run-id "luna-strength-1500-v1"' in result.stdout
-    assert '--wandb-run-name "Luna Strength 1500 v1"' in result.stdout
+    assert '--wandb-run-id "luna-fairy-ladder-v1"' in result.stdout
+    assert '--wandb-run-name "Luna Fairy Ladder 500+ · Benchmark 1500 v1"' in result.stdout
     assert f"--wandb-resume {resume_mode}" in result.stdout
     assert "--run.self-play-workers 4" in result.stdout
+    assert "--run.stockfish-elo 1500" in result.stdout
+    assert "--run.ladder-start-elo 500" in result.stdout
+    assert "--run.ladder-step-elo 100" in result.stdout
     assert "--learner.reanalyze-prob 0.10" in result.stdout
+    if target == "migrate-ladder-phase":
+        assert "--initialize-evaluation-state" in result.stdout
 
 
 def test_train_phase_make_target_keeps_pinned_source_preflight() -> None:

@@ -2,6 +2,8 @@
 
 import random
 import sys
+from dataclasses import asdict
+from hashlib import file_digest
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +19,14 @@ from luna.config import (
     validate_wandb_run_id,
     validate_wandb_run_name,
 )
+from luna.game.benchmark_state import BENCHMARK_STATE_NAME, load_benchmark_state
 from luna.game.chess_game import ChessGame as Game
+from luna.game.stockfish_eval import (
+    stockfish_evaluation_protocol,
+    validate_ladder_configuration,
+    validate_stockfish_configuration,
+)
+from luna.game.stockfish_ladder import LADDER_STATE_NAME, load_fairy_ladder_state
 from luna.network import LunaNetwork
 
 
@@ -62,15 +71,92 @@ def main() -> int:
         if cfg.load_model and cfg.new_training_phase:
             raise ValueError("--load-model and --new-training-phase are mutually exclusive")
         source_checkpoint = Path(cfg.load_checkpoint_dir) / cfg.load_checkpoint_file
+        source_parent = source_checkpoint.expanduser().resolve().parent
+        target = Path(run_cfg.checkpoint).expanduser().resolve()
+        cross_directory_resume = cfg.load_model and source_parent != target
+        if cfg.initialize_evaluation_state and not cross_directory_resume:
+            raise ValueError(
+                "--initialize-evaluation-state is only valid when migrating a loaded checkpoint to a new directory"
+            )
+        if (
+            cross_directory_resume
+            and (run_cfg.stockfish_eval_every > 0 or run_cfg.ladder_eval_every > 0)
+            and not cfg.initialize_evaluation_state
+        ):
+            raise ValueError("Cross-directory resume with external evaluation requires --initialize-evaluation-state")
+        loaded_iteration = 0
         if cfg.load_model:
-            validate_resume_checkpoint_target(run_cfg, source_checkpoint)
+            if not source_checkpoint.expanduser().is_file():
+                raise FileNotFoundError(f"No model in path {source_checkpoint.expanduser().resolve()}")
+            validate_resume_checkpoint_target(
+                run_cfg,
+                source_checkpoint,
+                allow_evaluation_artifacts_only=cfg.initialize_evaluation_state,
+            )
+            loaded_iteration = LunaNetwork.checkpoint_trainer_iteration(source_checkpoint.expanduser())
+            migration_source_sha256: str | None = None
+            if cfg.initialize_evaluation_state:
+                with source_checkpoint.expanduser().open("rb") as source_stream:
+                    migration_source_sha256 = file_digest(source_stream, "sha256").hexdigest()
         elif cfg.new_training_phase:
             if not source_checkpoint.expanduser().is_file():
                 raise FileNotFoundError(f"No model in path {source_checkpoint.expanduser().resolve()}")
             validate_new_training_phase_target(run_cfg.checkpoint)
         else:
             validate_fresh_checkpoint_target(run_cfg)
-    except (FileExistsError, FileNotFoundError, ValueError) as exc:
+        if run_cfg.stockfish_eval_every > 0:
+            validate_stockfish_configuration(run_cfg)
+            benchmark_path = target / BENCHMARK_STATE_NAME
+            benchmark_state = load_benchmark_state(
+                benchmark_path,
+                asdict(stockfish_evaluation_protocol(run_cfg)),
+                required=(
+                    cfg.load_model
+                    and not cfg.initialize_evaluation_state
+                    and loaded_iteration > run_cfg.stockfish_eval_every
+                ),
+            )
+            if (
+                cfg.initialize_evaluation_state
+                and benchmark_state.last_iteration is not None
+                and (
+                    benchmark_state.last_iteration != loaded_iteration
+                    or benchmark_state.last_checkpoint_sha256 != migration_source_sha256
+                )
+            ):
+                raise RuntimeError("Migrated benchmark state does not belong to the loaded source checkpoint")
+            best_record = Coach.validate_best_evaluation_contract(run_cfg)
+            if (
+                cfg.initialize_evaluation_state
+                and best_record is not None
+                and (
+                    best_record.get("iteration") != loaded_iteration
+                    or best_record.get("source_checkpoint_sha256") != migration_source_sha256
+                )
+            ):
+                raise RuntimeError("Migrated best checkpoint does not belong to the loaded source checkpoint")
+        if run_cfg.ladder_eval_every > 0:
+            validate_ladder_configuration(run_cfg)
+            ladder_path = Path(run_cfg.checkpoint).expanduser().resolve() / LADDER_STATE_NAME
+            ladder_state = load_fairy_ladder_state(
+                ladder_path,
+                run_cfg,
+                required=(
+                    cfg.load_model
+                    and not cfg.initialize_evaluation_state
+                    and loaded_iteration > run_cfg.ladder_eval_every
+                ),
+            )
+            if (
+                cfg.initialize_evaluation_state
+                and ladder_state.last_iteration is not None
+                and (
+                    ladder_state.last_iteration != loaded_iteration
+                    or ladder_state.last_checkpoint_sha256 != migration_source_sha256
+                )
+            ):
+                raise RuntimeError("Migrated ladder state does not belong to the loaded source checkpoint")
+    except (FileExistsError, FileNotFoundError, RuntimeError, ValueError) as exc:
         logger.error("Invalid training setup: {}", exc)
         return 2
 
@@ -128,6 +214,7 @@ def main() -> int:
         wandb_run_id=cfg.wandb_run_id,
         wandb_run_name=cfg.wandb_run_name,
         wandb_resume=cfg.wandb_resume,
+        initialize_evaluation_state=cfg.initialize_evaluation_state,
         seed=cfg.seed,
     )
 

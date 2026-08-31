@@ -7,6 +7,7 @@ periodic Stockfish matches provide an external, fixed-opponent benchmark.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -14,7 +15,7 @@ import shutil
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Never
+from typing import Never, cast
 
 import numpy as np
 import wandb
@@ -29,14 +30,30 @@ from luna.config import (
     validate_wandb_run_id,
     validate_wandb_run_name,
 )
+from luna.game.benchmark_state import (
+    BENCHMARK_STATE_NAME,
+    BenchmarkState,
+    load_benchmark_state,
+    record_benchmark_result,
+    write_benchmark_state,
+)
 from luna.game.chess_game import ChessGame
 from luna.game.stockfish_eval import (
     StockfishEvalOutcome,
     StockfishEvalScores,
     StockfishEvalSkipped,
+    _wandb_metrics,
     run_stockfish_eval,
     stockfish_evaluation_protocol,
+    validate_ladder_configuration,
     validate_stockfish_configuration,
+)
+from luna.game.stockfish_ladder import (
+    LADDER_STATE_NAME,
+    fairy_ladder_protocol,
+    load_fairy_ladder_state,
+    run_fairy_ladder_eval,
+    write_fairy_ladder_state,
 )
 from luna.mcts import MCTS, BatchedMCTS
 from luna.network import LunaNetwork
@@ -45,6 +62,8 @@ from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 from luna.self_play_actors import SelfPlayActorPool
 
 _BEST_EVAL_NAME = "best_eval.json"
+_BEST_EVAL_FIELD = "best_evaluation"
+_BEST_EVAL_SCHEMA_VERSION = 1
 
 
 def _configure_wandb_metrics() -> None:
@@ -55,12 +74,17 @@ def _configure_wandb_metrics() -> None:
     wandb.define_metric("selfplay/*", step_metric="iteration")
     wandb.define_metric("performance/*", step_metric="iteration")
     wandb.define_metric("replay/*", step_metric="iteration")
-    wandb.define_metric("stockfish/*", step_metric="iteration")
+    wandb.define_metric("benchmark/*", step_metric="iteration")
+    wandb.define_metric("ladder/evaluation_step")
+    wandb.define_metric("ladder/*", step_metric="ladder/evaluation_step")
 
 
 def _managed_checkpoint_conflicts(folder: Path) -> list[str]:
     managed = list(folder.glob("checkpoint_*.pth.tar"))
-    managed.extend(folder / name for name in ("latest.pth.tar", "best.pth.tar", _BEST_EVAL_NAME))
+    managed.extend(
+        folder / name
+        for name in ("latest.pth.tar", "best.pth.tar", _BEST_EVAL_NAME, BENCHMARK_STATE_NAME, LADDER_STATE_NAME)
+    )
     return sorted(path.name for path in managed if path.exists())
 
 
@@ -77,7 +101,12 @@ def validate_fresh_checkpoint_target(run: TrainingRunConfig) -> None:
         )
 
 
-def validate_resume_checkpoint_target(run: TrainingRunConfig, source_checkpoint: str | Path) -> None:
+def validate_resume_checkpoint_target(
+    run: TrainingRunConfig,
+    source_checkpoint: str | Path,
+    *,
+    allow_evaluation_artifacts_only: bool = False,
+) -> None:
     """Prevent a resume checkpoint from being merged into another managed run."""
     if not str(run.checkpoint).strip():
         return
@@ -85,6 +114,9 @@ def validate_resume_checkpoint_target(run: TrainingRunConfig, source_checkpoint:
     if Path(source_checkpoint).expanduser().resolve().parent == target:
         return
     conflicts = _managed_checkpoint_conflicts(target)
+    evaluation_artifacts = {BENCHMARK_STATE_NAME, LADDER_STATE_NAME, "best.pth.tar", _BEST_EVAL_NAME}
+    if allow_evaluation_artifacts_only and set(conflicts) <= evaluation_artifacts:
+        return
     if conflicts:
         raise FileExistsError(
             f"Resume target {target} contains managed files from another checkpoint lineage: {conflicts}. "
@@ -109,6 +141,7 @@ class Coach:
         wandb_run_id: str | None = None,
         wandb_run_name: str | None = None,
         wandb_resume: WandbResumeMode = "allow",
+        initialize_evaluation_state: bool = False,
         seed: int = 0,
     ) -> None:
         self.game = game
@@ -127,6 +160,7 @@ class Coach:
         self._checkpoint_lineage_iteration: int | None = None
         self._checkpoint_target_validated = False
         self._replay_beta_annealing_configured = False
+        self._initialize_evaluation_state = initialize_evaluation_state
         self._seed = seed
         validate_wandb_run_id(wandb_run_id)
         validate_wandb_run_name(wandb_run_name)
@@ -140,6 +174,10 @@ class Coach:
                 "learner": asdict(nnet._learner),
                 "training_phase_provenance": (phase_provenance.as_config() if phase_provenance is not None else None),
             }
+            if run.stockfish_eval_every > 0:
+                init_config["benchmark_protocol"] = asdict(stockfish_evaluation_protocol(run))
+            if run.ladder_eval_every > 0:
+                init_config["ladder_protocol"] = fairy_ladder_protocol(run)
             if wandb_run_id is None:
                 wandb.init(
                     project=wandb_project,
@@ -391,29 +429,161 @@ class Coach:
             truncated=truncated,
         )
 
+    def _external_checkpoint_path(self, iteration: int) -> Path:
+        candidates: list[Path] = []
+        if self.nnet._loaded_checkpoint_path is not None:
+            candidates.append(self.nnet._loaded_checkpoint_path)
+        folder = Path(self.run.checkpoint).expanduser().resolve()
+        candidates.extend((folder / f"checkpoint_{iteration}.pth.tar", folder / "latest.pth.tar"))
+        for candidate in candidates:
+            if candidate.is_file() and LunaNetwork.checkpoint_trainer_iteration(candidate) == iteration:
+                return candidate
+        raise FileNotFoundError(
+            f"No immutable checkpoint is available for scheduled evaluation at iteration {iteration}"
+        )
+
+    def _initialize_external_evaluation_sidecars(self, iteration: int) -> None:
+        folder = Path(self.run.checkpoint).expanduser().resolve()
+        if self._initialize_evaluation_state:
+            folder.mkdir(parents=True, exist_ok=True)
+
+        if self.run.stockfish_eval_every > 0:
+            benchmark_path = folder / BENCHMARK_STATE_NAME
+            benchmark_protocol = asdict(stockfish_evaluation_protocol(self.run))
+            required = not self._initialize_evaluation_state and iteration > self.run.stockfish_eval_every
+            benchmark_state = load_benchmark_state(benchmark_path, benchmark_protocol, required=required)
+            if benchmark_state.last_iteration is not None and benchmark_state.last_iteration > iteration:
+                raise RuntimeError("Fixed benchmark state is newer than the loaded checkpoint")
+            if self._initialize_evaluation_state and not benchmark_path.exists():
+                write_benchmark_state(benchmark_path, benchmark_state)
+
+        if self.run.ladder_eval_every > 0:
+            ladder_path = folder / LADDER_STATE_NAME
+            required = not self._initialize_evaluation_state and iteration > self.run.ladder_eval_every
+            ladder_state = load_fairy_ladder_state(ladder_path, self.run, required=required)
+            if ladder_state.last_iteration is not None and ladder_state.last_iteration > iteration:
+                raise RuntimeError("Fairy ladder state is newer than the loaded checkpoint")
+            if self._initialize_evaluation_state and not ladder_path.exists():
+                write_fairy_ladder_state(ladder_path, ladder_state)
+
+    def _run_fixed_benchmark(
+        self,
+        iteration: int,
+        checkpoint_path: Path,
+        checkpoint_sha256: str,
+    ) -> BenchmarkState:
+        folder = Path(self.run.checkpoint).expanduser().resolve()
+        state_path = folder / BENCHMARK_STATE_NAME
+        protocol = asdict(stockfish_evaluation_protocol(self.run))
+        state = load_benchmark_state(
+            state_path,
+            protocol,
+            required=state_path.exists() or iteration > self.run.stockfish_eval_every,
+        )
+        if state.last_iteration is not None and state.last_iteration > iteration:
+            raise RuntimeError("Fixed benchmark state is newer than the loaded checkpoint")
+        if state.last_iteration == iteration:
+            if state.last_checkpoint_sha256 != checkpoint_sha256 or state.last_scores is None:
+                raise RuntimeError("Fixed benchmark checkpoint identity differs from its durable result")
+            scores = state.last_scores
+            logger.info("Fixed benchmark iteration {} already completed; reconciling outputs", iteration)
+            duration_seconds = None
+        else:
+            started_at = time.perf_counter()
+            outcome = run_stockfish_eval(
+                self.game,
+                self.nnet,
+                self.run,
+                iteration=iteration,
+                metric_prefix=None,
+            )
+            if isinstance(outcome, StockfishEvalSkipped):
+                raise RuntimeError(f"External evaluation did not complete ({outcome.reason}): {outcome.message}")
+            scores = outcome
+            state = record_benchmark_result(
+                state_path,
+                protocol,
+                iteration=iteration,
+                checkpoint_sha256=checkpoint_sha256,
+                scores=scores,
+            )
+            duration_seconds = time.perf_counter() - started_at
+        if wandb.run is not None:
+            metrics = _wandb_metrics(
+                scores,
+                iteration,
+                opponent_elo=self.run.stockfish_elo,
+                duration_seconds=duration_seconds,
+            )
+            metrics["benchmark/evaluation_step"] = state.evaluation_step
+            wandb.log(metrics)
+        self._update_best_from_stockfish(iteration, scores, checkpoint_path=checkpoint_path)
+        return state
+
+    def _reconcile_current_evaluations(self, iteration: int) -> None:
+        if iteration < 1:
+            return
+        fixed_due = self.run.stockfish_eval_every > 0 and iteration % self.run.stockfish_eval_every == 0
+        ladder_due = self.run.ladder_eval_every > 0 and iteration % self.run.ladder_eval_every == 0
+        if not fixed_due and not ladder_due:
+            return
+        checkpoint_path = self._external_checkpoint_path(iteration)
+        checkpoint_sha256 = self._checkpoint_sha256(checkpoint_path)
+        if fixed_due:
+            self._run_fixed_benchmark(iteration, checkpoint_path, checkpoint_sha256)
+        if ladder_due:
+            run_fairy_ladder_eval(
+                self.game,
+                self.nnet,
+                self.run,
+                iteration=iteration,
+                checkpoint_sha256=checkpoint_sha256,
+                state_required=(Path(self.run.checkpoint).expanduser().resolve() / LADDER_STATE_NAME).exists(),
+            )
+
     def learn(self) -> None:
         """Full EZV2 training loop: self-play -> store in replay -> train from replay -> evaluate."""
         self._assert_checkpoint_target()
         self._assert_checkpoint_lineage()
 
-        start_iteration = self.nnet._trainer_iteration + 1
+        current_iteration = self.nnet._trainer_iteration
+        start_iteration = current_iteration + 1
+        evaluation_interval = self.run.stockfish_eval_every
+        fixed_due_now = (
+            evaluation_interval > 0 and current_iteration > 0 and current_iteration % evaluation_interval == 0
+        )
+        next_evaluation = (
+            ((start_iteration + evaluation_interval - 1) // evaluation_interval) * evaluation_interval
+            if evaluation_interval > 0
+            else self.run.num_iters + 1
+        )
+        if fixed_due_now or next_evaluation <= self.run.num_iters:
+            validate_stockfish_configuration(self.run)
+
+        ladder_interval = self.run.ladder_eval_every
+        ladder_due_now = ladder_interval > 0 and current_iteration > 0 and current_iteration % ladder_interval == 0
+        next_ladder_eval = (
+            ((start_iteration + ladder_interval - 1) // ladder_interval) * ladder_interval
+            if ladder_interval > 0
+            else self.run.num_iters + 1
+        )
+        if ladder_due_now or next_ladder_eval <= self.run.num_iters:
+            validate_ladder_configuration(self.run)
+
+        self._initialize_external_evaluation_sidecars(current_iteration)
+        if start_iteration <= self.run.num_iters or fixed_due_now or ladder_due_now:
+            self.nnet.warmup_mcts_inference(self.game)
+        self._reconcile_current_evaluations(current_iteration)
+
         if start_iteration > self.run.num_iters:
             logger.info(
                 "Checkpoint is already at iteration {}; requested total is {}. Nothing to train.",
-                self.nnet._trainer_iteration,
+                current_iteration,
                 self.run.num_iters,
             )
             return
         if start_iteration > 1:
             logger.info("Resuming training at iteration {} of {}", start_iteration, self.run.num_iters)
-
-        evaluation_interval = self.run.stockfish_eval_every
-        if evaluation_interval > 0:
-            next_evaluation = ((start_iteration + evaluation_interval - 1) // evaluation_interval) * evaluation_interval
-            if next_evaluation <= self.run.num_iters:
-                validate_stockfish_configuration(self.run)
-
-        self.nnet.warmup_mcts_inference(self.game)
 
         worker_count = min(self.run.self_play_workers, self.run.num_episodes)
         if worker_count <= 1:
@@ -532,9 +702,7 @@ class Coach:
             self._publish_checkpoint(i)
             stats.checkpoint_publish_s = time.perf_counter() - t0
 
-            if self.run.stockfish_eval_every > 0 and i % self.run.stockfish_eval_every == 0:
-                sf_outcome = run_stockfish_eval(self.game, self.nnet, self.run, iteration=i)
-                self._update_best_from_stockfish(i, sf_outcome)
+            self._reconcile_current_evaluations(i)
 
             stats.total_s = time.perf_counter() - iter_t0
             self._log_iteration_metrics(i, trajectories, stats)
@@ -629,45 +797,116 @@ class Coach:
         return (scores.model_wins + 0.5 * scores.draws) / float(total)
 
     @staticmethod
-    def _previous_best_score(metadata_path: Path, protocol: dict[str, object]) -> float:
-        if not metadata_path.exists():
-            return float("-inf")
-        try:
-            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-            score: object = payload["score"]
-            stored_protocol: object = payload["protocol"]
-        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise RuntimeError(f"Could not read external-evaluation metadata: {metadata_path}") from exc
+    def _checkpoint_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _validate_best_record(
+        value: object,
+        *,
+        protocol: dict[str, object],
+        best_path: Path,
+        trainer_iteration: int,
+    ) -> dict[str, object]:
+        if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+            raise RuntimeError(f"Best checkpoint has no valid external-evaluation record: {best_path}")
+        record = dict(value)
+        iteration = record.get("iteration")
+        score = record.get("score")
+        source_sha256 = record.get("source_checkpoint_sha256")
+        if record.get("schema_version") != _BEST_EVAL_SCHEMA_VERSION:
+            raise RuntimeError(f"Best checkpoint has an unsupported external-evaluation record: {best_path}")
+        if isinstance(iteration, bool) or not isinstance(iteration, int) or iteration < 1:
+            raise RuntimeError(f"Best checkpoint evaluation iteration is invalid: {best_path}")
+        if iteration != trainer_iteration:
+            raise RuntimeError(f"Best checkpoint evaluation iteration differs from its trainer state: {best_path}")
         if (
             isinstance(score, bool)
             or not isinstance(score, int | float)
             or not math.isfinite(score)
             or not 0.0 <= score <= 1.0
         ):
-            raise RuntimeError(f"External-evaluation score must be finite and between zero and one: {metadata_path}")
-        if stored_protocol != protocol:
+            raise RuntimeError(f"Best checkpoint evaluation score must be finite and between zero and one: {best_path}")
+        if record.get("protocol") != protocol:
             raise RuntimeError(
-                f"External-evaluation protocol differs from the score in {metadata_path}; "
+                f"External-evaluation protocol differs from the score in {best_path}; "
                 "use a new checkpoint directory for this benchmark contract"
             )
-        return float(score)
+        if (
+            not isinstance(source_sha256, str)
+            or len(source_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in source_sha256)
+        ):
+            raise RuntimeError(f"Best checkpoint source SHA-256 is invalid: {best_path}")
+        return record
 
     @staticmethod
-    def _write_best_metadata(
-        metadata_path: Path,
-        iteration: int,
-        score: float,
-        protocol: dict[str, object],
-    ) -> None:
+    def _write_best_metadata(metadata_path: Path, record: dict[str, object]) -> None:
         temporary = metadata_path.with_name(f".{metadata_path.name}.tmp-{os.getpid()}")
         try:
-            temporary.write_text(
-                json.dumps({"iteration": iteration, "score": score, "protocol": protocol}, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(record, stream, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(temporary, metadata_path)
+            directory_fd = os.open(metadata_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def _best_evaluation_record(
+        cls,
+        folder: Path,
+        protocol: dict[str, object],
+    ) -> dict[str, object] | None:
+        best_path = folder / "best.pth.tar"
+        metadata_path = folder / _BEST_EVAL_NAME
+        if not best_path.exists():
+            if metadata_path.exists():
+                raise RuntimeError(f"External-evaluation metadata exists without its best checkpoint: {metadata_path}")
+            return None
+        checkpoint = LunaNetwork._read_checkpoint(best_path)
+        trainer_iteration = checkpoint.get("trainer_iteration")
+        if isinstance(trainer_iteration, bool) or not isinstance(trainer_iteration, int):
+            raise RuntimeError(f"Best checkpoint trainer iteration is invalid: {best_path}")
+        record = cls._validate_best_record(
+            checkpoint.get(_BEST_EVAL_FIELD),
+            protocol=protocol,
+            best_path=best_path,
+            trainer_iteration=trainer_iteration,
+        )
+        try:
+            metadata: object = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            metadata = None
+        if metadata != record:
+            cls._write_best_metadata(metadata_path, record)
+        return record
+
+    @classmethod
+    def _previous_best_score(cls, folder: Path, protocol: dict[str, object]) -> float:
+        record = cls._best_evaluation_record(folder, protocol)
+        if record is None:
+            return float("-inf")
+        return float(cast(float | int, record["score"]))
+
+    @classmethod
+    def validate_best_evaluation_contract(cls, run: TrainingRunConfig) -> dict[str, object] | None:
+        """Validate and reconcile the authoritative best-checkpoint record before training."""
+        if not str(run.checkpoint).strip():
+            return None
+        folder = Path(run.checkpoint).expanduser().resolve()
+        protocol = asdict(stockfish_evaluation_protocol(run))
+        return cls._best_evaluation_record(folder, protocol)
 
     def _checkpoint_dir_usable(self) -> bool:
         return bool(str(self.run.checkpoint).strip())
@@ -679,7 +918,11 @@ class Coach:
         if source_checkpoint is None:
             validate_fresh_checkpoint_target(self.run)
         else:
-            validate_resume_checkpoint_target(self.run, source_checkpoint)
+            validate_resume_checkpoint_target(
+                self.run,
+                source_checkpoint,
+                allow_evaluation_artifacts_only=self._initialize_evaluation_state,
+            )
         self._checkpoint_target_validated = True
 
     @staticmethod
@@ -736,29 +979,59 @@ class Coach:
         temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
         try:
             shutil.copy2(source, temporary)
+            with temporary.open("rb") as stream:
+                os.fsync(stream.fileno())
             os.replace(temporary, destination)
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _update_best_from_stockfish(self, iteration: int, outcome: StockfishEvalOutcome) -> None:
+    def _update_best_from_stockfish(
+        self,
+        iteration: int,
+        outcome: StockfishEvalOutcome,
+        *,
+        checkpoint_path: Path | None = None,
+    ) -> None:
         if isinstance(outcome, StockfishEvalSkipped):
             raise RuntimeError(f"External evaluation did not complete ({outcome.reason}): {outcome.message}")
         if not self._checkpoint_dir_usable():
             return
 
         folder = Path(self.run.checkpoint).resolve()
-        fp = folder / f"checkpoint_{iteration}.pth.tar"
+        fp = checkpoint_path if checkpoint_path is not None else folder / f"checkpoint_{iteration}.pth.tar"
         if not fp.is_file():
             raise FileNotFoundError(f"Evaluated checkpoint is missing: {fp}")
+        checkpoint_iteration = LunaNetwork.checkpoint_trainer_iteration(fp)
+        if checkpoint_iteration != iteration:
+            raise RuntimeError(
+                f"Evaluated checkpoint iteration {checkpoint_iteration} differs from requested iteration {iteration}: {fp}"
+            )
+        if self.nnet._trainer_iteration != iteration:
+            raise RuntimeError("In-memory model differs from the externally evaluated checkpoint iteration")
 
         sf_score = self._stockfish_normalized_score(outcome)
-        metadata_path = folder / _BEST_EVAL_NAME
         protocol = asdict(stockfish_evaluation_protocol(self.run))
-        previous_score = self._previous_best_score(metadata_path, protocol)
+        previous_score = self._previous_best_score(folder, protocol)
         if sf_score <= previous_score:
             return
-        self._atomic_copy(fp, folder / "best.pth.tar")
-        self._write_best_metadata(metadata_path, iteration, sf_score, protocol)
+        record: dict[str, object] = {
+            "schema_version": _BEST_EVAL_SCHEMA_VERSION,
+            "iteration": iteration,
+            "score": sf_score,
+            "protocol": protocol,
+            "source_checkpoint_sha256": self._checkpoint_sha256(fp),
+        }
+        self.nnet.save_checkpoint(
+            folder=self.run.checkpoint,
+            filename="best.pth.tar",
+            extra_state={_BEST_EVAL_FIELD: record},
+        )
+        self._write_best_metadata(folder / _BEST_EVAL_NAME, record)
         logger.info("New best external score {:.3f} at iteration {}", sf_score, iteration)
 
     def _publish_checkpoint(self, iteration: int) -> None:

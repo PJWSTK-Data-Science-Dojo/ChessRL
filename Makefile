@@ -5,11 +5,13 @@ CHECKPOINT_PATH = $(CHECKPOINT_DIR)/latest.pth.tar
 NEW_PHASE_SOURCE_DIR ?= ./runs/luna-stockfish16-continuation
 NEW_PHASE_SOURCE_FILE ?= best.pth.tar
 NEW_PHASE_SOURCE_SHA256 ?= b6ec9f2e5455f592a3833a285fe478dfba9bb9bdddba9207a2d66572277c7b8d
-NEW_PHASE_CHECKPOINT_DIR ?= ./runs/luna-strength-1500-v1
+MIGRATION_SOURCE_DIR ?= ./runs/luna-strength-1500-v1
+NEW_PHASE_CHECKPOINT_DIR ?= ./runs/luna-fairy-ladder-v1
+FAIRY_STOCKFISH_PATH ?= ./vendor/stockfish/fairy-stockfish-14
 TRAIN_ENV_FILE ?= .env
 WANDB_PROJECT ?= ChessRL
-NEW_PHASE_WANDB_RUN_ID ?= luna-strength-1500-v1
-NEW_PHASE_WANDB_RUN_NAME ?= Luna Strength 1500 v1
+NEW_PHASE_WANDB_RUN_ID ?= luna-fairy-ladder-v1
+NEW_PHASE_WANDB_RUN_NAME ?= Luna Fairy Ladder 500+ · Benchmark 1500 v1
 PUBLIC_ENV ?= .env.public
 RELEASE_DIR ?= ./release
 RELEASE_ID ?=
@@ -33,7 +35,15 @@ PHASE_TRAIN_ARGS = \
 	--run.replay-capacity 300000 \
 	--run.stockfish-eval-every 25 \
 	--run.stockfish-eval-games 20 \
-	--run.stockfish-elo 1320 \
+	--run.stockfish-elo 1500 \
+	--run.ladder-eval-every 5 \
+	--run.ladder-eval-games 20 \
+	--run.ladder-start-elo 500 \
+	--run.ladder-step-elo 100 \
+	--run.ladder-max-elo 2800 \
+	--run.ladder-required-passes 2 \
+	--run.ladder-depth 10 \
+	--run.ladder-path "$(FAIRY_STOCKFISH_PATH)" \
 	--run.checkpoint "$(NEW_PHASE_CHECKPOINT_DIR)" \
 	--run.checkpoint-top-k 3 \
 	--learner.device cuda \
@@ -104,7 +114,7 @@ train:
 		--run.replay-capacity 150000 \
 		--run.stockfish-eval-every 25 \
 		--run.stockfish-eval-games 8 \
-		--run.stockfish-elo 1320 \
+		--run.stockfish-elo 1500 \
 		--run.checkpoint "$(CHECKPOINT_DIR)" \
 		--run.checkpoint-top-k 3 \
 		--learner.device cuda \
@@ -134,9 +144,13 @@ _train-env-preflight:
 	@uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python -c \
 		'import os, sys; names = ("WANDB_API_KEY", "WANDB_ENTITY"); missing = [n for n in names if not os.environ.get(n)]; sys.exit("Missing training environment variables: " + ", ".join(missing)) if missing else None'
 
+_fairy-stockfish-preflight:
+	@test -x "$(FAIRY_STOCKFISH_PATH)" || { \
+		echo "Fairy-Stockfish binary not found: $(FAIRY_STOCKFISH_PATH); run make install-fairy-stockfish" >&2; exit 2; }
+
 # Start a distinct optimizer/LR phase from validated v2 weights. The target
 # directory must not contain any files; src/main.py enforces that contract.
-train-phase: _train-env-preflight
+train-phase: _train-env-preflight _fairy-stockfish-preflight
 	@test -f "$(NEW_PHASE_SOURCE_DIR)/$(NEW_PHASE_SOURCE_FILE)" || { \
 		echo "Phase source checkpoint not found: $(NEW_PHASE_SOURCE_DIR)/$(NEW_PHASE_SOURCE_FILE)" >&2; exit 2; }
 	@printf '%s  %s\n' "$(NEW_PHASE_SOURCE_SHA256)" "$(NEW_PHASE_SOURCE_DIR)/$(NEW_PHASE_SOURCE_FILE)" \
@@ -150,7 +164,7 @@ train-phase: _train-env-preflight
 
 # Resume the same phase contract after an interruption without resetting
 # optimizer, scaler, counters, or the LR schedule horizon.
-resume-phase: _train-env-preflight
+resume-phase: _train-env-preflight _fairy-stockfish-preflight
 	@test -f "$(NEW_PHASE_CHECKPOINT_DIR)/latest.pth.tar" || { \
 		echo "Phase resume checkpoint not found: $(NEW_PHASE_CHECKPOINT_DIR)/latest.pth.tar" >&2; exit 2; }
 	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/main.py \
@@ -158,6 +172,19 @@ resume-phase: _train-env-preflight
 		--load-checkpoint-dir "$(NEW_PHASE_CHECKPOINT_DIR)" \
 		--load-checkpoint-file latest.pth.tar \
 		--wandb-resume must \
+		$(PHASE_TRAIN_ARGS) $(ARGS)
+
+# Continue the complete optimizer/checkpoint state in the new ladder contract.
+# The target must be absent or empty on first use; a pre-checkpoint retry may contain only validated evaluation sidecars.
+migrate-ladder-phase: _train-env-preflight _fairy-stockfish-preflight
+	@test -f "$(MIGRATION_SOURCE_DIR)/latest.pth.tar" || { \
+		echo "Migration source not found: $(MIGRATION_SOURCE_DIR)/latest.pth.tar" >&2; exit 2; }
+	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/main.py \
+		--load-model \
+		--initialize-evaluation-state \
+		--load-checkpoint-dir "$(MIGRATION_SOURCE_DIR)" \
+		--load-checkpoint-file latest.pth.tar \
+		--wandb-resume never \
 		$(PHASE_TRAIN_ARGS) $(ARGS)
 
 # Short end-to-end run with phase timings and a compact profiler trace.
@@ -243,6 +270,9 @@ lichess-config:
 eval-stockfish:
 	uv run --frozen python src/eval_vs_stockfish.py --checkpoint "$(CHECKPOINT_PATH)" $(ARGS)
 
+install-fairy-stockfish:
+	bash scripts/install-fairy-stockfish.sh
+
 test-pipeline-cpu:
 	uv run --frozen python src/main.py \
 		--run.num-iters 2 \
@@ -265,7 +295,8 @@ test-pipeline-cpu:
 test-pipeline-mps:
 	$(MAKE) test-pipeline-cpu ARGS="--learner.device mps $(ARGS)"
 
-.PHONY: _train-env-preflight audit bench check eval-stockfish fmt format-check lichess-config lint profile-smoke \
-	release-web-model resume resume-phase serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train-phase \
+.PHONY: _fairy-stockfish-preflight _train-env-preflight audit bench check eval-stockfish fmt format-check \
+	install-fairy-stockfish lichess-config lint migrate-ladder-phase profile-smoke release-web-model resume resume-phase \
+	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train-phase \
 	train types uci verify-web-model web-build web-config web-down web-logs web-public-config \
 	web-public-down web-public-logs web-public-up web-up

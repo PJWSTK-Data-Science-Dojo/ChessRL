@@ -31,6 +31,7 @@ Run every command from the repository root.
 uv sync --extra dev --extra perf
 make check
 make profile-smoke
+make install-fairy-stockfish
 ```
 
 Start a new training run with the maintained single-accelerator preset:
@@ -41,11 +42,13 @@ printf 'uci\nquit\n' | stockfish | rg '^uciok$'
 make train CHECKPOINT_DIR=./runs/luna-main
 ```
 
-The locked `stockfish` Python package is an engine controller, not the Stockfish
-executable. Install a current binary from the
-[official Stockfish download](https://stockfishchess.org/download/) before using the
-maintained preset. Its startup preflight deliberately stops the run if the scheduled
-external benchmark cannot launch. For a binary outside `PATH`, pass an absolute path:
+The Python adapter uses `python-chess`; engine executables are separate native programs.
+Install a current binary from the
+[official Stockfish download](https://stockfishchess.org/download/) for the fixed benchmark.
+`make install-fairy-stockfish` reproducibly builds the pinned Fairy-Stockfish 14 release
+at `vendor/stockfish/fairy-stockfish-14` for the adaptive ladder. Both startup preflights
+play a legal smoke-test move and stop the run before self-play if an engine contract is
+invalid. For an official Stockfish binary outside `PATH`, pass an absolute path:
 
 ```bash
 make train CHECKPOINT_DIR=./runs/luna-main \
@@ -78,23 +81,26 @@ Use `uv run python src/main.py --help` for the complete Tyro-generated option re
 
 ## Strength training phase
 
-The continuation preset starts from the formally externally evaluated best snapshot,
-`runs/luna-stockfish16-continuation/best.pth.tar` (iteration 225), and writes a separate
-lineage to `runs/luna-strength-1500-v1`:
+To carry the complete model, optimizer, scaler, counters, and LR horizon from the current
+`runs/luna-strength-1500-v1/latest.pth.tar` into the separate ladder contract, run this
+once, then use `make resume-phase` thereafter:
 
 ```bash
-make train-phase
+make migrate-ladder-phase
 ```
 
-The command verifies the source against the pinned `NEW_PHASE_SOURCE_SHA256` before
-loading it, so the stable `best.pth.tar` name cannot silently select different bytes.
-Override the source file and hash together only when intentionally starting from a
-different evaluated snapshot.
+The target defaults to `runs/luna-fairy-ladder-v1` and must initially be absent or empty.
+Replay is process memory and therefore starts empty. If the first migration process is
+interrupted after creating its W&B run but before publishing target `latest.pth.tar`, retry
+explicitly with `make migrate-ladder-phase ARGS='--wandb-resume allow'`.
 
-This imports the validated model weights but deliberately starts a fresh optimizer,
-scaler, counters, replay buffer, and warm-up/cosine learning-rate schedule. The target
-directory must not exist or must be completely empty; the command refuses to merge it
-with an earlier lineage. A local, Git-ignored `.env` must define
+`make train-phase` is a different, intentional alternative: it imports only weights from
+the pinned, externally evaluated `runs/luna-stockfish16-continuation/best.pth.tar`, then
+starts a fresh optimizer, scaler, counters, replay, and learning-rate schedule. It verifies
+the source against `NEW_PHASE_SOURCE_SHA256`; override the source and hash together only
+when deliberately starting that new lineage.
+
+A local, Git-ignored `.env` must define
 `WANDB_API_KEY` and `WANDB_ENTITY` (use `dsc-pjatk-warsaw` for the maintained
 experiment). The preflight checks only that both variables are
 non-empty and does not print their values.
@@ -106,18 +112,26 @@ make resume-phase
 ```
 
 Resume restores the phase optimizer, scaler, counters, and original learning-rate
-schedule. Both commands pass the same `NEW_PHASE_WANDB_RUN_ID` (default
-`luna-strength-1500-v1`) through `--wandb-run-id` and the display name
-`Luna Strength 1500 v1` through `--wandb-run-name`. `make train-phase` uses
+schedule. All phase commands pass the same `NEW_PHASE_WANDB_RUN_ID` (default
+`luna-fairy-ladder-v1`) through `--wandb-run-id` and the display name
+`Luna Fairy Ladder 500+ · Benchmark 1500 v1` through `--wandb-run-name`. `make train-phase` uses
 `--wandb-resume never`, so it refuses to append a new phase to an existing remote run;
 `make resume-phase` uses `--wandb-resume must`, so a typo or missing remote run fails
 instead of silently creating a second dashboard. Change the run ID only when intentionally
 starting a different phase. If the remote run was deliberately deleted while its local
 checkpoint remains valid, recreate it explicitly with
 `make resume-phase ARGS='--wandb-resume allow'`. The general CLI defaults to `allow`.
-The maintained phase preset collects 128 self-play episodes
-with four persistent actors running up to 32 active games each, trains with batches of
-256, reanalyzes 10% of eligible samples, and uses a fixed 20-game Stockfish sentinel.
+
+The maintained phase preset collects 128 self-play episodes with four persistent actors
+running up to 32 active games each, trains with batches of 256, and reanalyzes 10% of
+eligible samples. Every five iterations it plays a 20-game paired-opening match at the
+current Fairy-Stockfish rung. The ladder starts at native `UCI_Elo=500`, advances by 100
+after two consecutive matches with more Luna wins than Fairy wins, never demotes, and
+stops at 2800. Its atomically persisted state is `fairy_ladder.json`.
+
+Separately, every 25 iterations Luna plays the official Stockfish fixed benchmark at
+1500 Elo. Only that immutable benchmark can promote `best.pth.tar`; ladder results never
+change the best-checkpoint contract.
 The actor pool is controlled by `--run.self-play-workers` and can be overridden through
 `ARGS`; set it to `1` for in-process self-play without the pool.
 
@@ -125,9 +139,10 @@ The preset does not keep 1,024 MCTS roots active at once. Larger recurrent-infer
 batches improve the GPU kernel less than they increase CPU chess-rule and tree-management
 work at that scale; multiple actors keep the accelerator fed more effectively. W&B logs
 `selfplay/*` workload data, `performance/*` phase timings and throughput, and `replay/*`
-buffer state in addition to learner and Stockfish metrics. The Stockfish match is a
-fixed-protocol regression sentinel, not a guarantee of playing strength, and a 20-game
-sample remains noisy.
+buffer state. Fixed-opponent results use `benchmark/*`; adaptive results use `ladder/*`
+with their own monotonic evaluation step, current/highest Elo, decisions, outcomes,
+duration, and approximate 95% score interval. The fixed match is a regression sentinel, not a
+guarantee of playing strength, and a 20-game sample remains noisy.
 
 ## Checkpoint contract
 
@@ -135,11 +150,16 @@ Training writes format-v2 files under `CHECKPOINT_DIR` (`./runs/luna-main` by de
 
 - `checkpoint_<iteration>.pth.tar` is an immutable numbered snapshot. Retention is controlled by `--run.checkpoint-top-k`.
 - `latest.pth.tar` is atomically updated after every completed training iteration. Use it for resume and local testing, not as a public deployment artifact.
-- `best.pth.tar` is created or replaced only when a numbered checkpoint improves the external Stockfish benchmark score. It is not a synonym for “newest.”
+- `best.pth.tar` is created or replaced only when a checkpoint improves the fixed Stockfish benchmark score. Its payload embeds the authoritative score, protocol, and evaluated-checkpoint hash, so `best_eval.json` can be repaired after an interrupted write. It is not a synonym for “newest.”
+- `benchmark_state.json` records fixed-benchmark completion and makes a scheduled evaluation idempotent across restarts.
+- `fairy_ladder.json` atomically stores adaptive-rung progress and is bound to the exact binary hash and evaluation protocol.
 
 Resume restores the optimizer, scaler, global step, trainer iteration, and the original
 learning-rate schedule horizon. A resumed invocation cannot silently redefine the
 warm-up and cosine schedule by requesting a different training horizon.
+If power is lost after a scheduled checkpoint but during evaluation, startup reconciles
+that exact checkpoint before continuing. Missing sidecars after established progress
+fail closed instead of silently resetting the benchmark or ladder.
 
 Checkpoints and evaluation metadata are runtime artifacts and are ignored by Git. No pretrained weights are bundled.
 Public serving uses a read-only, versioned copy of an evaluated checkpoint plus its SHA-256 digest; `make release-web-model RELEASE_ID=<id>` creates that release without overwriting an existing ID.
@@ -196,8 +216,8 @@ uv run python src/eval_vs_stockfish.py \
   --run.stockfish-depth 10
 ```
 
-Set `--run.stockfish-path` when the executable is not discoverable. Elo limiting defaults
-to Stockfish's supported floor of 1320; keep Elo, depth, engine build, and search
+Set `--run.stockfish-path` when the executable is not discoverable. The fixed benchmark
+defaults to 1500 Elo; keep Elo, depth, engine build, and search
 settings fixed when comparing checkpoints. Periodic training evaluation is
 controlled by `--run.stockfish-eval-every`; set it to `0` to disable. Each versioned
 opening is played with both color assignments. A small match is still a noisy estimate.

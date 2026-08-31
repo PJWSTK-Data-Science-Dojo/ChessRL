@@ -1147,8 +1147,16 @@ class LunaNetwork:
         _validate_finite_state(payload, "checkpoint")
         temporary_path = f"{filepath}.tmp-{os.getpid()}"
         try:
-            torch.save(payload, temporary_path)
+            with open(temporary_path, "wb") as stream:
+                torch.save(payload, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(temporary_path, filepath)
+            directory_fd = os.open(output_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             with suppress(FileNotFoundError):
                 os.unlink(temporary_path)

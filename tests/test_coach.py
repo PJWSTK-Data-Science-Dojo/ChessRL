@@ -48,7 +48,9 @@ def test_wandb_metrics_use_domain_specific_step_axes(
         call("selfplay/*", step_metric="iteration"),
         call("performance/*", step_metric="iteration"),
         call("replay/*", step_metric="iteration"),
-        call("stockfish/*", step_metric="iteration"),
+        call("benchmark/*", step_metric="iteration"),
+        call("ladder/evaluation_step"),
+        call("ladder/*", step_metric="ladder/evaluation_step"),
     ]
 
 
@@ -556,7 +558,7 @@ def test_checkpoint_retention_keeps_top_k(
     assert (tmp_path / "checkpoint_3.pth.tar").is_file()
 
 
-def test_corrupt_best_evaluation_metadata_fails_loudly(
+def test_orphaned_best_evaluation_metadata_fails_loudly(
     tmp_path: Path,
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
@@ -566,25 +568,33 @@ def test_corrupt_best_evaluation_metadata_fails_loudly(
     coach._publish_checkpoint(1)
     (tmp_path / "best_eval.json").write_text("not-json", encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="external-evaluation metadata"):
+    with pytest.raises(RuntimeError, match="metadata exists without its best checkpoint"):
         coach._update_best_from_stockfish(1, StockfishEvalScores(model_wins=1, draws=1, stockfish_wins=0))
     assert (tmp_path / "latest.pth.tar").is_file()
     assert not (tmp_path / "best.pth.tar").exists()
 
 
 @pytest.mark.parametrize("score", [float("nan"), float("inf"), -0.1, 1.1])
-def test_best_evaluation_metadata_rejects_invalid_score(
+def test_best_checkpoint_record_rejects_invalid_score(
     tmp_path: Path,
     score: float,
 ) -> None:
-    metadata_path = tmp_path / "best_eval.json"
-    metadata_path.write_text(json.dumps({"score": score, "protocol": {}}), encoding="utf-8")
-
     with pytest.raises(RuntimeError, match="finite and between zero and one"):
-        Coach._previous_best_score(metadata_path, {})
+        Coach._validate_best_record(
+            {
+                "schema_version": 1,
+                "iteration": 1,
+                "score": score,
+                "protocol": {},
+                "source_checkpoint_sha256": "a" * 64,
+            },
+            protocol={},
+            best_path=tmp_path / "best.pth.tar",
+            trainer_iteration=1,
+        )
 
 
-def test_best_evaluation_metadata_is_bound_to_its_protocol(
+def test_best_checkpoint_record_repairs_metadata_and_is_bound_to_protocol(
     tmp_path: Path,
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
@@ -595,13 +605,19 @@ def test_best_evaluation_metadata_is_bound_to_its_protocol(
     score = StockfishEvalScores(model_wins=1, draws=1, stockfish_wins=0)
     coach._update_best_from_stockfish(1, score)
     metadata_path = tmp_path / "best_eval.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata: dict[str, object] = json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    assert metadata["protocol"]["opening_suite_version"] == 1
-    metadata["protocol"]["opening_suite_version"] = 2
-    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    protocol = cast(dict[str, object], metadata["protocol"])
+    assert protocol["opening_suite_version"] == 1
+    metadata_path.write_text("not-json", encoding="utf-8")
+    assert Coach._previous_best_score(tmp_path, protocol) == 0.75
+    repaired = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert repaired["protocol"] == protocol
+
+    changed_protocol = dict(protocol)
+    changed_protocol["opening_suite_version"] = 2
     with pytest.raises(RuntimeError, match="protocol differs"):
-        coach._update_best_from_stockfish(1, score)
+        Coach._previous_best_score(tmp_path, changed_protocol)
 
 
 def test_configured_external_evaluation_failure_stops_promotion(
@@ -630,7 +646,17 @@ def test_fresh_training_refuses_managed_checkpoint_without_clobbering_it(tmp_pat
     assert latest_path.read_bytes() == original
 
 
-@pytest.mark.parametrize("managed_name", ["checkpoint_2.pth.tar", "latest.pth.tar", "best.pth.tar", "best_eval.json"])
+@pytest.mark.parametrize(
+    "managed_name",
+    [
+        "checkpoint_2.pth.tar",
+        "latest.pth.tar",
+        "best.pth.tar",
+        "best_eval.json",
+        "benchmark_state.json",
+        "fairy_ladder.json",
+    ],
+)
 def test_resume_refuses_managed_state_from_another_directory(tmp_path: Path, managed_name: str) -> None:
     source = tmp_path / "source"
     target = tmp_path / "target"
@@ -660,6 +686,30 @@ def test_resume_allows_source_directory_or_empty_new_target(tmp_path: Path) -> N
         TrainingRunConfig(checkpoint=str(empty_target), stockfish_eval_every=0),
         source / "latest.pth.tar",
     )
+
+
+def test_explicit_evaluation_migration_allows_only_sidecars_in_target(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    for name in ("benchmark_state.json", "fairy_ladder.json"):
+        (target / name).write_text("{}", encoding="utf-8")
+    run = TrainingRunConfig(checkpoint=str(target), stockfish_eval_every=0)
+
+    validate_resume_checkpoint_target(
+        run,
+        source / "latest.pth.tar",
+        allow_evaluation_artifacts_only=True,
+    )
+    (target / "latest.pth.tar").write_bytes(b"different lineage")
+
+    with pytest.raises(FileExistsError, match="another checkpoint lineage"):
+        validate_resume_checkpoint_target(
+            run,
+            source / "latest.pth.tar",
+            allow_evaluation_artifacts_only=True,
+        )
 
 
 def test_resume_resolves_traversal_before_comparing_lineages(tmp_path: Path) -> None:
@@ -861,3 +911,34 @@ def test_coach_rejects_evaluation_larger_than_opening_suite(
             network,
             TrainingRunConfig(stockfish_eval_games=22),
         )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"ladder_start_elo": 499}, "cannot be below Fairy-Stockfish's 500 floor"),
+        ({"ladder_max_elo": 2900}, "cannot exceed Fairy-Stockfish's 2850 ceiling"),
+        ({"ladder_eval_games": 3}, "ladder_eval_games must be an even integer"),
+        ({"ladder_max_elo": 2750}, "reachable.*exact ladder_step_elo increments"),
+        ({"checkpoint": ""}, "checkpoint cannot be blank"),
+    ],
+)
+def test_coach_rejects_invalid_fairy_ladder_contract(
+    overrides: dict[str, object],
+    message: str,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    network = LunaNetwork(chess_game, small_learner_config)
+    config = {"ladder_eval_every": 5, **overrides}
+
+    with pytest.raises(ValueError, match=message):
+        Coach(chess_game, network, TrainingRunConfig(**config))
+
+
+def test_fixed_benchmark_defaults_to_1500_and_ladder_is_opt_in() -> None:
+    run = TrainingRunConfig()
+
+    assert run.stockfish_elo == 1500
+    assert run.ladder_eval_every == 0
+    assert run.ladder_start_elo == 500

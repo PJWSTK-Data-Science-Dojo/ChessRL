@@ -85,7 +85,6 @@ dependencies = [
     { name = "numpy" },
     { name = "python-chess" },
     { name = "pyyaml" },
-    { name = "stockfish" },
     { name = "tensorboard" },
     { name = "torch" },
     { name = "torch-tb-profiler" },
@@ -122,7 +121,6 @@ requires-dist = [
     { name = "python-chess", specifier = ">=1.9.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "stockfish", specifier = ">=3.28.0" },
     { name = "tensorboard", specifier = ">=2.14.0" },
     { name = "torch", specifier = ">=2.13,<2.14" },
     { name = "torch-tb-profiler", specifier = ">=0.4.3" },
@@ -999,15 +997,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/1f/ea/49c993d6dfdd7338c9b1000a0f36817ed7ec84577ae2e52f890d1a4ff909/smmap-5.0.3.tar.gz", hash = "sha256:4d9debb8b99007ae47165abc08670bd74cb74b5227dda7f643eccc4e9eb5642c", size = 22506, upload-time = "2026-03-09T03:43:26.1Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c1/d4/59e74daffcb57a07668852eeeb6035af9f32cbfd7a1d2511f17d2fe6a738/smmap-5.0.3-py3-none-any.whl", hash = "sha256:c106e05d5a61449cf6ba9a1e650227ecfb141590d2a98412103ff35d89fc7b2f", size = 24390, upload-time = "2026-03-09T03:43:24.361Z" },
-]
-
-[[package]]
-name = "stockfish"
-version = "4.0.8"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/65/c5/4da3e96a9614c4529a851f2d3ff0c5568b0d0942d6b67e98d1d1154d5479/stockfish-4.0.8.tar.gz", hash = "sha256:26ee627920ef186847faa2374de69de130faf113991394bf0e24498ecad8fc14", size = 31183, upload-time = "2026-02-20T04:40:38.505Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8f/32/7e7f9cb8f472e86611442fcbb6e61c0ca891aa19c361774d20e43a3c5a15/stockfish-4.0.8-py3-none-any.whl", hash = "sha256:d457e44295e9278fce9ef54935ece0bd7ce2a3bff31ae5b8e0b31dd92ad8e869", size = 24342, upload-time = "2026-02-20T04:40:37.209Z" },
 ]
 
 [[package]]

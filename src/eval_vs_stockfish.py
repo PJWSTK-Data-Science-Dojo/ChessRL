@@ -2,7 +2,7 @@
 
 Example:
     uv run python src/eval_vs_stockfish.py --checkpoint ./runs/luna-main/latest.pth.tar \\
-      --run.stockfish-eval-games 10 --run.stockfish-elo 1320
+      --run.stockfish-eval-games 10 --run.stockfish-elo 1500
 """
 
 from __future__ import annotations
