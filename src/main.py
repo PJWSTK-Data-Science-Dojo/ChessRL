@@ -53,9 +53,9 @@ def resolve_resume_checkpoint(requested: Path, target: Path) -> Path:
     if resolved.name != "latest.pth.tar" or resolved.parent != target.expanduser().resolve():
         return resolved
 
-    candidates: list[tuple[int, bool, Path]] = []
+    candidates: list[tuple[int, Path]] = []
     if resolved.is_file():
-        candidates.append((LunaNetwork.checkpoint_trainer_iteration(resolved), False, resolved))
+        candidates.append((LunaNetwork.checkpoint_trainer_iteration(resolved), resolved))
     for numbered in resolved.parent.glob("checkpoint_*.pth.tar"):
         suffix = numbered.name.removeprefix("checkpoint_").removesuffix(".pth.tar")
         try:
@@ -67,11 +67,11 @@ def resolve_resume_checkpoint(requested: Path, target: Path) -> Path:
             raise RuntimeError(
                 f"Numbered checkpoint iteration {checkpoint_iteration} differs from its filename: {numbered}"
             )
-        candidates.append((checkpoint_iteration, True, numbered))
+        candidates.append((checkpoint_iteration, numbered))
     if not candidates:
         raise FileNotFoundError(f"No resumable checkpoint in {resolved.parent}")
 
-    _, _, selected = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+    _, selected = max(candidates, key=lambda candidate: candidate[0])
     if selected != resolved:
         logger.warning('Recovering from newest immutable checkpoint "{}" instead of "{}"', selected, resolved)
     return selected

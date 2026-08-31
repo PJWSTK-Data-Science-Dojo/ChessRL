@@ -43,6 +43,20 @@ def test_resume_selects_newest_numbered_checkpoint_when_latest_lags(tmp_path: Pa
     assert selected == newest
 
 
+def test_resume_prefers_latest_when_its_iteration_matches_numbered_checkpoint(tmp_path: Path) -> None:
+    target = tmp_path / "run"
+    target.mkdir()
+    latest = target / "latest.pth.tar"
+    numbered = target / "checkpoint_12.pth.tar"
+    latest.write_bytes(b"latest")
+    numbered.write_bytes(b"numbered")
+
+    with patch.object(training_entry.LunaNetwork, "checkpoint_trainer_iteration", return_value=12):
+        selected = training_entry.resolve_resume_checkpoint(latest, target)
+
+    assert selected == latest
+
+
 def test_resume_recovers_numbered_checkpoint_when_latest_is_missing(tmp_path: Path) -> None:
     target = tmp_path / "run"
     target.mkdir()
