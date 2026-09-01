@@ -401,6 +401,8 @@ speculative and uses a much larger search budget than Luna's maintained 32 simul
 Search-contempt is therefore disabled for external evaluation and replay reanalysis even
 when enabled for new self-play. Stored self-play root values are still produced by the
 hybrid search, so a short canary phase must verify value calibration before a long run.
+Iteration telemetry reports terminal-outcome MAE and signed bias for root values from
+completed games; truncated games are excluded because their outcome is not observed.
 
 Run the fixed-weight gate before starting a training phase. Use an immutable numbered
 checkpoint, not `latest.pth.tar`:
@@ -419,6 +421,19 @@ records per-seed and aggregate throughput, outcomes, truncation, policy entropy,
 opponent selections made by frozen-distribution sampling. Do not start a long run if the
 candidate fails to activate, loses substantial throughput, or merely changes W/D/L by
 adding truncations or repeated openings.
+
+The maintained online canary resumes the complete optimizer and scheduler state from the
+pinned LC0 warm-start iteration 30, but creates a separate checkpoint and W&B lineage:
+
+```bash
+make train-search-contempt-canary
+```
+
+It runs only iterations 31–40 with `L=8` and a 40-ply exploration threshold. All ten
+canary checkpoints are retained. Fairy-Stockfish is measured every five iterations from
+600 Elo, while the independent fixed 1500-Elo benchmark runs at iterations 30 and 40.
+Passing the fixed-weight ablation does not authorize a longer run: throughput, truncation,
+color balance, root-value bias, and both external evaluations are the promotion gates.
 
 ## Training flow
 
@@ -444,6 +459,7 @@ make check               # format check + lint + types + tests
 make audit               # audit locked runtime dependencies (network required)
 make bench               # throughput benchmark
 make ablate-search-contempt SEARCH_CONTEMPT_CHECKPOINT=...  # fixed-weight search ablation
+make train-search-contempt-canary  # bounded L=8 online canary from the pinned iteration 30
 make profile-smoke       # bounded end-to-end profile
 make download-pgn-data   # fetch and verify the pinned expert corpus
 make pretrain-pgn        # start or resume supervised PGN warm-start training

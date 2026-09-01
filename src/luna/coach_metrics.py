@@ -39,6 +39,10 @@ class _SelfPlaySummary:
     search_contempt_frozen_nodes: int = 0
     repeated_prefix_8_fraction: float = 0.0
     repeated_prefix_16_fraction: float = 0.0
+    root_value_terminal_abs_error_sum: float = 0.0
+    root_value_terminal_error_sum: float = 0.0
+    root_value_sum: float = 0.0
+    root_value_terminal_positions: int = 0
     terminations: dict[chess.Termination, int] = field(
         default_factory=lambda: {termination: 0 for termination in chess.Termination}
     )
@@ -59,6 +63,7 @@ def log_iteration_metrics(
         "replay_buffer_size": coach.replay.size,
     }
     metrics.update(_self_play_metrics(coach, summary, optimizer_steps))
+    metrics.update(_root_value_metrics(summary))
     metrics.update(_search_contempt_metrics(summary))
     metrics.update(_termination_metrics(summary))
     metrics.update(_performance_metrics(coach, summary, stats, optimizer_steps))
@@ -77,6 +82,7 @@ def _summarize_trajectories(trajectories: list[Trajectory]) -> _SelfPlaySummary:
         summary.search_contempt_opponent_selections += trajectory.search_contempt_opponent_selections
         summary.search_contempt_thompson_selections += trajectory.search_contempt_thompson_selections
         summary.search_contempt_frozen_nodes += trajectory.search_contempt_frozen_nodes
+        _record_root_value_calibration(summary, trajectory)
         _record_outcome(summary, trajectory)
     summary.repeated_prefix_8_fraction = _repeated_prefix_fraction(trajectories, 8)
     summary.repeated_prefix_16_fraction = _repeated_prefix_fraction(trajectories, 16)
@@ -95,6 +101,20 @@ def _policy_entropy(trajectory: Trajectory) -> float:
     probabilities = trajectory.root_policies.astype(np.float32)
     positive = probabilities > 0.0
     return -float(np.sum(probabilities[positive] * np.log(probabilities[positive])))
+
+
+def _record_root_value_calibration(summary: _SelfPlaySummary, trajectory: Trajectory) -> None:
+    if trajectory.truncated:
+        return
+    final_reward = float(trajectory.rewards[-1])
+    final_index = trajectory.game_length - 1
+    for index, root_value in enumerate(trajectory.root_values):
+        target = -final_reward if (final_index - index) % 2 else final_reward
+        error = float(root_value) - target
+        summary.root_value_terminal_abs_error_sum += abs(error)
+        summary.root_value_terminal_error_sum += error
+        summary.root_value_sum += float(root_value)
+    summary.root_value_terminal_positions += trajectory.game_length
 
 
 def _record_outcome(summary: _SelfPlaySummary, trajectory: Trajectory) -> None:
@@ -180,6 +200,16 @@ def _search_contempt_metrics(summary: _SelfPlaySummary) -> dict[str, MetricValue
             summary.search_contempt_frozen_nodes,
             summary.positions,
         ),
+    }
+
+
+def _root_value_metrics(summary: _SelfPlaySummary) -> dict[str, MetricValue]:
+    positions = summary.root_value_terminal_positions
+    return {
+        "selfplay/root_value_terminal_mae": _mean(summary.root_value_terminal_abs_error_sum, positions),
+        "selfplay/root_value_terminal_bias": _mean(summary.root_value_terminal_error_sum, positions),
+        "selfplay/root_value_terminal_mean": _mean(summary.root_value_sum, positions),
+        "selfplay/root_value_terminal_positions": positions,
     }
 
 

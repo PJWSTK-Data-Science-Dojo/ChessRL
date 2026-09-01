@@ -197,6 +197,28 @@ def test_decisive_to_draw_ratio_stays_positive_when_no_games_draw(
     assert wandb_log.call_args.args[0]["selfplay/decisive_to_draw_ratio"] == 1.0
 
 
+def test_root_value_terminal_calibration_alternates_perspective_and_excludes_truncations(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    make_trajectory: TrajectoryFactory,
+) -> None:
+    coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), TrainingRunConfig())
+    completed = make_trajectory(4, termination=chess.Termination.CHECKMATE)
+    completed.rewards[-1] = 1.0
+    completed.root_values[:] = [0.0, 0.5, -0.5, 1.0]
+    truncated = make_trajectory(4, truncated=True)
+    truncated.root_values[:] = 100.0
+
+    with patch("luna.coach_metrics.wandb.run", object()), patch("luna.coach_metrics.wandb.log") as wandb_log:
+        coach._log_iteration_metrics(1, [completed, truncated], IterProfileStats(iter_index=1))
+
+    metrics = wandb_log.call_args.args[0]
+    assert metrics["selfplay/root_value_terminal_positions"] == 4
+    assert metrics["selfplay/root_value_terminal_mae"] == pytest.approx(0.5)
+    assert metrics["selfplay/root_value_terminal_bias"] == pytest.approx(0.25)
+    assert metrics["selfplay/root_value_terminal_mean"] == pytest.approx(0.25)
+
+
 def test_gumbel_selfplay_reenables_exploration_for_a_repeated_root() -> None:
     board = chess.Board()
     for move in ("g1f3", "g8f6", "f3g1", "f6g8"):

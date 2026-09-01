@@ -44,6 +44,12 @@ LC0_SELECTED_CHECKPOINT ?=
 LC0_RL_CHECKPOINT_DIR ?= ./runs/luna-balanced-ezv2-lc0-warmstart-v1
 LC0_RL_WANDB_RUN_ID ?= luna-balanced-ezv2-lc0-warmstart-v1
 LC0_RL_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · LC0 Warm Start v1
+SEARCH_CONTEMPT_CANARY_SOURCE_DIR ?= ./runs/sources
+SEARCH_CONTEMPT_CANARY_SOURCE_FILE ?= luna-lc0-warmstart-iter30.pth.tar
+SEARCH_CONTEMPT_CANARY_SOURCE_SHA256 ?= edb1aee2b5c560eb7b38ba3209c52baa9bc4d982cefa1ce7eed0f8f9448cba4a
+SEARCH_CONTEMPT_CANARY_CHECKPOINT_DIR ?= ./runs/luna-balanced-ezv2-search-contempt-l8-canary-v1
+SEARCH_CONTEMPT_CANARY_WANDB_RUN_ID ?= luna-balanced-ezv2-search-contempt-l8-canary-v1
+SEARCH_CONTEMPT_CANARY_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · Search-contempt L8 Canary v1
 NEW_PHASE_WANDB_RUN_ID ?= luna-balanced-ezv2-anti-collapse-v2
 NEW_PHASE_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · Anti-Collapse v2
 MIGRATION_WANDB_RUN_ID ?= luna-fairy-ladder-v1
@@ -64,6 +70,18 @@ MIGRATION_PHASE_IDENTITY_ARGS = \
 	--wandb-run-id "$(MIGRATION_WANDB_RUN_ID)" \
 	--wandb-run-name "$(MIGRATION_WANDB_RUN_NAME)" \
 	--run.checkpoint "$(MIGRATION_CHECKPOINT_DIR)"
+
+SEARCH_CONTEMPT_CANARY_ARGS = \
+	--wandb-project "$(WANDB_PROJECT)" \
+	--wandb-run-id "$(SEARCH_CONTEMPT_CANARY_WANDB_RUN_ID)" \
+	--wandb-run-name "$(SEARCH_CONTEMPT_CANARY_WANDB_RUN_NAME)" \
+	--run.num-iters 40 \
+	--run.checkpoint-top-k 12 \
+	--run.search-contempt-visit-limit 8 \
+	--run.temp-threshold 40 \
+	--run.stockfish-eval-every 10 \
+	--run.ladder-start-elo 600 \
+	--run.ladder-eval-every 5
 
 PHASE_TRAIN_ARGS = \
 	--run.search-mode gumbel \
@@ -403,6 +421,22 @@ train-lc0-warmstart: _train-env-preflight _fairy-stockfish-preflight
 			TRAIN_ARGS="--new-training-phase --load-checkpoint-dir \"$$source_dir\" --load-checkpoint-file \"$$source_file\" --wandb-project \"$(WANDB_PROJECT)\" --wandb-run-id \"$(LC0_RL_WANDB_RUN_ID)\" --wandb-run-name \"$(LC0_RL_WANDB_RUN_NAME)\" --wandb-resume allow"; \
 	fi
 
+# Migrate the complete LC0 warm-start state on first use, then continue only
+# the canary's optimizer, evaluation sidecars, checkpoints, and W&B lineage.
+train-search-contempt-canary: _train-env-preflight _fairy-stockfish-preflight
+	@if test -f "$(SEARCH_CONTEMPT_CANARY_CHECKPOINT_DIR)/latest.pth.tar" || \
+		find "$(SEARCH_CONTEMPT_CANARY_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'checkpoint_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
+		$(MAKE) resume CHECKPOINT_DIR="$(SEARCH_CONTEMPT_CANARY_CHECKPOINT_DIR)" \
+			TRAIN_ARGS='$(SEARCH_CONTEMPT_CANARY_ARGS) --wandb-resume must'; \
+	else \
+		test -f "$(SEARCH_CONTEMPT_CANARY_SOURCE_DIR)/$(SEARCH_CONTEMPT_CANARY_SOURCE_FILE)" || { \
+			echo "Search-contempt canary source not found: $(SEARCH_CONTEMPT_CANARY_SOURCE_DIR)/$(SEARCH_CONTEMPT_CANARY_SOURCE_FILE)" >&2; exit 2; }; \
+		printf '%s  %s\n' "$(SEARCH_CONTEMPT_CANARY_SOURCE_SHA256)" "$(SEARCH_CONTEMPT_CANARY_SOURCE_DIR)/$(SEARCH_CONTEMPT_CANARY_SOURCE_FILE)" \
+			| sha256sum --check --status || { echo "Search-contempt canary source SHA-256 mismatch" >&2; exit 2; }; \
+		$(MAKE) train CHECKPOINT_DIR="$(SEARCH_CONTEMPT_CANARY_CHECKPOINT_DIR)" \
+			TRAIN_ARGS='--load-model --initialize-evaluation-state --load-checkpoint-dir "$(SEARCH_CONTEMPT_CANARY_SOURCE_DIR)" --load-checkpoint-file "$(SEARCH_CONTEMPT_CANARY_SOURCE_FILE)" $(SEARCH_CONTEMPT_CANARY_ARGS) --wandb-resume allow'; \
+	fi
+
 _train-env-preflight:
 	@test -f "$(TRAIN_ENV_FILE)" || { echo "Training environment file not found: $(TRAIN_ENV_FILE)" >&2; exit 2; }
 	@uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python -c \
@@ -600,5 +634,6 @@ test-pipeline-mps:
 	lichess-config lint \
 	migrate-ladder-phase pretrain-lc0 pretrain-pgn profile-smoke release-web-model resume resume-migrated-phase resume-phase \
 	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train train-lc0-warmstart train-phase train-pgn-warmstart \
+	train-search-contempt-canary \
 	types uci verify-lc0-data verify-pgn-data verify-web-model web-build web-config web-down web-logs web-public-config \
 	web-public-down web-public-logs web-public-up web-up
