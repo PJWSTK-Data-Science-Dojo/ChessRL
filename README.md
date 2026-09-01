@@ -28,7 +28,7 @@ The implementation follows ideas from [MuZero](https://arxiv.org/abs/1911.08265)
 Run every command from the repository root.
 
 ```bash
-uv sync --extra dev --extra perf
+uv sync --frozen --extra dev --extra perf
 make check
 make profile-smoke
 make install-fairy-stockfish
@@ -263,6 +263,7 @@ Chess uses an undiscounted terminal objective (`discount=1.0`). Terminal outcome
 
 ```bash
 make fmt                 # format and apply safe Ruff fixes
+make lock-check          # verify pyproject.toml and uv.lock agree
 make format-check        # verify Ruff formatting without editing files
 make lint                # Ruff checks
 make types               # mypy over src
@@ -289,21 +290,42 @@ If CUDA is requested but unavailable, verify the environment first:
 uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Install the PyTorch build appropriate for the host using the official PyTorch instructions when the environment is incorrect.
+When the locked PyTorch build is unsuitable for a host, update the dependency with
+`uv add` and the appropriate official PyTorch package index, then commit the resulting
+`pyproject.toml` and `uv.lock` together. Do not mutate the managed environment with `pip`.
+
+## Development standards
+
+The repository uses `uv` as its only Python environment and package manager. Runtime
+and development dependencies are locked in `uv.lock`; update them with `uv add` or
+`uv lock`, never with an ad-hoc `pip` install. Before opening a change, run:
+
+```bash
+make fmt
+make check
+```
+
+`make check` is the same quality gate used in CI: Ruff formatting and linting, strict
+mypy over production code, and the complete pytest suite. Python source and test modules
+must remain below 400 lines; split a growing module by responsibility instead of hiding
+the limit with generated files or exclusions. Tests should be deterministic and must not
+require a GPU, network connection, W&B credentials, or a local chess-engine binary unless
+the dependency is explicitly mocked.
 
 ## Repository map
 
 ```text
 src/main.py                    training entry point
-src/web_app.py                 Flask app factory and interactive API
+src/web_app.py                 stable web entry point and public imports
+src/web_*.py                   engine service, game state, security, and API routes
 src/eval_vs_stockfish.py       standalone external evaluation
-src/luna/config.py             typed configuration
-src/luna/coach.py              self-play/training/checkpoint orchestration
-src/luna/network.py            learner, inference, and checkpoint I/O
+src/luna/config*.py            typed configuration and validation
+src/luna/coach*.py             self-play, training, evaluation, and checkpoints
+src/luna/network*.py           learner, inference, diagnostics, and checkpoint I/O
 src/luna/model_factory.py      configured model architecture selection
 src/luna/ezv2_networks.py      baseline architecture and support transforms
 src/luna/balanced_networks.py  asymmetric SE-ResNet and state-anchored variant
-src/luna/mcts.py               Gumbel MuZero and PUCT latent search
+src/luna/mcts*.py              Gumbel MuZero, PUCT, and batched latent search
 src/luna/replay_buffer.py      prioritized trajectory replay
 src/luna/targets.py            TD and unroll targets
 src/luna/uci.py                UCI adapter

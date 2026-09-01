@@ -23,7 +23,6 @@ class TrajectoryFactory(Protocol):
 
 @pytest.fixture
 def small_learner_config() -> EzV2LearnerConfig:
-    """Minimal model config for fast CPU tests."""
     return EzV2LearnerConfig(
         device="cpu",
         num_channels=16,
@@ -36,14 +35,11 @@ def small_learner_config() -> EzV2LearnerConfig:
 
 @pytest.fixture
 def chess_game() -> ChessGame:
-    """ChessGame instance."""
     return ChessGame()
 
 
 @pytest.fixture
 def make_trajectory() -> TrajectoryFactory:
-    """Factory for creating test trajectories."""
-
     def _make(
         length: int = 10,
         *,

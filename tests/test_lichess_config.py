@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from luna.lichess_config import build_config, main, write_private_config
+from luna.lichess_config import LichessEngineConfig, build_config, main, write_private_config
 
 type YamlValue = str | int | float | bool | None | list[YamlValue] | dict[str, YamlValue]
 
@@ -48,8 +48,7 @@ def _runtime_files(tmp_path: Path) -> tuple[Path, Path]:
 
 def test_build_config_uses_current_lichess_bot_shape_and_safe_defaults(tmp_path: Path) -> None:
     engine, checkpoint = _runtime_files(tmp_path)
-    config = build_config(
-        _template(),
+    settings = LichessEngineConfig(
         repository=tmp_path,
         engine_path=engine,
         checkpoint=checkpoint,
@@ -60,6 +59,7 @@ def test_build_config_uses_current_lichess_bot_shape_and_safe_defaults(tmp_path:
         estimated_simulation_ms=3.5,
         compile_inference=True,
     )
+    config = build_config(_template(), settings)
 
     engine_config = config["engine"]
     assert Path(engine_config["dir"]) / engine_config["name"] == engine.resolve()
@@ -101,8 +101,7 @@ def test_build_config_rejects_non_finite_timing(tmp_path: Path) -> None:
     engine, checkpoint = _runtime_files(tmp_path)
 
     with pytest.raises(ValueError, match="finite and positive"):
-        build_config(
-            _template(),
+        settings = LichessEngineConfig(
             repository=tmp_path,
             engine_path=engine,
             checkpoint=checkpoint,
@@ -113,6 +112,7 @@ def test_build_config_rejects_non_finite_timing(tmp_path: Path) -> None:
             estimated_simulation_ms=float("nan"),
             compile_inference=False,
         )
+        build_config(_template(), settings)
 
 
 def test_private_writer_is_atomic_owner_only_and_requires_force(tmp_path: Path) -> None:

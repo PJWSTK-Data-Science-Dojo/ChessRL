@@ -47,7 +47,7 @@ class StockfishPlayer:
         except (chess.engine.EngineError, OSError, TimeoutError, ValueError) as exc:
             try:
                 self.close()
-            except Exception as cleanup_exc:
+            except (chess.engine.EngineError, OSError, TimeoutError, RuntimeError) as cleanup_exc:
                 exc.add_note(f"External-engine cleanup also failed: {cleanup_exc}")
             raise
 
@@ -91,12 +91,12 @@ class StockfishPlayer:
         quit_failure: Exception | None = None
         try:
             self.stockfish.quit()
-        except Exception as exc:
+        except (chess.engine.EngineError, OSError, TimeoutError, RuntimeError) as exc:
             quit_failure = exc
 
         try:
             self.stockfish.close()
-        except Exception as exc:
+        except (chess.engine.EngineError, OSError, TimeoutError, RuntimeError) as exc:
             if quit_failure is None:
                 raise
             quit_failure.add_note(f"Hard-closing the engine transport also failed: {exc}")

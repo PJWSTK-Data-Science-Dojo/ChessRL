@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,28 @@ import yaml
 
 
 class LichessConfigurationError(ValueError):
-    """Raised when a safe lichess-bot configuration cannot be generated."""
+    pass
+
+
+@dataclass(frozen=True)
+class LichessEngineConfig:
+    repository: Path
+    engine_path: Path
+    checkpoint: Path
+    device: str
+    cuda_device: int | None
+    mcts_simulations: int
+    minimum_simulations: int
+    estimated_simulation_ms: float
+    compile_inference: bool
+
+    def resolved(self) -> LichessEngineConfig:
+        return replace(
+            self,
+            repository=self.repository.resolve(),
+            engine_path=self.engine_path.resolve(),
+            checkpoint=self.checkpoint.resolve(),
+        )
 
 
 def _mapping_section(config: dict[str, Any], name: str) -> dict[str, Any]:
@@ -46,86 +68,85 @@ def load_template(path: Path) -> dict[str, Any]:
 
 def build_config(
     template: Mapping[str, Any],
-    *,
-    repository: Path,
-    engine_path: Path,
-    checkpoint: Path,
-    device: str,
-    cuda_device: int | None,
-    mcts_simulations: int,
-    minimum_simulations: int,
-    estimated_simulation_ms: float,
-    compile_inference: bool,
+    settings: LichessEngineConfig,
 ) -> dict[str, Any]:
-    """Return a configured copy of the current lichess-bot template."""
-    if device not in {"cuda", "mps", "cpu"}:
-        raise LichessConfigurationError(f"Unsupported inference device: {device}")
-    if cuda_device is not None and cuda_device < 0:
-        raise LichessConfigurationError("--cuda-device must be non-negative.")
-    if mcts_simulations < 1 or minimum_simulations < 1:
-        raise LichessConfigurationError("Simulation counts must be positive.")
-    if minimum_simulations > mcts_simulations:
-        raise LichessConfigurationError("--minimum-sims cannot exceed --mcts-sims.")
-    if not math.isfinite(estimated_simulation_ms) or estimated_simulation_ms <= 0:
-        raise LichessConfigurationError("--estimated-sim-ms must be finite and positive.")
-
-    repository = repository.resolve()
-    engine_path = engine_path.resolve()
-    checkpoint = checkpoint.resolve()
-    if not repository.is_dir():
-        raise LichessConfigurationError(f"Repository directory not found: {repository}")
-    if not engine_path.is_file() or not os.access(engine_path, os.X_OK):
-        raise LichessConfigurationError(
-            f"UCI executable is missing or not executable: {engine_path}. Run 'uv sync' first."
-        )
-    if not checkpoint.is_file():
-        raise LichessConfigurationError(
-            f"Checkpoint not found: {checkpoint}. Train or copy a format-v2 latest.pth.tar first."
-        )
-
+    settings = settings.resolved()
+    _validate_engine_settings(settings)
     config: dict[str, Any] = copy.deepcopy(dict(template))
-    engine = _mapping_section(config, "engine")
-    challenge = _mapping_section(config, "challenge")
-    correspondence = _mapping_section(config, "correspondence")
+    config.update(token="", url="https://lichess.org/", move_overhead=250, max_takebacks_accepted=0)
+    _configure_engine(_mapping_section(config, "engine"), settings)
+    _configure_challenges(_mapping_section(config, "challenge"))
+    _mapping_section(config, "correspondence")["ponder"] = False
     matchmaking = _mapping_section(config, "matchmaking")
+    matchmaking.update(allow_matchmaking=False, allow_during_games=False)
+    _configure_greeting(config)
+    return config
 
-    # Current lichess-bot releases read LICHESS_BOT_TOKEN before this field.
-    # Keeping the generated file secret-free prevents accidental credential copies.
-    config["token"] = ""
-    config["url"] = "https://lichess.org/"
-    config["move_overhead"] = 250
-    config["max_takebacks_accepted"] = 0
 
+def _validate_engine_settings(settings: LichessEngineConfig) -> None:
+    if settings.device not in {"cuda", "mps", "cpu"}:
+        raise LichessConfigurationError(f"Unsupported inference device: {settings.device}")
+    if settings.cuda_device is not None and settings.cuda_device < 0:
+        raise LichessConfigurationError("--cuda-device must be non-negative.")
+    if settings.mcts_simulations < 1 or settings.minimum_simulations < 1:
+        raise LichessConfigurationError("Simulation counts must be positive.")
+    if settings.minimum_simulations > settings.mcts_simulations:
+        raise LichessConfigurationError("--minimum-sims cannot exceed --mcts-sims.")
+    if not math.isfinite(settings.estimated_simulation_ms) or settings.estimated_simulation_ms <= 0:
+        raise LichessConfigurationError("--estimated-sim-ms must be finite and positive.")
+    _validate_runtime_paths(settings)
+
+
+def _validate_runtime_paths(settings: LichessEngineConfig) -> None:
+    if not settings.repository.is_dir():
+        raise LichessConfigurationError(f"Repository directory not found: {settings.repository}")
+    if not settings.engine_path.is_file() or not os.access(settings.engine_path, os.X_OK):
+        raise LichessConfigurationError(
+            f"UCI executable is missing or not executable: {settings.engine_path}. Run 'uv sync' first."
+        )
+    if not settings.checkpoint.is_file():
+        raise LichessConfigurationError(
+            f"Checkpoint not found: {settings.checkpoint}. Train or copy a format-v2 latest.pth.tar first."
+        )
+
+
+def _engine_options(settings: LichessEngineConfig) -> dict[str, Any]:
     engine_options: dict[str, Any] = {
-        "checkpoint": str(checkpoint),
-        "device": device,
-        "mcts-sims": mcts_simulations,
-        "minimum-sims": minimum_simulations,
-        "estimated-sim-ms": estimated_simulation_ms,
+        "checkpoint": str(settings.checkpoint),
+        "device": settings.device,
+        "mcts-sims": settings.mcts_simulations,
+        "minimum-sims": settings.minimum_simulations,
+        "estimated-sim-ms": settings.estimated_simulation_ms,
     }
-    if cuda_device is not None:
-        engine_options["cuda-device"] = cuda_device
-    if compile_inference:
-        # lichess-bot renders a null engine option as a valueless CLI switch.
+    if settings.cuda_device is not None:
+        engine_options["cuda-device"] = settings.cuda_device
+    if settings.compile_inference:
         engine_options["compile-inference"] = None
+    return engine_options
 
+
+def _configure_engine(engine: dict[str, Any], settings: LichessEngineConfig) -> None:
     engine.update(
         {
-            "dir": str(engine_path.parent),
-            "name": engine_path.name,
+            "dir": str(settings.engine_path.parent),
+            "name": settings.engine_path.name,
             "debug": False,
-            "working_dir": str(repository),
+            "working_dir": str(settings.repository),
             "protocol": "uci",
             "ponder": False,
-            "engine_options": engine_options,
+            "engine_options": _engine_options(settings),
             "uci_options": {
-                "MCTS Simulations": mcts_simulations,
-                "Minimum Simulations": minimum_simulations,
-                "Estimated Simulation ms": estimated_simulation_ms,
+                "MCTS Simulations": settings.mcts_simulations,
+                "Minimum Simulations": settings.minimum_simulations,
+                "Estimated Simulation ms": settings.estimated_simulation_ms,
             },
             "silence_stderr": False,
         }
     )
+    _disable_optional_engine_features(engine)
+
+
+def _disable_optional_engine_features(engine: dict[str, Any]) -> None:
     polyglot = engine.get("polyglot")
     if isinstance(polyglot, dict):
         polyglot["enabled"] = False
@@ -134,6 +155,8 @@ def build_config(
         draw_or_resign["resign_enabled"] = False
         draw_or_resign["offer_draw_enabled"] = False
 
+
+def _configure_challenges(challenge: dict[str, Any]) -> None:
     challenge.update(
         {
             "concurrency": 1,
@@ -147,10 +170,9 @@ def build_config(
         }
     )
     challenge.pop("bullet_requires_increment", None)
-    correspondence["ponder"] = False
-    matchmaking["allow_matchmaking"] = False
-    matchmaking["allow_during_games"] = False
 
+
+def _configure_greeting(config: dict[str, Any]) -> None:
     greeting = config.get("greeting")
     if isinstance(greeting, dict):
         greeting.update(
@@ -161,7 +183,6 @@ def build_config(
                 "goodbye_spectators": "Thanks for watching!",
             }
         )
-    return config
 
 
 def write_private_config(config: Mapping[str, Any], output: Path, *, force: bool = False) -> None:
@@ -219,8 +240,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path = (args.output or bot_directory / "config.yml").expanduser().absolute()
     try:
         template = load_template(template_path)
-        config = build_config(
-            template,
+        settings = LichessEngineConfig(
             repository=repository,
             engine_path=args.engine,
             checkpoint=args.checkpoint,
@@ -231,6 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             estimated_simulation_ms=args.estimated_sim_ms,
             compile_inference=args.compile_inference,
         )
+        config = build_config(template, settings)
         write_private_config(config, output_path, force=args.force)
     except LichessConfigurationError as exc:
         print(f"Configuration failed: {exc}", file=sys.stderr)

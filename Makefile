@@ -109,7 +109,10 @@ lint:
 types:
 	uv run --frozen --extra dev mypy src
 
-check: format-check lint types test
+lock-check:
+	uv lock --check
+
+check: lock-check format-check lint types test
 
 test:
 	env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run --frozen --extra dev pytest tests/ -v

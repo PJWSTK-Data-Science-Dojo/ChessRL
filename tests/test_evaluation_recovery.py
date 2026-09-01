@@ -91,13 +91,13 @@ def test_loaded_due_checkpoint_reconciles_fixed_and_ladder_before_early_return(
         return object()
 
     with (
-        patch("luna.coach.validate_stockfish_configuration"),
-        patch("luna.coach.validate_ladder_configuration"),
-        patch("luna.coach.run_stockfish_eval", side_effect=fixed_eval) as fixed_match,
-        patch("luna.coach.run_fairy_ladder_eval", side_effect=ladder_eval) as ladder_match,
+        patch("luna.coach_training.validate_stockfish_configuration"),
+        patch("luna.coach_training.validate_ladder_configuration"),
+        patch("luna.coach_evaluation.run_stockfish_eval", side_effect=fixed_eval) as fixed_match,
+        patch("luna.coach_evaluation.run_fairy_ladder_eval", side_effect=ladder_eval) as ladder_match,
         patch.object(network, "warmup_mcts_inference") as warmup,
         patch.object(coach, "_learn_iterations") as train,
-        patch("luna.coach.wandb.run", None),
+        patch("luna.coach_evaluation.wandb.run", None),
     ):
         coach.learn()
 
@@ -147,11 +147,11 @@ def test_durable_benchmark_result_promotes_missing_best_without_replaying_match(
     coach = Coach(chess_game, network, run)
 
     with (
-        patch("luna.coach.validate_stockfish_configuration"),
-        patch("luna.coach.run_stockfish_eval") as fixed_match,
+        patch("luna.coach_training.validate_stockfish_configuration"),
+        patch("luna.coach_evaluation.run_stockfish_eval") as fixed_match,
         patch.object(network, "warmup_mcts_inference"),
         patch.object(coach, "_learn_iterations") as train,
-        patch("luna.coach.wandb.run", None),
+        patch("luna.coach_evaluation.wandb.run", None),
     ):
         coach.learn()
 
@@ -201,10 +201,10 @@ def test_resume_after_first_interval_requires_existing_evaluation_sidecar(
     coach = Coach(chess_game, network, run)
 
     with (
-        patch("luna.coach.validate_stockfish_configuration") as validate_fixed,
-        patch("luna.coach.validate_ladder_configuration") as validate_ladder,
-        patch("luna.coach.run_stockfish_eval") as fixed_match,
-        patch("luna.coach.run_fairy_ladder_eval") as ladder_match,
+        patch("luna.coach_training.validate_stockfish_configuration") as validate_fixed,
+        patch("luna.coach_training.validate_ladder_configuration") as validate_ladder,
+        patch("luna.coach_evaluation.run_stockfish_eval") as fixed_match,
+        patch("luna.coach_evaluation.run_fairy_ladder_eval") as ladder_match,
         patch.object(network, "warmup_mcts_inference") as warmup,
         pytest.raises((FileNotFoundError, RuntimeError), match=message),
     ):
@@ -245,8 +245,8 @@ def test_cross_directory_migration_initializes_empty_evaluation_sidecars(
     )
 
     with (
-        patch("luna.coach.validate_stockfish_configuration") as validate_fixed,
-        patch("luna.coach.validate_ladder_configuration") as validate_ladder,
+        patch("luna.coach_training.validate_stockfish_configuration") as validate_fixed,
+        patch("luna.coach_training.validate_ladder_configuration") as validate_ladder,
         patch.object(network, "warmup_mcts_inference") as warmup,
         patch.object(coach, "_learn_iterations") as train,
     ):

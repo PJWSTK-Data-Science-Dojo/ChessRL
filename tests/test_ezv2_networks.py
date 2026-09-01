@@ -34,7 +34,6 @@ def test_network_output_shapes(
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
 ) -> None:
-    """All networks produce correct output tensor shapes."""
     nnet = EZV2Networks(chess_game, small_learner_config)
     action_size = chess_game.get_action_size()
 

@@ -1,6 +1,7 @@
 """EfficientZeroV2 target generation: n-step bootstrap values, unroll targets."""
 
 import math
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -47,36 +48,70 @@ def compute_target_value(
     trajectory target instead of being interpreted as a later bootstrap.
     """
     _validate_target_request(trajectory, pos_idx, td_steps, discount)
-    game_len = trajectory.game_length
     if root_value_override is not None and pos_idx in root_value_override:
-        override = float(root_value_override[pos_idx])
-        if not math.isfinite(override):
-            raise ValueError(f"Root-value override at position {pos_idx} must be finite")
-        return override
+        return _finite_override(root_value_override[pos_idx], pos_idx)
     bootstrap_idx = pos_idx + td_steps
-
-    end = min(bootstrap_idx, game_len)
-    n = end - pos_idx
-    if n > 0:
-        rewards = trajectory.rewards[pos_idx:end].astype(np.float64)
-        steps = np.arange(n, dtype=np.float64)
-        signs = np.where(steps % 2 == 0, 1.0, -1.0)
-        discounts = discount**steps
-        value = float((discounts * signs * rewards).sum())
-    else:
-        value = 0.0
-
-    if bootstrap_idx < game_len:
-        sign = 1.0 if td_steps % 2 == 0 else -1.0
-        if root_value_override is not None and bootstrap_idx in root_value_override:
-            v_boot = float(root_value_override[bootstrap_idx])
-            if not math.isfinite(v_boot):
-                raise ValueError(f"Root-value override at position {bootstrap_idx} must be finite")
-        else:
-            v_boot = float(trajectory.root_values[bootstrap_idx])
-        value += (discount**td_steps) * sign * v_boot
-
+    value = _discounted_rewards(trajectory, pos_idx, bootstrap_idx, discount)
+    if bootstrap_idx < trajectory.game_length:
+        value += _bootstrap_value(trajectory, bootstrap_idx, td_steps, discount, root_value_override)
     return value
+
+
+def _finite_override(value: float, position: int) -> float:
+    override = float(value)
+    if not math.isfinite(override):
+        raise ValueError(f"Root-value override at position {position} must be finite")
+    return override
+
+
+def _discounted_rewards(trajectory: Trajectory, pos_idx: int, bootstrap_idx: int, discount: float) -> float:
+    end = min(bootstrap_idx, trajectory.game_length)
+    n = end - pos_idx
+    if n <= 0:
+        return 0.0
+    rewards = trajectory.rewards[pos_idx:end].astype(np.float64)
+    steps = np.arange(n, dtype=np.float64)
+    signs = np.where(steps % 2 == 0, 1.0, -1.0)
+    return float(((discount**steps) * signs * rewards).sum())
+
+
+def _bootstrap_value(
+    trajectory: Trajectory,
+    bootstrap_idx: int,
+    td_steps: int,
+    discount: float,
+    overrides: dict[int, float] | None,
+) -> float:
+    if overrides is not None and bootstrap_idx in overrides:
+        value = _finite_override(overrides[bootstrap_idx], bootstrap_idx)
+    else:
+        value = float(trajectory.root_values[bootstrap_idx])
+    sign = 1.0 if td_steps % 2 == 0 else -1.0
+    return (discount**td_steps) * sign * value
+
+
+@dataclass
+class _TargetLists:
+    values: list[float] = field(default_factory=list)
+    rewards: list[float] = field(default_factory=list)
+    policies: list[np.ndarray] = field(default_factory=list)
+    observations: list[np.ndarray] = field(default_factory=list)
+    valid_masks: list[np.ndarray] = field(default_factory=list)
+    actions: list[int] = field(default_factory=list)
+    unroll_mask: list[float] = field(default_factory=list)
+    consistency_mask: list[float] = field(default_factory=list)
+    value_mask: list[float] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _TargetRequest:
+    trajectory: Trajectory
+    pos_idx: int
+    unroll_steps: int
+    td_steps: int
+    discount: float
+    root_value_override: dict[int, float] | None
+    policy_override: dict[int, np.ndarray] | None
 
 
 def build_unroll_targets(
@@ -93,75 +128,92 @@ def build_unroll_targets(
     if isinstance(unroll_steps, bool) or not isinstance(unroll_steps, int) or unroll_steps < 0:
         raise ValueError("unroll_steps must be a non-negative integer")
     _validate_target_request(trajectory, pos_idx, td_steps, discount)
-    game_len = trajectory.game_length
-
-    target_values: list[float] = []
-    target_rewards: list[float] = []
-    target_policies: list[np.ndarray] = []
-    observations_unroll: list[np.ndarray] = []
-    valid_masks_unroll: list[np.ndarray] = []
-    actions: list[int] = []
-    unroll_mask: list[float] = []
-    consistency_mask: list[float] = []
-    value_mask: list[float] = []
-
+    request = _TargetRequest(
+        trajectory,
+        pos_idx,
+        unroll_steps,
+        td_steps,
+        discount,
+        root_value_override,
+        policy_override,
+    )
+    targets = _TargetLists()
     for step in range(unroll_steps + 1):
-        idx = pos_idx + step
-        if idx < game_len:
-            target_values.append(
-                compute_target_value(
-                    trajectory,
-                    idx,
-                    td_steps,
-                    discount,
-                    root_value_override=root_value_override,
-                )
-            )
-            value_mask.append(1.0)
-        else:
-            target_values.append(0.0)
-            value_mask.append(0.0)
+        _append_target_step(targets, request, step)
+    return _target_mapping(targets, request)
 
-        if step < unroll_steps:
-            if idx < game_len:
-                actions.append(int(trajectory.actions[idx]))
-                target_rewards.append(float(trajectory.rewards[idx]))
-                unroll_mask.append(1.0)
-                consistency_mask.append(float(idx + 1 < game_len))
-            else:
-                actions.append(0)
-                target_rewards.append(0.0)
-                unroll_mask.append(0.0)
-                consistency_mask.append(0.0)
 
-        if idx < game_len:
-            if policy_override is not None and idx in policy_override:
-                target_policies.append(_validate_policy_override(trajectory, idx, policy_override[idx]))
-            else:
-                target_policies.append(trajectory.root_policies[idx])
-            observations_unroll.append(trajectory.observations[idx])
-            valid_masks_unroll.append(trajectory.valids[idx])
-        else:
-            action_size = trajectory.root_policies.shape[1]
-            target_policies.append(np.ones(action_size, dtype=np.float32) / action_size)
-            observations_unroll.append(trajectory.observations[-1])
-            valid_masks_unroll.append(trajectory.valids[-1])
+def _append_target_step(targets: _TargetLists, request: _TargetRequest, step: int) -> None:
+    position = request.pos_idx + step
+    active = position < request.trajectory.game_length
+    _append_value_target(targets, request, position, active)
+    if step < request.unroll_steps:
+        _append_transition_target(targets, request.trajectory, position, active)
+    _append_state_target(targets, request, position, active)
 
-    obs = trajectory.observations[pos_idx] if pos_idx < game_len else trajectory.observations[-1]
-    valid_mask_arr = trajectory.valids[pos_idx] if pos_idx < game_len else trajectory.valids[-1]
 
+def _append_value_target(targets: _TargetLists, request: _TargetRequest, position: int, active: bool) -> None:
+    if not active:
+        targets.values.append(0.0)
+        targets.value_mask.append(0.0)
+        return
+    targets.values.append(
+        compute_target_value(
+            request.trajectory,
+            position,
+            request.td_steps,
+            request.discount,
+            root_value_override=request.root_value_override,
+        )
+    )
+    targets.value_mask.append(1.0)
+
+
+def _append_transition_target(
+    targets: _TargetLists,
+    trajectory: Trajectory,
+    position: int,
+    active: bool,
+) -> None:
+    targets.actions.append(int(trajectory.actions[position]) if active else 0)
+    targets.rewards.append(float(trajectory.rewards[position]) if active else 0.0)
+    targets.unroll_mask.append(float(active))
+    targets.consistency_mask.append(float(active and position + 1 < trajectory.game_length))
+
+
+def _append_state_target(targets: _TargetLists, request: _TargetRequest, position: int, active: bool) -> None:
+    trajectory = request.trajectory
+    if active:
+        override = request.policy_override
+        policy = (
+            _validate_policy_override(trajectory, position, override[position])
+            if override is not None and position in override
+            else trajectory.root_policies[position]
+        )
+        targets.policies.append(policy)
+        targets.observations.append(trajectory.observations[position])
+        targets.valid_masks.append(trajectory.valids[position])
+        return
+    action_size = trajectory.root_policies.shape[1]
+    targets.policies.append(np.ones(action_size, dtype=np.float32) / action_size)
+    targets.observations.append(trajectory.observations[-1])
+    targets.valid_masks.append(trajectory.valids[-1])
+
+
+def _target_mapping(targets: _TargetLists, request: _TargetRequest) -> dict[str, Any]:
+    trajectory = request.trajectory
     return {
-        "observation": obs,
-        "valid_mask": valid_mask_arr,
-        "target_values": target_values,
-        "target_rewards": target_rewards,
-        "target_policies": target_policies,
-        "observations_unroll": observations_unroll,
-        "valid_masks_unroll": valid_masks_unroll,
-        "actions": actions,
-        "unroll_mask": unroll_mask,
-        "consistency_mask": consistency_mask,
-        "value_mask": value_mask,
+        "observation": trajectory.observations[request.pos_idx],
+        "valid_mask": trajectory.valids[request.pos_idx],
+        "target_values": targets.values,
+        "target_rewards": targets.rewards,
+        "target_policies": targets.policies,
+        "observations_unroll": targets.observations,
+        "valid_masks_unroll": targets.valid_masks,
+        "actions": targets.actions,
+        "unroll_mask": targets.unroll_mask,
+        "consistency_mask": targets.consistency_mask,
+        "value_mask": targets.value_mask,
     }
 
 
@@ -170,38 +222,34 @@ def collate_batch(
 ) -> dict[str, np.ndarray]:
     if not batch_targets:
         raise ValueError("Cannot collate an empty target batch")
-    B = len(batch_targets)
-    K = len(batch_targets[0]["actions"])
+    collated = _collate_state_targets(batch_targets)
+    collated.update(_collate_unroll_arrays(batch_targets))
+    expected_horizon = len(batch_targets[0]["actions"]) + 1
+    policies = collated["target_policies"]
+    if policies.ndim != 3 or policies.shape[:2] != (len(batch_targets), expected_horizon):
+        raise ValueError(f"Policy targets must have shape (batch, unroll + 1, actions), got {policies.shape}")
+    return collated
 
-    observations = np.stack([t["observation"] for t in batch_targets]).astype(np.float32)
-    valid_masks = np.stack([t["valid_mask"] for t in batch_targets]).astype(np.float32)
 
-    target_values = np.array([t["target_values"] for t in batch_targets], dtype=np.float32)
-    target_rewards = np.array([t["target_rewards"] for t in batch_targets], dtype=np.float32)
-    observations_unroll = np.stack([np.stack(t["observations_unroll"]) for t in batch_targets]).astype(np.float32)
-
-    policies_list = [np.stack(t["target_policies"]) for t in batch_targets]
-    target_policies = np.stack(policies_list).astype(np.float32)
-    if target_policies.ndim != 3 or target_policies.shape[:2] != (B, K + 1):
-        raise ValueError(f"Policy targets must have shape (batch, unroll + 1, actions), got {target_policies.shape}")
-
-    valid_masks_unroll = np.stack([np.stack(t["valid_masks_unroll"]) for t in batch_targets]).astype(np.float32)
-
-    actions = np.array([t["actions"] for t in batch_targets], dtype=np.int64)
-    unroll_mask = np.array([t["unroll_mask"] for t in batch_targets], dtype=np.float32)
-    consistency_mask = np.array([t["consistency_mask"] for t in batch_targets], dtype=np.float32)
-    value_mask = np.array([t["value_mask"] for t in batch_targets], dtype=np.float32)
-
+def _collate_state_targets(batch_targets: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+    policies = [np.stack(target["target_policies"]) for target in batch_targets]
+    observations = [np.stack(target["observations_unroll"]) for target in batch_targets]
+    valid_masks = [np.stack(target["valid_masks_unroll"]) for target in batch_targets]
     return {
-        "observations": observations,
-        "valid_masks": valid_masks,
-        "target_values": target_values,
-        "target_rewards": target_rewards,
-        "target_policies": target_policies,
-        "observations_unroll": observations_unroll,
-        "valid_masks_unroll": valid_masks_unroll,
-        "actions": actions,
-        "unroll_mask": unroll_mask,
-        "consistency_mask": consistency_mask,
-        "value_mask": value_mask,
+        "observations": np.stack([target["observation"] for target in batch_targets]).astype(np.float32),
+        "valid_masks": np.stack([target["valid_mask"] for target in batch_targets]).astype(np.float32),
+        "target_policies": np.stack(policies).astype(np.float32),
+        "observations_unroll": np.stack(observations).astype(np.float32),
+        "valid_masks_unroll": np.stack(valid_masks).astype(np.float32),
+    }
+
+
+def _collate_unroll_arrays(batch_targets: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+    return {
+        "target_values": np.array([target["target_values"] for target in batch_targets], dtype=np.float32),
+        "target_rewards": np.array([target["target_rewards"] for target in batch_targets], dtype=np.float32),
+        "actions": np.array([target["actions"] for target in batch_targets], dtype=np.int64),
+        "unroll_mask": np.array([target["unroll_mask"] for target in batch_targets], dtype=np.float32),
+        "consistency_mask": np.array([target["consistency_mask"] for target in batch_targets], dtype=np.float32),
+        "value_mask": np.array([target["value_mask"] for target in batch_targets], dtype=np.float32),
     }

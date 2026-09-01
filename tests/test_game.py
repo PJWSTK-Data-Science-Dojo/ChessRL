@@ -54,8 +54,6 @@ def _piece_plane(history_index: int, color: chess.Color, piece_type: chess.Piece
 
 
 class TestObservationEncoding:
-    """Verify the temporal 119-plane representation and auxiliary state."""
-
     def test_shape_dtype_range_and_initial_position(self, chess_game: ChessGame) -> None:
         board = chess_game.get_init_board()
         observation = board_to_numpy(board)
@@ -153,8 +151,6 @@ class TestObservationEncoding:
 
 
 class TestRewardPerspective:
-    """Verify exact outcomes relative to the requested player."""
-
     def test_ongoing_game_returns_none(self, chess_game: ChessGame) -> None:
         board = chess_game.get_init_board()
         assert chess_game.get_game_outcome(board, 1) is None
@@ -340,7 +336,6 @@ def test_action_encoding_with_promotions(
     expected_piece: chess.PieceType,
     chess_game: ChessGame,
 ) -> None:
-    """Action encoding roundtrip preserves from/to/promotion."""
     board = chess.Board("8/P7/8/8/8/8/8/4K2k w - - 0 1")
 
     move = chess.Move.from_uci(uci)

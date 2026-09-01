@@ -13,7 +13,6 @@ def test_batched_mcts_expansion_with_boards(
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
 ) -> None:
-    """Batched MCTS should track boards and compute valid masks for all positions."""
     nnet = LunaNetwork(chess_game, small_learner_config)
     params = MCTSParams(num_mcts_sims=3, dir_noise=False, recurrent_policy_topk=None)
     batched_mcts = BatchedMCTS(chess_game, nnet, params)
@@ -32,7 +31,6 @@ def test_batched_mcts_expansion_with_boards(
 
 
 def test_get_next_state_rejects_illegal_action(chess_game: ChessGame) -> None:
-    """Illegal actions must fail rather than corrupting action/transition pairs."""
     board = chess_game.get_init_board()
 
     with pytest.raises(ValueError, match="Illegal action"):

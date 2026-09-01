@@ -10,9 +10,7 @@ from threading import RLock
 import chess
 import numpy as np
 
-from luna.game.chess_game import ACTION_SIZE, OBS_PLANES
-
-_POLICY_SUM_ATOL = 5e-3
+from luna.trajectory import TrajectoryArrays, TrajectoryInput, TrajectoryMetadata, prepare_trajectory
 
 
 class Trajectory:
@@ -49,100 +47,41 @@ class Trajectory:
         repetition_guard_forced_fallbacks: int = 0,
         repetition_guard_excluded_actions: int = 0,
     ) -> None:
-        raw_actions = np.asarray(actions)
-        if raw_actions.ndim != 1 or raw_actions.size == 0:
-            raise ValueError("A trajectory must contain at least one one-dimensional action sequence")
-        if raw_actions.dtype.kind not in {"i", "u"}:
-            raise ValueError("Trajectory actions must be integers")
-        if np.any(raw_actions < 0) or np.any(raw_actions >= ACTION_SIZE):
-            raise ValueError(f"Trajectory actions must be in [0, {ACTION_SIZE})")
-
-        observations_array = np.ascontiguousarray(observations, dtype=np.float16)
-        actions_array = raw_actions.astype(np.int64, copy=False)
-        rewards_array = np.asarray(rewards, dtype=np.float32)
-        policies_array = np.ascontiguousarray(root_policies, dtype=np.float16)
-        values_array = np.asarray(root_values, dtype=np.float32)
-        raw_valids = np.asarray(valids)
-
-        game_length = int(actions_array.shape[0])
-        named_lengths = {
-            "observations": len(observations_array),
-            "rewards": len(rewards_array),
-            "root_policies": len(policies_array),
-            "root_values": len(values_array),
-            "valids": len(raw_valids),
-        }
-        mismatched = {name: length for name, length in named_lengths.items() if length != game_length}
-        if mismatched:
-            raise ValueError(f"Trajectory fields must all have length {game_length}; got {mismatched}")
-        expected_observation_shape = (game_length, 8, 8, OBS_PLANES)
-        if observations_array.shape != expected_observation_shape:
-            raise ValueError(
-                f"Trajectory observations must have shape {expected_observation_shape}, got {observations_array.shape}"
+        arrays, metadata = prepare_trajectory(
+            TrajectoryInput(
+                observations=observations,
+                actions=actions,
+                rewards=rewards,
+                root_policies=root_policies,
+                root_values=root_values,
+                valids=valids,
+                truncated=truncated,
+                termination=termination,
+                repetition_guard_attempts=repetition_guard_attempts,
+                repetition_guard_interventions=repetition_guard_interventions,
+                repetition_guard_forced_fallbacks=repetition_guard_forced_fallbacks,
+                repetition_guard_excluded_actions=repetition_guard_excluded_actions,
             )
-        expected_policy_shape = (game_length, ACTION_SIZE)
-        if policies_array.shape != expected_policy_shape or raw_valids.shape != expected_policy_shape:
-            raise ValueError(
-                f"Trajectory root_policies and valids must have shape {expected_policy_shape}; "
-                f"got {policies_array.shape} and {raw_valids.shape}"
-            )
-        if rewards_array.ndim != 1 or values_array.ndim != 1:
-            raise ValueError("Trajectory rewards and root values must be one-dimensional")
-        if not np.isfinite(observations_array).all():
-            raise ValueError("Trajectory observations must be finite")
-        if not np.isfinite(rewards_array).all() or not np.isfinite(values_array).all():
-            raise ValueError("Trajectory rewards and root values must be finite")
-        if not np.isfinite(policies_array).all() or np.any(policies_array < 0):
-            raise ValueError("Trajectory root policies must be finite and non-negative")
-        if raw_valids.dtype.kind not in {"b", "i", "u", "f"}:
-            raise ValueError("Trajectory valid masks must contain numeric zero/one values")
-        if not np.isfinite(raw_valids).all() or not np.all((raw_valids == 0) | (raw_valids == 1)):
-            raise ValueError("Trajectory valid masks must contain only finite zero/one values")
-        valids_array = np.ascontiguousarray(raw_valids, dtype=np.bool_)
-        if not np.all(valids_array.any(axis=1)):
-            raise ValueError("Every trajectory position must contain at least one legal action")
-        if not np.all(valids_array[np.arange(game_length), actions_array]):
-            raise ValueError("Every trajectory action must be legal in its stored position")
-        if np.any(policies_array[~valids_array] != 0):
-            raise ValueError("Trajectory root policies must assign zero probability to illegal actions")
-        policy_sums = policies_array.astype(np.float32).sum(axis=1)
-        if not np.allclose(policy_sums, 1.0, rtol=0.0, atol=_POLICY_SUM_ATOL):
-            raise ValueError("Every trajectory root policy must sum to one")
-        if not isinstance(truncated, bool | np.bool_):
-            raise ValueError("truncated must be a boolean")
-        if termination is not None and not isinstance(termination, chess.Termination):
-            raise TypeError("termination must be a chess.Termination or None")
-        if truncated and termination is not None:
-            raise ValueError("A truncated trajectory cannot have a terminal chess outcome")
-        guard_counts = {
-            "repetition_guard_attempts": repetition_guard_attempts,
-            "repetition_guard_interventions": repetition_guard_interventions,
-            "repetition_guard_forced_fallbacks": repetition_guard_forced_fallbacks,
-            "repetition_guard_excluded_actions": repetition_guard_excluded_actions,
-        }
-        for name, value in guard_counts.items():
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
-        if repetition_guard_attempts != repetition_guard_interventions + repetition_guard_forced_fallbacks:
-            raise ValueError("repetition guard attempts must equal interventions plus forced fallbacks")
-        if repetition_guard_attempts > game_length:
-            raise ValueError("repetition guard cannot be attempted more than once per trajectory position")
-        if repetition_guard_interventions > 0 and repetition_guard_excluded_actions < repetition_guard_interventions:
-            raise ValueError("each repetition guard intervention must exclude at least one action")
+        )
+        self._store_arrays(arrays)
+        self._store_metadata(metadata)
 
-        self.observations = observations_array
-        self.actions = actions_array
-        self.rewards = rewards_array
-        self.root_policies = policies_array
-        self.root_values = values_array
-        self.valids = valids_array
-        self.game_length = game_length
-        self.truncated = bool(truncated)
-        self.termination = termination
-        self.repetition_guard_attempts = repetition_guard_attempts
-        self.repetition_guard_interventions = repetition_guard_interventions
-        self.repetition_guard_forced_fallbacks = repetition_guard_forced_fallbacks
-        self.repetition_guard_excluded_actions = repetition_guard_excluded_actions
+    def _store_arrays(self, arrays: TrajectoryArrays) -> None:
+        self.observations = arrays.observations
+        self.actions = arrays.actions
+        self.rewards = arrays.rewards
+        self.root_policies = arrays.root_policies
+        self.root_values = arrays.root_values
+        self.valids = arrays.valids
+        self.game_length = arrays.game_length
+
+    def _store_metadata(self, metadata: TrajectoryMetadata) -> None:
+        self.truncated = metadata.truncated
+        self.termination = metadata.termination
+        self.repetition_guard_attempts = metadata.repetition_guard_attempts
+        self.repetition_guard_interventions = metadata.repetition_guard_interventions
+        self.repetition_guard_forced_fallbacks = metadata.repetition_guard_forced_fallbacks
+        self.repetition_guard_excluded_actions = metadata.repetition_guard_excluded_actions
 
 
 class _SumTree:
@@ -283,7 +222,7 @@ class PrioritizedReplayBuffer:
             raise ValueError("indices and td_errors must have the same length")
         with self._lock:
             raw_priorities: dict[int, float] = {}
-            for idx, err in zip(indices, errors):
+            for idx, err in zip(indices, errors, strict=True):
                 if (
                     isinstance(idx, bool | np.bool_)
                     or not isinstance(idx, int | np.integer)

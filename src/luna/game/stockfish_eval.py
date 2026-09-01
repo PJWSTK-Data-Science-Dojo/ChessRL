@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
-import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
 import chess
 import chess.engine
@@ -20,15 +17,48 @@ from luna.config import MCTSParams, TrainingRunConfig, evaluation_mcts_params
 from luna.game.arena import Arena
 from luna.game.chess_game import ChessGame
 from luna.game.player import StockfishPlayer
+from luna.game.stockfish_contract import (
+    OPENING_SUITE_VERSION,
+    EngineMatchSettings,
+    StockfishEvalOutcome,
+    StockfishEvalScores,
+    StockfishEvalSkipped,
+    StockfishEvaluationProtocol,
+    _wandb_metrics,
+    engine_binary_sha256,
+    fixed_match_settings,
+    ladder_match_settings,
+    resolve_engine_path,
+    stockfish_evaluation_protocol,
+)
 from luna.mcts import MCTS
 from luna.network import LunaNetwork
+
+__all__ = [
+    "OPENING_SUITE_VERSION",
+    "ArenaMCTSPlayer",
+    "EngineMatchSettings",
+    "StockfishEvalOutcome",
+    "StockfishEvalScores",
+    "StockfishEvalSkipped",
+    "StockfishEvaluationProtocol",
+    "_StockfishException",
+    "_score_game_for_model",
+    "_wandb_metrics",
+    "engine_binary_sha256",
+    "fixed_match_settings",
+    "ladder_match_settings",
+    "resolve_engine_path",
+    "retry_stockfish_eval",
+    "run_stockfish_eval",
+    "stockfish_evaluation_protocol",
+    "validate_ladder_configuration",
+    "validate_stockfish_configuration",
+]
 
 _WIN = 0.5
 _StockfishException = cast(type[Exception], chess.engine.EngineError)
 
-SkipReason = Literal["too_few_games", "too_many_games", "no_engine", "runtime_error"]
-
-OPENING_SUITE_VERSION = 1
 _OPENING_LINES = (
     ("e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"),
     ("e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4"),
@@ -41,26 +71,6 @@ _OPENING_LINES = (
     ("d2d4", "g8f6", "c2c4", "e7e6", "g1f3", "b7b6"),
     ("d2d4", "f7f5", "g2g3", "g8f6", "f1g2", "g7g6"),
 )
-
-
-@dataclass(frozen=True)
-class StockfishEvalScores:
-    """Finished Stockfish benchmark (alternating colors)."""
-
-    model_wins: int
-    draws: int
-    stockfish_wins: int
-
-
-@dataclass(frozen=True)
-class StockfishEvalSkipped:
-    """Benchmark did not run or aborted."""
-
-    reason: SkipReason
-    message: str = ""
-
-
-StockfishEvalOutcome = StockfishEvalScores | StockfishEvalSkipped
 
 
 def retry_stockfish_eval(
@@ -93,137 +103,6 @@ def retry_stockfish_eval(
             time.sleep(retry_seconds)
         outcome = evaluate()
     return outcome
-
-
-@dataclass(frozen=True)
-class EngineMatchSettings:
-    """Complete external-engine contract for one balanced match."""
-
-    opponent_name: str
-    games: int
-    elo: int
-    depth: int
-    path: str | None
-    max_ply: int | None
-
-
-@dataclass(frozen=True)
-class StockfishEvaluationProtocol:
-    """Settings that must stay fixed when comparing external scores."""
-
-    opening_suite_version: int
-    games: int
-    stockfish_elo: int
-    stockfish_depth: int
-    stockfish_path: str | None
-    stockfish_binary_sha256: str
-    max_ply: int | None
-    mcts: MCTSParams
-
-
-def _score_interval(scores: StockfishEvalScores) -> tuple[float, float]:
-    """Approximate a 95% Wilson interval with draws treated as half a point."""
-    total = scores.model_wins + scores.draws + scores.stockfish_wins
-    if total <= 0:
-        return 0.0, 1.0
-    score = (scores.model_wins + 0.5 * scores.draws) / total
-    z = 1.959963984540054
-    denominator = 1.0 + z * z / total
-    center = (score + z * z / (2.0 * total)) / denominator
-    margin = z * math.sqrt((score * (1.0 - score) + z * z / (4.0 * total)) / total) / denominator
-    return max(0.0, center - margin), min(1.0, center + margin)
-
-
-def _wandb_metrics(
-    scores: StockfishEvalScores,
-    iteration: int | None,
-    *,
-    prefix: str = "benchmark",
-    opponent_elo: int | None = None,
-    duration_seconds: float | None = None,
-) -> dict[str, float | int]:
-    total = scores.model_wins + scores.draws + scores.stockfish_wins
-    win_rate = scores.model_wins / total if total else 0.0
-    score = (scores.model_wins + 0.5 * scores.draws) / total if total else 0.0
-    decisive_games = scores.model_wins + scores.stockfish_wins
-    decisive_win_rate = scores.model_wins / decisive_games if decisive_games else 0.0
-    ci_low, ci_high = _score_interval(scores)
-    metrics: dict[str, float | int] = {
-        f"{prefix}/luna_wins": scores.model_wins,
-        f"{prefix}/draws": scores.draws,
-        f"{prefix}/stockfish_wins": scores.stockfish_wins,
-        f"{prefix}/games": total,
-        f"{prefix}/win_rate": win_rate,
-        f"{prefix}/decisive_win_rate": decisive_win_rate,
-        f"{prefix}/score": score,
-        f"{prefix}/score_approx_ci95_low": ci_low,
-        f"{prefix}/score_approx_ci95_high": ci_high,
-        f"{prefix}/opening_suite_version": OPENING_SUITE_VERSION,
-    }
-    if opponent_elo is not None:
-        metrics[f"{prefix}/opponent_elo"] = opponent_elo
-    if duration_seconds is not None:
-        metrics[f"{prefix}/duration_seconds"] = duration_seconds
-    if iteration is not None:
-        metrics["iteration"] = iteration
-    return metrics
-
-
-def resolve_engine_path(path: str | None) -> Path:
-    """Resolve an explicit or PATH-discovered engine executable."""
-    command = path if path is not None else "stockfish"
-    discovered = shutil.which(command)
-    resolved = Path(discovered if discovered is not None else command).expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"External engine executable not found: {resolved}")
-    return resolved
-
-
-def engine_binary_sha256(path: str | None) -> str:
-    """Hash the exact external-engine binary used by an evaluation contract."""
-    digest = hashlib.sha256()
-    with resolve_engine_path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def fixed_match_settings(run: TrainingRunConfig) -> EngineMatchSettings:
-    """Build the immutable official-Stockfish benchmark settings."""
-    return EngineMatchSettings(
-        opponent_name="Stockfish",
-        games=run.stockfish_eval_games,
-        elo=run.stockfish_elo,
-        depth=run.stockfish_depth,
-        path=run.stockfish_path,
-        max_ply=run.stockfish_eval_max_ply,
-    )
-
-
-def ladder_match_settings(run: TrainingRunConfig, elo: int) -> EngineMatchSettings:
-    """Build one Fairy-Stockfish ladder-rung contract."""
-    return EngineMatchSettings(
-        opponent_name="Fairy-Stockfish",
-        games=run.ladder_eval_games,
-        elo=elo,
-        depth=run.ladder_depth,
-        path=run.ladder_path,
-        max_ply=run.ladder_eval_max_ply,
-    )
-
-
-def stockfish_evaluation_protocol(run: TrainingRunConfig) -> StockfishEvaluationProtocol:
-    """Capture the comparable external-evaluation contract."""
-    return StockfishEvaluationProtocol(
-        opening_suite_version=OPENING_SUITE_VERSION,
-        games=run.stockfish_eval_games,
-        stockfish_elo=run.stockfish_elo,
-        stockfish_depth=run.stockfish_depth,
-        stockfish_path=run.stockfish_path,
-        stockfish_binary_sha256=engine_binary_sha256(run.stockfish_path),
-        max_ply=run.stockfish_eval_max_ply,
-        mcts=evaluation_mcts_params(run),
-    )
 
 
 def _stockfish_player(settings: EngineMatchSettings) -> StockfishPlayer:
@@ -260,10 +139,10 @@ def _validate_engine_settings(settings: EngineMatchSettings, *, require_fairy: b
             raise ValueError(f"Fixed benchmark requires official Stockfish, but the binary reports {engine_name!r}")
         elo_range = player.elo_range
         player.play(chess.Board())
-    except Exception as exc:
+    except (chess.engine.EngineError, OSError, TimeoutError, RuntimeError, ValueError) as exc:
         try:
             player.close()
-        except Exception as cleanup_exc:
+        except (chess.engine.EngineError, OSError, TimeoutError, RuntimeError) as cleanup_exc:
             exc.add_note(f"External-engine preflight cleanup also failed: {cleanup_exc}")
         raise
     player.close()
@@ -320,6 +199,155 @@ def _score_game_for_model(arena_result: float, model_is_player1: bool) -> str:
     return "draw"
 
 
+@dataclass(slots=True)
+class _ScoreTally:
+    model_wins: int = 0
+    draws: int = 0
+    stockfish_wins: int = 0
+
+    def record(self, outcome: str) -> None:
+        if outcome == "model":
+            self.model_wins += 1
+        elif outcome == "sf":
+            self.stockfish_wins += 1
+        else:
+            self.draws += 1
+
+    def scores(self) -> StockfishEvalScores:
+        return StockfishEvalScores(self.model_wins, self.draws, self.stockfish_wins)
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchContext:
+    game: ChessGame
+    model_player: Callable[[chess.Board], int]
+    stockfish: StockfishPlayer
+    max_ply: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _EvaluationReport:
+    match: EngineMatchSettings
+    scores: StockfishEvalScores
+    mcts_params: MCTSParams
+    game_count: int
+    iteration: int | None
+    metric_prefix: str | None
+    started_at: float
+
+
+def _balanced_game_count(requested_games: int) -> int | StockfishEvalSkipped:
+    if requested_games < 1:
+        logger.warning("External-engine games < 1; skipping evaluation.")
+        return StockfishEvalSkipped("too_few_games", "evaluation games < 1")
+    game_count = requested_games
+    if game_count % 2 == 1:
+        game_count -= 1
+        logger.warning("External-engine game count was odd; using {} games for balanced colors.", game_count)
+    if game_count < 2:
+        logger.warning("stockfish_eval_games < 2 after rounding; skipping Stockfish eval.")
+        return StockfishEvalSkipped(
+            "too_few_games",
+            "need at least 2 games after rounding to an even count",
+        )
+    return game_count
+
+
+def _openings_for_match(game_count: int) -> list[chess.Board] | StockfishEvalSkipped:
+    try:
+        return _evaluation_openings(game_count // 2)
+    except ValueError as exc:
+        logger.warning("Stockfish eval skipped (opening suite): {}", exc)
+        return StockfishEvalSkipped("too_many_games", str(exc))
+
+
+def _open_stockfish(match: EngineMatchSettings) -> StockfishPlayer | StockfishEvalSkipped:
+    try:
+        return _stockfish_player(match)
+    except (OSError, ImportError, ValueError, RuntimeError, _StockfishException) as exc:
+        logger.warning("Stockfish eval skipped (engine): {}", exc)
+        return StockfishEvalSkipped("no_engine", str(exc))
+
+
+def _play_match(
+    context: _MatchContext,
+    openings: list[chess.Board],
+) -> StockfishEvalOutcome:
+    tally = _ScoreTally()
+    runtime_failure: StockfishEvalSkipped | None = None
+    close_failure: str | None = None
+    try:
+        for opening in openings:
+            _play_opening_pair(context, opening, tally)
+    except (OSError, ValueError, RuntimeError, _StockfishException) as exc:
+        logger.exception("Stockfish eval aborted during games")
+        runtime_failure = StockfishEvalSkipped("runtime_error", str(exc))
+    finally:
+        try:
+            context.stockfish.close()
+        except (OSError, ValueError, RuntimeError, _StockfishException) as exc:
+            close_failure = str(exc)
+    return _resolve_match_outcome(tally, runtime_failure, close_failure)
+
+
+def _play_opening_pair(
+    context: _MatchContext,
+    opening: chess.Board,
+    tally: _ScoreTally,
+) -> None:
+    for model_is_player1 in (True, False):
+        context.stockfish.new_game()
+        if model_is_player1:
+            arena = Arena(context.model_player, context.stockfish.play, context.game)
+        else:
+            arena = Arena(context.stockfish.play, context.model_player, context.game)
+        result = arena.play_game(verbose=False, max_ply=context.max_ply, initial_board=opening)
+        tally.record(_score_game_for_model(result, model_is_player1))
+
+
+def _resolve_match_outcome(
+    tally: _ScoreTally,
+    runtime_failure: StockfishEvalSkipped | None,
+    close_failure: str | None,
+) -> StockfishEvalOutcome:
+    if runtime_failure is not None:
+        if close_failure is not None:
+            logger.warning("Stockfish cleanup also failed after the benchmark error: {}", close_failure)
+        return runtime_failure
+    if close_failure is not None:
+        logger.error("Stockfish eval cleanup failed: {}", close_failure)
+        return StockfishEvalSkipped("runtime_error", f"failed to close Stockfish: {close_failure}")
+    return tally.scores()
+
+
+def _report_completed_evaluation(report: _EvaluationReport) -> None:
+    iteration_suffix = f" (iter {report.iteration})" if report.iteration is not None else ""
+    logger.info(
+        "{} eval{}: Luna {} — {} — {} {} | MCTS sims={} opponent elo={} depth={} games={} openings=v{}",
+        report.match.opponent_name,
+        iteration_suffix,
+        report.scores.model_wins,
+        report.scores.draws,
+        report.scores.stockfish_wins,
+        report.match.opponent_name,
+        report.mcts_params.num_mcts_sims,
+        report.match.elo,
+        report.match.depth,
+        report.game_count,
+        OPENING_SUITE_VERSION,
+    )
+    if wandb.run is not None and report.metric_prefix is not None:
+        wandb.log(
+            _wandb_metrics(
+                report.scores,
+                report.iteration,
+                prefix=report.metric_prefix,
+                opponent_elo=report.match.elo,
+                duration_seconds=time.perf_counter() - report.started_at,
+            )
+        )
+
+
 def run_stockfish_eval(
     game: ChessGame,
     nnet: LunaNetwork,
@@ -332,96 +360,29 @@ def run_stockfish_eval(
     """Run a balanced UCI-engine match or report an expected engine failure."""
     match = settings if settings is not None else fixed_match_settings(run)
     started_at = time.perf_counter()
-    n_games = match.games
-    if n_games < 1:
-        logger.warning("External-engine games < 1; skipping evaluation.")
-        return StockfishEvalSkipped("too_few_games", "evaluation games < 1")
-    if n_games % 2 == 1:
-        n_games -= 1
-        logger.warning("External-engine game count was odd; using {} games for balanced colors.", n_games)
-    if n_games < 2:
-        logger.warning("stockfish_eval_games < 2 after rounding; skipping Stockfish eval.")
-        return StockfishEvalSkipped(
-            "too_few_games",
-            "need at least 2 games after rounding to an even count",
-        )
-    try:
-        openings = _evaluation_openings(n_games // 2)
-    except ValueError as exc:
-        logger.warning("Stockfish eval skipped (opening suite): {}", exc)
-        return StockfishEvalSkipped("too_many_games", str(exc))
-
+    game_count = _balanced_game_count(match.games)
+    if isinstance(game_count, StockfishEvalSkipped):
+        return game_count
+    openings = _openings_for_match(game_count)
+    if isinstance(openings, StockfishEvalSkipped):
+        return openings
     mcts_params = evaluation_mcts_params(run)
     model_player = ArenaMCTSPlayer(game, nnet, mcts_params)
-    max_ply = match.max_ply
-
-    try:
-        sf = _stockfish_player(match)
-    except (OSError, ImportError, ValueError, RuntimeError, _StockfishException) as exc:
-        logger.warning("Stockfish eval skipped (engine): {}", exc)
-        return StockfishEvalSkipped("no_engine", str(exc))
-
-    mw = dr = sw = 0
-    runtime_failure: StockfishEvalSkipped | None = None
-    close_failure: str | None = None
-    try:
-        for opening in openings:
-            for model_is_p1 in (True, False):
-                sf.new_game()
-                if model_is_p1:
-                    arena = Arena(model_player, sf.play, game)
-                else:
-                    arena = Arena(sf.play, model_player, game)
-                r = arena.play_game(verbose=False, max_ply=max_ply, initial_board=opening)
-                out = _score_game_for_model(r, model_is_p1)
-                if out == "model":
-                    mw += 1
-                elif out == "sf":
-                    sw += 1
-                else:
-                    dr += 1
-    except (OSError, ValueError, RuntimeError, _StockfishException) as exc:
-        logger.exception("Stockfish eval aborted during games")
-        runtime_failure = StockfishEvalSkipped("runtime_error", str(exc))
-    finally:
-        try:
-            sf.close()
-        except (OSError, ValueError, RuntimeError, _StockfishException) as exc:
-            close_failure = str(exc)
-
-    if runtime_failure is not None:
-        if close_failure is not None:
-            logger.warning("Stockfish cleanup also failed after the benchmark error: {}", close_failure)
-        return runtime_failure
-    if close_failure is not None:
-        logger.error("Stockfish eval cleanup failed: {}", close_failure)
-        return StockfishEvalSkipped("runtime_error", f"failed to close Stockfish: {close_failure}")
-
-    scores = StockfishEvalScores(model_wins=mw, draws=dr, stockfish_wins=sw)
-    iter_suffix = f" (iter {iteration})" if iteration is not None else ""
-    logger.info(
-        "{} eval{}: Luna {} — {} — {} {} | MCTS sims={} opponent elo={} depth={} games={} openings=v{}",
-        match.opponent_name,
-        iter_suffix,
-        mw,
-        dr,
-        sw,
-        match.opponent_name,
-        mcts_params.num_mcts_sims,
-        match.elo,
-        match.depth,
-        n_games,
-        OPENING_SUITE_VERSION,
-    )
-    if wandb.run is not None and metric_prefix is not None:
-        wandb.log(
-            _wandb_metrics(
-                scores,
-                iteration,
-                prefix=metric_prefix,
-                opponent_elo=match.elo,
-                duration_seconds=time.perf_counter() - started_at,
-            )
+    stockfish = _open_stockfish(match)
+    if isinstance(stockfish, StockfishEvalSkipped):
+        return stockfish
+    outcome = _play_match(_MatchContext(game, model_player, stockfish, match.max_ply), openings)
+    if isinstance(outcome, StockfishEvalSkipped):
+        return outcome
+    _report_completed_evaluation(
+        _EvaluationReport(
+            match,
+            outcome,
+            mcts_params,
+            game_count,
+            iteration,
+            metric_prefix,
+            started_at,
         )
-
-    return scores
+    )
+    return outcome

@@ -51,39 +51,41 @@ class Arena:
                 return 0.0
             turn_count += 1
             if verbose:
-                if self.display is None:
-                    raise ValueError("display callback required for verbose mode")
-                logger.info("Turn {} Player {}", turn_count, current_player)
-                self.display(board)
+                self._show_position(board, f"Turn {turn_count} Player {current_player}")
             canonical_board = self.game.get_canonical_form(board, current_player)
-            raw_action = players[current_player](canonical_board)
-            if isinstance(raw_action, bool):
-                raise ValueError(f"Player returned a non-integer action: {raw_action!r}")
-            try:
-                action = index(raw_action)
-            except TypeError as exc:
-                raise ValueError(f"Player returned a non-integer action: {raw_action!r}") from exc
-
-            valids = self.game.get_valid_moves(canonical_board, 1)
-
-            if not 0 <= action < len(valids) or valids[action] == 0:
-                logger.error("Action {} is not valid!", action)
-                logger.debug("valids = {}", valids)
-                raise ValueError(f"Action {action} is not valid")
+            action = self._player_action(players[current_player], canonical_board)
+            self._validate_action(canonical_board, action)
             current_player = self.game.push_action(board, current_player, action)
         if verbose:
-            if self.display is None:
-                raise ValueError("display callback required for verbose mode")
-            logger.info(
-                "Game over: Turn {} Result {}",
-                turn_count,
-                self.game.get_game_outcome(board, 1),
-            )
-            self.display(board)
+            self._show_position(board, f"Game over: Turn {turn_count} Result {self.game.get_game_outcome(board, 1)}")
         outcome = self.game.get_game_outcome(board, current_player)
         if outcome is None:
             raise RuntimeError("Arena stopped before reaching a terminal position")
         return current_player * outcome
+
+    @staticmethod
+    def _player_action(player: Callable[..., Any], board: chess.Board) -> int:
+        raw_action = player(board)
+        if isinstance(raw_action, bool):
+            raise ValueError(f"Player returned a non-integer action: {raw_action!r}")
+        try:
+            return index(raw_action)
+        except TypeError as exc:
+            raise ValueError(f"Player returned a non-integer action: {raw_action!r}") from exc
+
+    def _validate_action(self, board: chess.Board, action: int) -> None:
+        valids = self.game.get_valid_moves(board, 1)
+        if 0 <= action < len(valids) and valids[action] != 0:
+            return
+        logger.error("Action {} is not valid!", action)
+        logger.debug("valids = {}", valids)
+        raise ValueError(f"Action {action} is not valid")
+
+    def _show_position(self, board: chess.Board, message: str) -> None:
+        if self.display is None:
+            raise ValueError("display callback required for verbose mode")
+        logger.info("{}", message)
+        self.display(board)
 
     @staticmethod
     def _classify_result(result: float) -> int:

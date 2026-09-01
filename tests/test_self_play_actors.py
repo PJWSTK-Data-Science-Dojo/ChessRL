@@ -113,7 +113,7 @@ def test_streamed_actor_collection_rejects_missing_trajectory() -> None:
         child_connection.send(_ActorTrajectory(0, 3, 1, _trajectory_with_action(20)))
         child_connection.send(_ActorCollectionDone(0, 3, 2))
 
-        with pytest.raises(SelfPlayActorError, match="missing trajectory indices: \\[0\\]"):
+        with pytest.raises(SelfPlayActorError, match=r"missing trajectory indices: \[0\]"):
             pool._receive_collection_blocking(0, episode_count=2, generation=3)
     finally:
         parent_connection.close()
@@ -150,7 +150,7 @@ def test_coach_owns_actor_pool_for_the_complete_training_loop(tmp_path: Path) ->
     coach = Coach(game, network, run, seed=31)
 
     with (
-        patch("luna.coach.SelfPlayActorPool") as actor_pool_type,
+        patch("luna.coach_training.SelfPlayActorPool") as actor_pool_type,
         patch.object(coach, "_learn_iterations") as learn_iterations,
     ):
         actor_pool = actor_pool_type.return_value.__enter__.return_value
