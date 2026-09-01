@@ -17,15 +17,14 @@ from luna.config import EzV2LearnerConfig
 from luna.network import LunaNetwork
 from luna.pgn_dataset import PgnDataset, PgnDatasetConfig, PgnDatasetStats
 from luna.pgn_pretraining import (
-    PgnPretrainingConfig,
     _resume_seed,
     evaluate_validation,
     run_pgn_pretraining,
-    validate_pretraining_config,
 )
 from luna.pgn_pretraining_checkpoints import (
     CHECKPOINT_METADATA_KEY,
 )
+from luna.pgn_pretraining_config import PgnPretrainingConfig, validate_pretraining_config
 from luna.pgn_pretraining_validation import ValidationPlan
 from luna.replay_buffer import Trajectory
 
@@ -299,6 +298,40 @@ def test_completed_numbered_resume_republishes_latest_alias(
     assert [name for name, _metadata in network.saved] == ["latest.pth.tar"]
 
 
+def test_resume_rejoins_the_next_absolute_checkpoint_boundary(
+    tmp_path: Path,
+    make_trajectory: Callable[[int], Trajectory],
+) -> None:
+    config = _config(tmp_path)
+    output = config.output_dir
+    output.mkdir()
+    numbered = output / "pretrain_step_00000003.pth.tar"
+    _write_checkpoint(numbered, 3, {})
+    resumed = replace(
+        config,
+        source_checkpoint=None,
+        resume_checkpoint=output / "latest.pth.tar",
+        wandb_resume="allow",
+    )
+    network = _FakeNetwork(resume_step=3)
+
+    with (
+        patch("luna.pgn_pretraining.load_pgn_dataset", return_value=_dataset(make_trajectory(2))),
+        patch("luna.pgn_pretraining.LunaNetwork", return_value=network),
+        patch("luna.pgn_pretraining.validate_resume_contract"),
+        patch("luna.pgn_pretraining.wandb.run", None),
+    ):
+        run_pgn_pretraining(resumed)
+
+    assert network.train_requests == [(1, 5), (1, 5)]
+    assert [name for name, _metadata in network.saved] == [
+        "pretrain_step_00000004.pth.tar",
+        "latest.pth.tar",
+        "pretrain_step_00000005.pth.tar",
+        "latest.pth.tar",
+    ]
+
+
 def test_resume_seed_changes_with_training_progress() -> None:
     assert _resume_seed(0, 1_000) == _resume_seed(0, 1_000)
     assert _resume_seed(0, 1_000) != _resume_seed(0, 2_000)
@@ -329,6 +362,7 @@ def test_makefile_pins_restart_safe_pgn_experiments() -> None:
     expected_contract = (
         "714d0eb99f99fca8d791142038b6c59b5ca6a51b3339bd3891a92f4bdffcbf0c",
         "pretrain-pgn:",
+        "state-anchor-v3/best.pth.tar",
         "eval-pgn-warmstart:",
         "train-pgn-warmstart:",
         "--checkpoint-top-k 10",
@@ -337,9 +371,8 @@ def test_makefile_pins_restart_safe_pgn_experiments() -> None:
         "--learner.dataloader-workers 4",
         "luna-balanced-pgn-pretrain-v1",
         "luna-balanced-ezv2-pgn-warmstart-v1",
-        "wandb_resume=never",
-        "wandb_resume=must",
-        "--wandb-resume must",
-        "--wandb-resume never",
+        "--wandb-resume allow",
+        'dirname -- "$$selected_checkpoint"',
+        'basename -- "$$selected_checkpoint"',
     )
     assert all(fragment in makefile for fragment in expected_contract)

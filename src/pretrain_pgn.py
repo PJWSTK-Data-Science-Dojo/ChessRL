@@ -9,7 +9,8 @@ import tyro
 from loguru import logger
 
 from luna.network import RepresentationCollapseError
-from luna.pgn_pretraining import PgnPretrainingConfig, run_pgn_pretraining
+from luna.pgn_pretraining import run_pgn_pretraining
+from luna.pgn_pretraining_config import PgnPretrainingConfig
 
 
 def _configure_logging(level: str = "INFO") -> None:

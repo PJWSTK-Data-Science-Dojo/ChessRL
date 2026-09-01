@@ -33,6 +33,7 @@ class CheckpointPublication:
     output: Path
     keep: int
     metadata: dict[str, object]
+    protected_step_interval: int | None = None
 
 
 def pretraining_resume_exists(requested: Path, output_dir: Path) -> bool:
@@ -87,7 +88,7 @@ def publish_pretraining_checkpoints(
     if not numbered.exists():
         network.save_checkpoint(str(resolved_output), numbered.name, extra_state=extra_state)
     network.save_checkpoint(str(resolved_output), "latest.pth.tar", extra_state=extra_state)
-    _prune_numbered_checkpoints(resolved_output, publication.keep)
+    _prune_numbered_checkpoints(resolved_output, publication)
 
 
 def _checkpoint_step(path: Path) -> int:
@@ -118,11 +119,17 @@ def _checkpoint_payload(path: Path) -> Mapping[str, object]:
     return payload
 
 
-def _prune_numbered_checkpoints(output: Path, keep: int) -> None:
+def _prune_numbered_checkpoints(output: Path, publication: CheckpointPublication) -> None:
     checkpoints = sorted(
         output.glob(f"{CHECKPOINT_PREFIX}*.pth.tar"),
         key=_numbered_checkpoint_step,
         reverse=True,
     )
-    for checkpoint in checkpoints[keep:]:
+    recoveries = [checkpoint for checkpoint in checkpoints if not _is_protected(checkpoint, publication)]
+    for checkpoint in recoveries[publication.keep :]:
         checkpoint.unlink()
+
+
+def _is_protected(checkpoint: Path, publication: CheckpointPublication) -> bool:
+    interval = publication.protected_step_interval
+    return interval is not None and _numbered_checkpoint_step(checkpoint) % interval == 0

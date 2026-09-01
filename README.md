@@ -127,11 +127,12 @@ make pretrain-pgn
 ```
 
 `src/pretrain_pgn.py` is the typed CLI behind `make pretrain-pgn`. A fresh invocation uses
-the current state-anchor checkpoint as weights-only input; a repeated invocation recovers
+the current state-anchor `best.pth.tar` as weights-only input; a repeated invocation recovers
 the newest healthy immutable PGN checkpoint, including when `latest.pth.tar` is missing or
 corrupt. Both paths use the explicit W&B ID `luna-balanced-pgn-pretrain-v1`, which is also
-part of the resume contract. Fresh runs use W&B `resume=never`; checkpoint resumes use
-`resume=must`, so neither path can silently create or join an unrelated dashboard.
+part of the resume contract. Both use W&B's documented `resume=allow` behavior with that
+fixed ID, closing the crash window between remote run creation and the first local
+checkpoint; the local resume contract rejects a changed dataset, seed, or W&B identity.
 
 The ten 1,000-step milestones are retained because supervised validation is not a chess
 strength measurement. Benchmark at least the 2k, 5k, and 10k milestones with the same

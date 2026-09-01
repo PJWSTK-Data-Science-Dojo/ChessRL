@@ -16,7 +16,7 @@ PGN_DATA_FILE ?= lichess_db_broadcast_2026-07.pgn.zst
 PGN_DATA_PATH ?= $(PGN_DATA_DIR)/$(PGN_DATA_FILE)
 PGN_DATA_URL ?= https://database.lichess.org/broadcast/$(PGN_DATA_FILE)
 PGN_DATA_SHA256 ?= 714d0eb99f99fca8d791142038b6c59b5ca6a51b3339bd3891a92f4bdffcbf0c
-PGN_SOURCE_CHECKPOINT ?= ./runs/luna-balanced-ezv2-state-anchor-v3/latest.pth.tar
+PGN_SOURCE_CHECKPOINT ?= ./runs/luna-balanced-ezv2-state-anchor-v3/best.pth.tar
 PGN_PRETRAIN_CHECKPOINT_DIR ?= ./runs/luna-balanced-pgn-pretrain-v1
 PGN_PRETRAIN_WANDB_RUN_ID ?= luna-balanced-pgn-pretrain-v1
 PGN_PRETRAIN_WANDB_RUN_NAME ?= Luna Balanced · Expert PGN Pretrain v1
@@ -233,11 +233,9 @@ pretrain-pgn: _train-env-preflight verify-pgn-data
 	@if test -f "$(PGN_PRETRAIN_CHECKPOINT_DIR)/latest.pth.tar" || \
 		find "$(PGN_PRETRAIN_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'pretrain_step_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
 		set -- --resume-checkpoint "$(PGN_PRETRAIN_CHECKPOINT_DIR)/latest.pth.tar"; \
-		wandb_resume=must; \
 	else \
 		test -f "$(PGN_SOURCE_CHECKPOINT)" || { echo "PGN source checkpoint not found: $(PGN_SOURCE_CHECKPOINT)" >&2; exit 2; }; \
 		set -- --source-checkpoint "$(PGN_SOURCE_CHECKPOINT)"; \
-		wandb_resume=never; \
 	fi; \
 	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/pretrain_pgn.py \
 		--dataset-path "$(PGN_DATA_PATH)" \
@@ -255,7 +253,7 @@ pretrain-pgn: _train-env-preflight verify-pgn-data
 		--wandb-project "$(WANDB_PROJECT)" \
 		--wandb-run-id "$(PGN_PRETRAIN_WANDB_RUN_ID)" \
 		--wandb-run-name "$(PGN_PRETRAIN_WANDB_RUN_NAME)" \
-		--wandb-resume "$$wandb_resume" \
+		--wandb-resume allow \
 		$(ARGS)
 
 # Benchmarks one immutable PGN milestone at the first real Fairy-Stockfish Elo.
@@ -284,14 +282,17 @@ train-pgn-warmstart: _train-env-preflight _fairy-stockfish-preflight
 	@if test -f "$(PGN_RL_CHECKPOINT_DIR)/latest.pth.tar" || \
 		find "$(PGN_RL_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'checkpoint_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
 		$(MAKE) resume CHECKPOINT_DIR="$(PGN_RL_CHECKPOINT_DIR)" \
-			TRAIN_ARGS='--wandb-project "$(WANDB_PROJECT)" --wandb-run-id "$(PGN_RL_WANDB_RUN_ID)" --wandb-run-name "$(PGN_RL_WANDB_RUN_NAME)" --wandb-resume must'; \
+			TRAIN_ARGS='--wandb-project "$(WANDB_PROJECT)" --wandb-run-id "$(PGN_RL_WANDB_RUN_ID)" --wandb-run-name "$(PGN_RL_WANDB_RUN_NAME)" --wandb-resume allow'; \
 	else \
 		test -n "$(PGN_SELECTED_CHECKPOINT)" || { \
 			echo "PGN_SELECTED_CHECKPOINT must name a benchmarked immutable checkpoint" >&2; exit 2; }; \
 		test -f "$(PGN_SELECTED_CHECKPOINT)" || { \
 			echo "Selected PGN checkpoint not found: $(PGN_SELECTED_CHECKPOINT)" >&2; exit 2; }; \
+		selected_checkpoint="$(PGN_SELECTED_CHECKPOINT)"; \
+		source_dir="$$(dirname -- "$$selected_checkpoint")"; \
+		source_file="$$(basename -- "$$selected_checkpoint")"; \
 		$(MAKE) train CHECKPOINT_DIR="$(PGN_RL_CHECKPOINT_DIR)" \
-			TRAIN_ARGS='--new-training-phase --load-checkpoint-dir "$(dir $(PGN_SELECTED_CHECKPOINT))" --load-checkpoint-file "$(notdir $(PGN_SELECTED_CHECKPOINT))" --wandb-project "$(WANDB_PROJECT)" --wandb-run-id "$(PGN_RL_WANDB_RUN_ID)" --wandb-run-name "$(PGN_RL_WANDB_RUN_NAME)" --wandb-resume never'; \
+			TRAIN_ARGS="--new-training-phase --load-checkpoint-dir \"$$source_dir\" --load-checkpoint-file \"$$source_file\" --wandb-project \"$(WANDB_PROJECT)\" --wandb-run-id \"$(PGN_RL_WANDB_RUN_ID)\" --wandb-run-name \"$(PGN_RL_WANDB_RUN_NAME)\" --wandb-resume allow"; \
 	fi
 
 _train-env-preflight:

@@ -112,3 +112,24 @@ def test_checkpoint_publication_retains_only_configured_numbered_snapshots(tmp_p
         "pretrain_step_00000005.pth.tar",
     ]
     assert (tmp_path / "latest.pth.tar").is_file()
+
+
+def test_checkpoint_publication_never_prunes_absolute_training_milestones(tmp_path: Path) -> None:
+    for step in (1_000, 1_250, 2_000, 2_250):
+        _write_checkpoint(tmp_path / f"pretrain_step_{step:08d}.pth.tar", step)
+    network = _WritingCheckpointNetwork(global_step=2_500)
+    publication = CheckpointPublication(
+        tmp_path,
+        keep=1,
+        metadata={},
+        protected_step_interval=1_000,
+    )
+
+    publish_pretraining_checkpoints(network, publication)
+
+    numbered = sorted(path.name for path in tmp_path.glob("pretrain_step_*.pth.tar"))
+    assert numbered == [
+        "pretrain_step_00001000.pth.tar",
+        "pretrain_step_00002000.pth.tar",
+        "pretrain_step_00002500.pth.tar",
+    ]
