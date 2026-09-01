@@ -184,7 +184,6 @@ train:
 		--learner.grad-clip-norm 5 \
 		--learner.recurrent-gradient-scale 0.5 \
 		--learner.dataloader-workers 4 \
-		--learner.compile-inference \
 		--learner.compile-training \
 		--learner.reanalyze-mcts-sims 0 \
 		--learner.reanalyze-prob 0.0 \
