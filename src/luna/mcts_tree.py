@@ -144,6 +144,11 @@ def _validate_search(params: MCTSParams, num_sims: int, temp: float) -> None:
             raise ValueError("gumbel_value_scale must be non-negative")
         if params.gumbel_maxvisit_init < 0:
             raise ValueError("gumbel_maxvisit_init must be non-negative")
+    visit_limit = params.search_contempt_visit_limit
+    if visit_limit is not None and (
+        isinstance(visit_limit, bool) or not isinstance(visit_limit, int) or visit_limit <= 0
+    ):
+        raise ValueError("search_contempt_visit_limit must be a positive integer when enabled")
 
 
 def _visit_count_policy(counts: np.ndarray, temp: float) -> np.ndarray:

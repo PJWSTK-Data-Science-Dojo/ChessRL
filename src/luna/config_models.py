@@ -65,6 +65,9 @@ class MCTSParams:
     recurrent_policy_topk: int | None = 256
     """Host-transfer width for recurrent policies; legal actions are always retained."""
 
+    search_contempt_visit_limit: int | None = None
+    """Freeze and sample opponent-node visits after this limit; ``None`` disables Search-contempt."""
+
 
 @dataclass
 class TrainingRunConfig(MCTSParams):
@@ -225,6 +228,7 @@ def evaluation_mcts_params(run: TrainingRunConfig) -> MCTSParams:
         dir_fraction=run.dir_fraction,
         discount=run.discount,
         recurrent_policy_topk=run.recurrent_policy_topk,
+        search_contempt_visit_limit=None,
     )
 
 

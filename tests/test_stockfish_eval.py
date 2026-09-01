@@ -1,5 +1,6 @@
 """Tests for Stockfish benchmark helpers."""
 
+from dataclasses import asdict
 from unittest.mock import patch
 
 import chess
@@ -16,6 +17,7 @@ from luna.game.stockfish_eval import (
     _wandb_metrics,
     retry_stockfish_eval,
     run_stockfish_eval,
+    stockfish_evaluation_protocol,
 )
 from luna.network import LunaNetwork
 
@@ -232,11 +234,26 @@ class TestRunStockfishEval:
 
 
 def test_evaluation_mcts_params_matches_run() -> None:
-    run = TrainingRunConfig(num_mcts_sims=40, evaluation_num_mcts_sims=7, dir_noise=True, recurrent_policy_topk=128)
+    run = TrainingRunConfig(
+        num_mcts_sims=40,
+        evaluation_num_mcts_sims=7,
+        dir_noise=True,
+        recurrent_policy_topk=128,
+        search_contempt_visit_limit=4,
+    )
     p = evaluation_mcts_params(run)
     assert p.num_mcts_sims == 7
     assert p.dir_noise is False
     assert p.recurrent_policy_topk == 128
+    assert p.search_contempt_visit_limit is None
+
+
+def test_self_play_search_contempt_is_absent_from_evaluation_protocol() -> None:
+    run = TrainingRunConfig(search_contempt_visit_limit=4, stockfish_path="/bin/true")
+
+    protocol = asdict(stockfish_evaluation_protocol(run))
+
+    assert "search_contempt_visit_limit" not in protocol["mcts"]
 
 
 def test_scores_dataclass_fields() -> None:

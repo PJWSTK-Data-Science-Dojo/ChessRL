@@ -27,6 +27,9 @@ class Trajectory:
         "rewards",
         "root_policies",
         "root_values",
+        "search_contempt_frozen_nodes",
+        "search_contempt_opponent_selections",
+        "search_contempt_thompson_selections",
         "termination",
         "truncated",
         "truncation_bootstrap_value",
@@ -48,6 +51,9 @@ class Trajectory:
         repetition_guard_interventions: int = 0,
         repetition_guard_forced_fallbacks: int = 0,
         repetition_guard_excluded_actions: int = 0,
+        search_contempt_opponent_selections: int = 0,
+        search_contempt_thompson_selections: int = 0,
+        search_contempt_frozen_nodes: int = 0,
     ) -> None:
         arrays, metadata = prepare_trajectory(
             TrajectoryInput(
@@ -64,6 +70,9 @@ class Trajectory:
                 repetition_guard_interventions=repetition_guard_interventions,
                 repetition_guard_forced_fallbacks=repetition_guard_forced_fallbacks,
                 repetition_guard_excluded_actions=repetition_guard_excluded_actions,
+                search_contempt_opponent_selections=search_contempt_opponent_selections,
+                search_contempt_thompson_selections=search_contempt_thompson_selections,
+                search_contempt_frozen_nodes=search_contempt_frozen_nodes,
             )
         )
         self._store_arrays(arrays)
@@ -86,6 +95,9 @@ class Trajectory:
         self.repetition_guard_interventions = metadata.repetition_guard_interventions
         self.repetition_guard_forced_fallbacks = metadata.repetition_guard_forced_fallbacks
         self.repetition_guard_excluded_actions = metadata.repetition_guard_excluded_actions
+        self.search_contempt_opponent_selections = metadata.search_contempt_opponent_selections
+        self.search_contempt_thompson_selections = metadata.search_contempt_thompson_selections
+        self.search_contempt_frozen_nodes = metadata.search_contempt_frozen_nodes
 
 
 class _SumTree:

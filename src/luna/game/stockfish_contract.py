@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import math
 import shutil
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
-from luna.config import MCTSParams, TrainingRunConfig, evaluation_mcts_params
+from luna.config import TrainingRunConfig, evaluation_mcts_params
 from luna.game.opening_suite import OPENING_SUITE_VERSION as OPENING_SUITE_VERSION
 
 SkipReason = Literal["too_few_games", "too_many_games", "no_engine", "runtime_error"]
@@ -58,7 +58,7 @@ class StockfishEvaluationProtocol:
     stockfish_path: str | None
     stockfish_binary_sha256: str
     max_ply: int | None
-    mcts: MCTSParams
+    mcts: dict[str, object]
 
 
 def _score_interval(scores: StockfishEvalScores) -> tuple[float, float]:
@@ -162,5 +162,12 @@ def stockfish_evaluation_protocol(run: TrainingRunConfig) -> StockfishEvaluation
         stockfish_path=run.stockfish_path,
         stockfish_binary_sha256=engine_binary_sha256(run.stockfish_path),
         max_ply=run.stockfish_eval_max_ply,
-        mcts=evaluation_mcts_params(run),
+        mcts=evaluation_mcts_protocol(run),
     )
+
+
+def evaluation_mcts_protocol(run: TrainingRunConfig) -> dict[str, object]:
+    """Serialize only settings that can affect external evaluation."""
+    protocol: dict[str, object] = asdict(evaluation_mcts_params(run))
+    del protocol["search_contempt_visit_limit"]
+    return protocol

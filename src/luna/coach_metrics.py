@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,11 @@ class _SelfPlaySummary:
     guard_interventions: int = 0
     guard_forced_fallbacks: int = 0
     guard_excluded_actions: int = 0
+    search_contempt_opponent_selections: int = 0
+    search_contempt_thompson_selections: int = 0
+    search_contempt_frozen_nodes: int = 0
+    repeated_prefix_8_fraction: float = 0.0
+    repeated_prefix_16_fraction: float = 0.0
     terminations: dict[chess.Termination, int] = field(
         default_factory=lambda: {termination: 0 for termination in chess.Termination}
     )
@@ -53,6 +59,7 @@ def log_iteration_metrics(
         "replay_buffer_size": coach.replay.size,
     }
     metrics.update(_self_play_metrics(coach, summary, optimizer_steps))
+    metrics.update(_search_contempt_metrics(summary))
     metrics.update(_termination_metrics(summary))
     metrics.update(_performance_metrics(coach, summary, stats, optimizer_steps))
     wandb.log(metrics)
@@ -67,8 +74,21 @@ def _summarize_trajectories(trajectories: list[Trajectory]) -> _SelfPlaySummary:
         summary.guard_interventions += trajectory.repetition_guard_interventions
         summary.guard_forced_fallbacks += trajectory.repetition_guard_forced_fallbacks
         summary.guard_excluded_actions += trajectory.repetition_guard_excluded_actions
+        summary.search_contempt_opponent_selections += trajectory.search_contempt_opponent_selections
+        summary.search_contempt_thompson_selections += trajectory.search_contempt_thompson_selections
+        summary.search_contempt_frozen_nodes += trajectory.search_contempt_frozen_nodes
         _record_outcome(summary, trajectory)
+    summary.repeated_prefix_8_fraction = _repeated_prefix_fraction(trajectories, 8)
+    summary.repeated_prefix_16_fraction = _repeated_prefix_fraction(trajectories, 16)
     return summary
+
+
+def _repeated_prefix_fraction(trajectories: list[Trajectory], length: int) -> float:
+    prefixes = [tuple(trajectory.actions[:length]) for trajectory in trajectories if trajectory.game_length >= length]
+    if not prefixes:
+        return 0.0
+    counts = Counter(prefixes)
+    return sum(counts[prefix] > 1 for prefix in prefixes) / len(prefixes)
 
 
 def _policy_entropy(trajectory: Trajectory) -> float:
@@ -141,6 +161,25 @@ def _self_play_metrics(
         "selfplay/repetition_guard_excluded_actions": summary.guard_excluded_actions,
         "selfplay/repetition_guard_intervention_fraction": _fraction(summary.guard_interventions, positions),
         "selfplay/repetition_guard_attempt_fraction": _fraction(summary.guard_attempts, positions),
+        "selfplay/decisive_to_draw_ratio": decisive_games / max(summary.draws, 1),
+        "selfplay/repeated_prefix_8_fraction": summary.repeated_prefix_8_fraction,
+        "selfplay/repeated_prefix_16_fraction": summary.repeated_prefix_16_fraction,
+    }
+
+
+def _search_contempt_metrics(summary: _SelfPlaySummary) -> dict[str, MetricValue]:
+    return {
+        "selfplay/search_contempt_opponent_selections": summary.search_contempt_opponent_selections,
+        "selfplay/search_contempt_thompson_selections": summary.search_contempt_thompson_selections,
+        "selfplay/search_contempt_frozen_nodes": summary.search_contempt_frozen_nodes,
+        "selfplay/search_contempt_thompson_fraction": _fraction(
+            summary.search_contempt_thompson_selections,
+            summary.search_contempt_opponent_selections,
+        ),
+        "selfplay/search_contempt_frozen_nodes_per_position": _fraction(
+            summary.search_contempt_frozen_nodes,
+            summary.positions,
+        ),
     }
 
 

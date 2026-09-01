@@ -12,6 +12,7 @@ from luna.coach import (
 from luna.config import EzV2LearnerConfig, MCTSParams, TrainingRunConfig
 from luna.game.arena import Arena
 from luna.game.chess_game import ChessGame, move_to_action
+from luna.mcts_search_contempt import SearchContemptStats
 from luna.network import LunaNetwork
 from luna.profiling import SelfPlayMCTSTimings
 
@@ -27,6 +28,7 @@ def test_gumbel_selfplay_executes_proposal_but_stores_improved_target(
     class _Search:
         def __init__(self, _game: ChessGame, _network: LunaNetwork, _params: MCTSParams) -> None:
             self.last_action = proposed_action
+            self.last_search_contempt_stats = SearchContemptStats()
 
         def search_latent(
             self,
@@ -74,6 +76,7 @@ def test_batched_gumbel_selfplay_routes_per_root_exploration_and_proposals(
             del timings
             self.game = game
             self.last_actions: list[int | None] = []
+            self.last_search_contempt_stats: list[SearchContemptStats] = []
 
         def search_batch(
             self,
@@ -85,6 +88,7 @@ def test_batched_gumbel_selfplay_routes_per_root_exploration_and_proposals(
             assert temp == 1.0
             assert add_exploration_noise == [True]
             self.last_actions = [proposed_action]
+            self.last_search_contempt_stats = [SearchContemptStats()]
             outputs = []
             for board in boards:
                 policy = np.zeros(self.game.get_action_size(), dtype=np.float32)

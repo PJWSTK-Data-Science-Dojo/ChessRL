@@ -1,6 +1,6 @@
 """Tests for MCTS search (single-game and batched)."""
 
-from typing import Never
+from typing import Literal, Never
 
 import chess
 import numpy as np
@@ -82,6 +82,69 @@ class _MateInOneNetwork:
             values=np.zeros(batch_size, dtype=np.float32),
             rewards=np.zeros(batch_size, dtype=np.float32),
             next_latent=torch.zeros((batch_size, 1, 1, 1)),
+        )
+
+
+class _DeterministicSearchNetwork:
+    def __init__(self, action_size: int) -> None:
+        self.action_size = action_size
+
+    def _policy(self, valid: np.ndarray | None) -> np.ndarray:
+        mask = np.ones(self.action_size, dtype=np.float32) if valid is None else valid.astype(np.float32, copy=False)
+        return mask / float(mask.sum())
+
+    @staticmethod
+    def _value(action: int) -> float:
+        return float(np.float32(((action % 7) - 3) / 10))
+
+    @staticmethod
+    def _reward(action: int) -> float:
+        return float(np.float32(((action % 5) - 2) / 20))
+
+    def predict_with_latent(
+        self,
+        _observation: np.ndarray,
+        valid: np.ndarray,
+    ) -> tuple[np.ndarray, float, torch.Tensor]:
+        return self._policy(valid), float(np.float32(0.125)), torch.zeros((1, 1, 1, 1))
+
+    def recurrent_predict(
+        self,
+        _latent: torch.Tensor,
+        action: int,
+        valid_mask: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, float, float, torch.Tensor]:
+        return self._policy(valid_mask), self._value(action), self._reward(action), torch.zeros((1, 1, 1, 1))
+
+    def batched_initial_inference(
+        self,
+        observations: np.ndarray,
+        valids: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, torch.Tensor]:
+        batch_size = observations.shape[0]
+        policies = np.stack([self._policy(valid) for valid in valids])
+        values = np.full(batch_size, 0.125, dtype=np.float32)
+        return policies, values, torch.zeros((batch_size, 1, 1, 1))
+
+    def batched_recurrent_inference(
+        self,
+        latents: torch.Tensor,
+        actions: list[int],
+        *,
+        valid_masks: list[np.ndarray | None],
+        policy_topk: int | None,
+    ) -> RecurrentBatchResult:
+        del policy_topk
+        policies = np.stack([self._policy(valid) for valid in valid_masks])
+        values = np.asarray([self._value(action) for action in actions], dtype=np.float32)
+        rewards = np.asarray([self._reward(action) for action in actions], dtype=np.float32)
+        return RecurrentBatchResult(
+            policy_full=policies,
+            topk_indices=None,
+            topk_probs=None,
+            values=values,
+            rewards=rewards,
+            next_latent=torch.zeros((latents.shape[0], 1, 1, 1)),
         )
 
 
@@ -245,3 +308,41 @@ class TestBatchedMCTS:
         np.testing.assert_allclose(batch_policy, single_policy, rtol=0.0, atol=1e-7)
         assert abs(batch_value - single_value) < 1e-7
         assert batched.last_actions == [single_action.last_action]
+
+    @pytest.mark.parametrize("search_mode", ["gumbel", "puct"])
+    def test_single_and_batch_search_contempt_match(
+        self,
+        chess_game: ChessGame,
+        search_mode: Literal["gumbel", "puct"],
+    ) -> None:
+        network = _DeterministicSearchNetwork(chess_game.get_action_size())
+        params = MCTSParams(
+            num_mcts_sims=32,
+            search_mode=search_mode,
+            dir_noise=False,
+            recurrent_policy_topk=None,
+            search_contempt_visit_limit=1,
+        )
+        board = chess_game.get_init_board()
+
+        np.random.seed(7)
+        serial = MCTS(chess_game, network, params)
+        serial_policy, serial_value = serial.search_latent(
+            board,
+            temp=1.0,
+            add_exploration_noise=False,
+        )
+        np.random.seed(7)
+        batched = BatchedMCTS(chess_game, network, params)
+        batch_policy, batch_value, _observation, _valid = batched.search_batch(
+            [board],
+            temp=1.0,
+            add_exploration_noise=False,
+        )[0]
+
+        assert np.count_nonzero(serial_policy) > 1
+        np.testing.assert_allclose(batch_policy, serial_policy, rtol=0.0, atol=1e-12)
+        assert batch_value == pytest.approx(serial_value, abs=1e-12)
+        assert batched.last_actions == [serial.last_action]
+        assert serial.last_search_contempt_stats.thompson_selections > 0
+        assert batched.last_search_contempt_stats == [serial.last_search_contempt_stats]

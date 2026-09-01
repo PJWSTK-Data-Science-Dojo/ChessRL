@@ -115,6 +115,7 @@ def test_dynamic_steps_use_fixed_lr_horizon_and_reconfigure_per_each_iteration(
             train_steps_per_iter=10,
             target_replay_ratio=2.0,
             lr_schedule_total_steps=1234,
+            search_contempt_visit_limit=4,
             checkpoint="",
             stockfish_eval_every=0,
         ),
@@ -131,6 +132,7 @@ def test_dynamic_steps_use_fixed_lr_horizon_and_reconfigure_per_each_iteration(
 
     assert [entry.kwargs["steps"] for entry in train.call_args_list] == [3, 3]
     assert [entry.kwargs["total_train_steps"] for entry in train.call_args_list] == [1234, 1234]
+    assert all(entry.kwargs["mcts_for_reanalyze"].search_contempt_visit_limit is None for entry in train.call_args_list)
     assert configure_beta.call_args_list == [call(6), call(3)]
 
 

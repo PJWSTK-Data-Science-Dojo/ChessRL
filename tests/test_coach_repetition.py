@@ -12,6 +12,7 @@ from luna.coach import (
 )
 from luna.config import EzV2LearnerConfig, MCTSParams, TrainingRunConfig
 from luna.game.chess_game import ChessGame, move_to_action
+from luna.mcts_search_contempt import SearchContemptStats
 from luna.network import LunaNetwork
 from luna.profiling import IterProfileStats, SelfPlayMCTSTimings
 
@@ -37,6 +38,7 @@ def test_single_selfplay_retries_a_move_that_enables_threefold_and_logs_guard_co
     class _Search:
         def __init__(self, _game: ChessGame, _network: LunaNetwork, _params: MCTSParams) -> None:
             self.last_action: int | None = None
+            self.last_search_contempt_stats = SearchContemptStats()
 
         def search_latent(
             self,
@@ -121,6 +123,7 @@ def test_batched_selfplay_retries_only_with_non_repetition_root_actions(
             del timings
             self.game = game
             self.last_actions: list[int] = []
+            self.last_search_contempt_stats: list[SearchContemptStats] = []
 
         def search_batch(
             self,
@@ -146,6 +149,7 @@ def test_batched_selfplay_retries_only_with_non_repetition_root_actions(
                     assert safe_action in restriction
                 selected_actions.append(selected_action)
             self.last_actions = selected_actions
+            self.last_search_contempt_stats = [SearchContemptStats() for _ in selected_actions]
             outputs = []
             for root, selected_action in zip(boards, selected_actions, strict=True):
                 policy = np.zeros(self.game.get_action_size(), dtype=np.float32)

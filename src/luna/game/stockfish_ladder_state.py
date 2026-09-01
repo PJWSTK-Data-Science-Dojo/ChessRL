@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from luna.config import TrainingRunConfig, evaluation_mcts_params
-from luna.game.stockfish_contract import OPENING_SUITE_VERSION, StockfishEvalScores, engine_binary_sha256
+from luna.config import TrainingRunConfig
+from luna.game.stockfish_contract import (
+    OPENING_SUITE_VERSION,
+    StockfishEvalScores,
+    engine_binary_sha256,
+    evaluation_mcts_protocol,
+)
 
 FAIRY_STOCKFISH_RELEASE = "fairy_sf_14"
 FAIRY_STOCKFISH_SOURCE_COMMIT = "f3e6969d11d1bec17eba26e7ae0e629ad4af71dd"
@@ -63,7 +68,7 @@ def fairy_ladder_protocol(run: TrainingRunConfig) -> dict[str, object]:
         "step_elo": run.ladder_step_elo,
         "max_elo": run.ladder_max_elo,
         "required_passes": run.ladder_required_passes,
-        "mcts": asdict(evaluation_mcts_params(run)),
+        "mcts": evaluation_mcts_protocol(run),
     }
 
 

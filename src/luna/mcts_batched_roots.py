@@ -13,6 +13,7 @@ import torch
 from luna.config import MCTSParams
 from luna.game.chess_game import ChessGame
 from luna.mcts_gumbel import _gumbel_improved_policy, _GumbelRootState
+from luna.mcts_search_contempt import SearchContemptState
 from luna.mcts_tree import _LatentNode, _visit_count_policy
 
 if TYPE_CHECKING:
@@ -50,6 +51,7 @@ class SearchRoots:
     encoded: EncodedRootBatch
     roots: list[_LatentNode]
     gumbel_states: list[_GumbelRootState | None]
+    search_contempt_states: list[SearchContemptState]
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +148,8 @@ def build_search_roots(
         else None
         for root, add_noise in zip(roots, settings.exploration_noise, strict=True)
     ]
-    return SearchRoots(encoded, roots, gumbel_states)
+    search_contempt_states = [SearchContemptState(settings.params.search_contempt_visit_limit) for _ in roots]
+    return SearchRoots(encoded, roots, gumbel_states, search_contempt_states)
 
 
 def _build_root(

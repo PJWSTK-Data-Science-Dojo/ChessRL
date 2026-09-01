@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -295,7 +295,7 @@ def _run_optimizer_steps(
         steps=optimizer_steps,
         total_train_steps=_lr_schedule_total_steps(coach, iteration),
         discount=coach.run.discount,
-        mcts_for_reanalyze=coach.run,
+        mcts_for_reanalyze=replace(coach.run, search_contempt_visit_limit=None),
         torch_profile_steps=coach.run.profile_torch_steps if profile_iteration else 0,
         torch_profile_dir=coach.run.profile_dir if profile_iteration else None,
         torch_profile_iter=iteration,

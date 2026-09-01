@@ -27,12 +27,11 @@ from luna.mcts_batched_roots import (
     finalize_search_roots,
     infer_root_batch,
 )
-from luna.mcts_gumbel import _gumbel_interior_best_action
+from luna.mcts_search_contempt import SearchContemptState, SearchContemptStats
 from luna.mcts_tree import (
     _backup_latent_path,
     _LatentNode,
     _PendingExpansion,
-    _puct_best_action,
     _validate_search,
 )
 from luna.profiling import SelfPlayMCTSTimings
@@ -47,7 +46,6 @@ class _BatchRequest:
     temperature: float
     exploration_noise: list[bool]
     root_action_restrictions: list[Collection[int] | None]
-    cpuct: float
     discount: float
 
 
@@ -70,6 +68,7 @@ class BatchedMCTS:
         self._pending_actions: list[int] = []
         self._pending_parent_boards: list[chess.Board | None] = []
         self.last_actions: list[int | None] = []
+        self.last_search_contempt_stats: list[SearchContemptStats] = []
 
     def search_batch(
         self,
@@ -82,6 +81,7 @@ class BatchedMCTS:
     ) -> list[SearchResult]:
         """Run latent MCTS for each position, batching network inference."""
         self.last_actions = []
+        self.last_search_contempt_stats = []
         if not canonical_boards:
             return []
         request = self._build_request(
@@ -111,7 +111,6 @@ class BatchedMCTS:
             temperature,
             _resolve_exploration_noise(root_count, temperature, exploration_noise),
             _resolve_root_action_restrictions(root_count, allowed_root_actions),
-            self.params.cpuct,
             float(self.params.discount),
         )
 
@@ -141,7 +140,7 @@ class BatchedMCTS:
     def _run_simulation(self, search: SearchRoots, request: _BatchRequest) -> None:
         timings = self._timings
         started_at = time.perf_counter()
-        batch = self._select_expansions(search, request.cpuct)
+        batch = self._select_expansions(search)
         if timings is not None:
             timings.selection_s += time.perf_counter() - started_at
         if not batch.pending:
@@ -164,13 +163,19 @@ class BatchedMCTS:
         if timings is not None:
             timings.expand_backup_s += time.perf_counter() - started_at
 
-    def _select_expansions(self, search: SearchRoots, cpuct: float) -> PendingExpansionBatch:
+    def _select_expansions(self, search: SearchRoots) -> PendingExpansionBatch:
         self._clear_pending()
-        for root, gumbel_state in zip(search.roots, search.gumbel_states, strict=True):
+        search_states = zip(
+            search.roots,
+            search.gumbel_states,
+            search.search_contempt_states,
+            strict=True,
+        )
+        for root, gumbel_state, search_contempt in search_states:
             if not root.children:
                 continue
             root_action = gumbel_state.select_action(root) if gumbel_state is not None else None
-            selected = self._select_leaf(root, cpuct, root_action=root_action)
+            selected = self._select_leaf(root, search_contempt, root_action=root_action)
             if selected is not None:
                 self._queue_expansion(selected)
         return PendingExpansionBatch(
@@ -204,6 +209,7 @@ class BatchedMCTS:
         started_at = time.perf_counter()
         finalized = finalize_search_roots(search, self.params, temperature)
         self.last_actions = finalized.actions
+        self.last_search_contempt_stats = [state.stats for state in search.search_contempt_states]
         if self._timings is not None:
             self._timings.finalize_s += time.perf_counter() - started_at
         return finalized.results
@@ -211,7 +217,7 @@ class BatchedMCTS:
     def _select_leaf(
         self,
         root: _LatentNode,
-        cpuct: float,
+        search_contempt: SearchContemptState,
         root_action: int | None = None,
     ) -> tuple[list[_LatentNode], _LatentNode, int] | None:
         """Return the first unexpanded edge reachable under the selection policy."""
@@ -220,7 +226,8 @@ class BatchedMCTS:
         ancestors: list[_LatentNode] = [root]
         current = root
         while True:
-            best_action = self._select_action(current, root, cpuct, root_action)
+            depth = len(ancestors) - 1
+            best_action = self._select_action(current, root, search_contempt, root_action, depth)
             if best_action not in current.children:
                 raise RuntimeError(f"search selected absent action {best_action}")
             child = current.children[best_action]
@@ -238,14 +245,13 @@ class BatchedMCTS:
         self,
         current: _LatentNode,
         root: _LatentNode,
-        cpuct: float,
+        search_contempt: SearchContemptState,
         root_action: int | None,
+        depth: int,
     ) -> int:
         if current is root and root_action is not None:
             return root_action
-        if self.params.search_mode == "gumbel":
-            return _gumbel_interior_best_action(current, self.params)
-        return _puct_best_action(cpuct, self.params.pb_c_base, current)
+        return search_contempt.select_action(current, depth, self.params)
 
 
 def _resolve_exploration_noise(

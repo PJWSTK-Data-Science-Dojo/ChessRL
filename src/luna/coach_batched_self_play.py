@@ -21,6 +21,7 @@ from luna.coach_self_play import (
 from luna.game.chess_game import ChessGame
 from luna.mcts import BatchedMCTS
 from luna.mcts_batched_roots import SearchResult
+from luna.mcts_search_contempt import SearchContemptStats
 from luna.profiling import SelfPlayMCTSTimings
 from luna.replay_buffer import Trajectory
 
@@ -42,6 +43,9 @@ class _GameSlot:
     guard_interventions: int = 0
     guard_forced_fallbacks: int = 0
     guard_excluded_actions: int = 0
+    search_contempt_opponent_selections: int = 0
+    search_contempt_thompson_selections: int = 0
+    search_contempt_frozen_nodes: int = 0
     alive: bool = True
 
 
@@ -50,6 +54,7 @@ class _BatchDecision:
     canonical_boards: list[chess.Board]
     results: list[SearchResult]
     actions: list[int]
+    search_contempt: list[SearchContemptStats]
 
 
 @dataclass(frozen=True)
@@ -127,7 +132,7 @@ def _search_active_roots(
         )
         for row, result in enumerate(results)
     ]
-    decision = _BatchDecision(canonical_boards, results, actions)
+    decision = _BatchDecision(canonical_boards, results, actions, list(search.last_search_contempt_stats))
     _retry_repetitions(coach, search, slots, active_indices, decision)
     return decision
 
@@ -206,6 +211,7 @@ def _apply_retry_results(
             explore=True,
             gumbel_proposal=proposals[retry_index],
         )
+        decision.search_contempt[row] = search.last_search_contempt_stats[retry_index]
 
 
 def _advance_active_roots(
@@ -219,7 +225,13 @@ def _advance_active_roots(
 ) -> None:
     results_by_index = dict(zip(active_indices, decision.results, strict=True))
     for row, index in enumerate(active_indices):
-        trajectory = _advance_slot(coach, slots[index], decision.actions[row], results_by_index[index])
+        trajectory = _advance_slot(
+            coach,
+            slots[index],
+            decision.actions[row],
+            results_by_index[index],
+            decision.search_contempt[row],
+        )
         if trajectory is not None:
             _record_completion(coach.game, slots, index, trajectory, completed, target_games, pbar)
 
@@ -229,6 +241,7 @@ def _advance_slot(
     slot: _GameSlot,
     action: int,
     result: SearchResult,
+    search_contempt: SearchContemptStats,
 ) -> Trajectory | None:
     policy, root_value, observation, valid_moves = result
     slot.steps += 1
@@ -238,6 +251,7 @@ def _advance_slot(
     slot.valid_moves.append(valid_moves)
     slot.player = coach.game.push_action(slot.board, slot.player, action)
     slot.actions.append(action)
+    _record_search_contempt(slot, search_contempt)
     outcome = coach.game.get_game_outcome(slot.board, slot.player)
     if outcome is not None:
         return _terminal_slot_trajectory(coach.game, slot, outcome)
@@ -250,6 +264,12 @@ def _advance_slot(
             truncation_bootstrap_value=bootstrap_value,
         )
     return None
+
+
+def _record_search_contempt(slot: _GameSlot, stats: SearchContemptStats) -> None:
+    slot.search_contempt_opponent_selections += stats.opponent_selections
+    slot.search_contempt_thompson_selections += stats.thompson_selections
+    slot.search_contempt_frozen_nodes += stats.frozen_nodes
 
 
 def _terminal_slot_trajectory(game: ChessGame, slot: _GameSlot, outcome: float) -> Trajectory:
@@ -281,6 +301,9 @@ def _slot_trajectory(
         repetition_guard_interventions=slot.guard_interventions,
         repetition_guard_forced_fallbacks=slot.guard_forced_fallbacks,
         repetition_guard_excluded_actions=slot.guard_excluded_actions,
+        search_contempt_opponent_selections=slot.search_contempt_opponent_selections,
+        search_contempt_thompson_selections=slot.search_contempt_thompson_selections,
+        search_contempt_frozen_nodes=slot.search_contempt_frozen_nodes,
     )
 
 

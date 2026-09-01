@@ -4,6 +4,8 @@ CHECKPOINT_DIR ?= ./runs/luna-main
 CHECKPOINT_PATH = $(CHECKPOINT_DIR)/latest.pth.tar
 ARENA_CHECKPOINT_A ?=
 ARENA_CHECKPOINT_B ?=
+SEARCH_CONTEMPT_CHECKPOINT ?=
+SEARCH_CONTEMPT_REPORT ?= ./runs/search-contempt-ablation/report.json
 NEW_PHASE_SOURCE_DIR ?= ./runs/sources
 NEW_PHASE_SOURCE_FILE ?= luna-balanced-precollapse-iter40.pth.tar
 NEW_PHASE_SOURCE_SHA256 ?= dd07d8ddf2aa652719b405b4e3b6f7381bb652873a34d139fe37b95327ba99dd
@@ -560,6 +562,14 @@ eval-checkpoints:
 		--checkpoint-b "$(ARENA_CHECKPOINT_B)" \
 		$(ARGS)
 
+ablate-search-contempt:
+	@test -n "$(SEARCH_CONTEMPT_CHECKPOINT)" || { echo "SEARCH_CONTEMPT_CHECKPOINT is required" >&2; exit 2; }
+	@test -f "$(SEARCH_CONTEMPT_CHECKPOINT)" || { echo "Checkpoint not found: $(SEARCH_CONTEMPT_CHECKPOINT)" >&2; exit 2; }
+	uv run --frozen python src/ablate_search_contempt.py \
+		--checkpoint "$(SEARCH_CONTEMPT_CHECKPOINT)" \
+		--output "$(SEARCH_CONTEMPT_REPORT)" \
+		$(ARGS)
+
 install-fairy-stockfish:
 	bash scripts/install-fairy-stockfish.sh
 
@@ -585,7 +595,7 @@ test-pipeline-cpu:
 test-pipeline-mps:
 	$(MAKE) test-pipeline-cpu ARGS="--learner.device mps $(ARGS)"
 
-.PHONY: _fairy-stockfish-preflight _train-env-preflight audit bench check download-lc0-data download-pgn-data \
+.PHONY: _fairy-stockfish-preflight _train-env-preflight ablate-search-contempt audit bench check download-lc0-data download-pgn-data \
 	eval-checkpoints eval-lc0-warmstart eval-pgn-warmstart eval-stockfish fmt format-check install-fairy-stockfish \
 	lichess-config lint \
 	migrate-ladder-phase pretrain-lc0 pretrain-pgn profile-smoke release-web-model resume resume-migrated-phase resume-phase \

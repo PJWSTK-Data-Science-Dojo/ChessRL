@@ -28,6 +28,9 @@ class TrajectoryInput:
     repetition_guard_interventions: int
     repetition_guard_forced_fallbacks: int
     repetition_guard_excluded_actions: int
+    search_contempt_opponent_selections: int
+    search_contempt_thompson_selections: int
+    search_contempt_frozen_nodes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +53,9 @@ class TrajectoryMetadata:
     repetition_guard_interventions: int
     repetition_guard_forced_fallbacks: int
     repetition_guard_excluded_actions: int
+    search_contempt_opponent_selections: int
+    search_contempt_thompson_selections: int
+    search_contempt_frozen_nodes: int
 
 
 def prepare_trajectory(values: TrajectoryInput) -> tuple[TrajectoryArrays, TrajectoryMetadata]:
@@ -159,6 +165,8 @@ def _validate_metadata(values: TrajectoryInput, game_length: int) -> TrajectoryM
     bootstrap_value = _validate_truncation_bootstrap(values)
     counts = _guard_counts(values)
     _validate_guard_counts(counts, game_length)
+    search_contempt_counts = _search_contempt_counts(values)
+    _validate_search_contempt_counts(search_contempt_counts)
     return TrajectoryMetadata(
         truncated=bool(values.truncated),
         truncation_bootstrap_value=bootstrap_value,
@@ -167,6 +175,9 @@ def _validate_metadata(values: TrajectoryInput, game_length: int) -> TrajectoryM
         repetition_guard_interventions=values.repetition_guard_interventions,
         repetition_guard_forced_fallbacks=values.repetition_guard_forced_fallbacks,
         repetition_guard_excluded_actions=values.repetition_guard_excluded_actions,
+        search_contempt_opponent_selections=values.search_contempt_opponent_selections,
+        search_contempt_thompson_selections=values.search_contempt_thompson_selections,
+        search_contempt_frozen_nodes=values.search_contempt_frozen_nodes,
     )
 
 
@@ -192,6 +203,14 @@ def _guard_counts(values: TrajectoryInput) -> dict[str, int]:
     }
 
 
+def _search_contempt_counts(values: TrajectoryInput) -> dict[str, int]:
+    return {
+        "search_contempt_opponent_selections": values.search_contempt_opponent_selections,
+        "search_contempt_thompson_selections": values.search_contempt_thompson_selections,
+        "search_contempt_frozen_nodes": values.search_contempt_frozen_nodes,
+    }
+
+
 def _validate_guard_counts(counts: dict[str, int], game_length: int) -> None:
     for name, value in counts.items():
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -206,3 +225,11 @@ def _validate_guard_counts(counts: dict[str, int], game_length: int) -> None:
         raise ValueError("repetition guard cannot be attempted more than once per trajectory position")
     if interventions > 0 and excluded_actions < interventions:
         raise ValueError("each repetition guard intervention must exclude at least one action")
+
+
+def _validate_search_contempt_counts(counts: dict[str, int]) -> None:
+    for name, value in counts.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    if counts["search_contempt_thompson_selections"] > counts["search_contempt_opponent_selections"]:
+        raise ValueError("Search-contempt Thompson selections cannot exceed opponent selections")

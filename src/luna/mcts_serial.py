@@ -14,8 +14,8 @@ from luna.game.chess_game import ChessGame, player_from_turn
 from luna.mcts_gumbel import (
     _gumbel_improved_policy,
     _GumbelRootState,
-    _interior_best_action,
 )
+from luna.mcts_search_contempt import SearchContemptState, SearchContemptStats
 from luna.mcts_tree import EPS, _LatentNode, _validate_search, _visit_count_policy
 
 if TYPE_CHECKING:
@@ -79,6 +79,7 @@ class MCTS:
         self.params = params
         self.last_action: int | None = None
         self.last_simulations = 0
+        self.last_search_contempt_stats = SearchContemptStats()
 
     def get_action_prob(
         self,
@@ -116,12 +117,15 @@ class MCTS:
         """
         self.last_action = None
         self.last_simulations = 0
+        self.last_search_contempt_stats = SearchContemptStats()
         options = self._resolve_options(num_sims, temp, add_exploration_noise)
         prepared = self._prepare_root(canonical_board, allowed_root_actions, options)
         if isinstance(prepared, _CompletedSearch):
             return prepared.policy, prepared.value
         gumbel_state = self._create_gumbel_state(prepared.node, options)
-        self._run_simulations(prepared.node, gumbel_state, options, should_stop)
+        search_contempt = SearchContemptState(self.params.search_contempt_visit_limit)
+        self._run_simulations(prepared.node, gumbel_state, search_contempt, options, should_stop)
+        self.last_search_contempt_stats = search_contempt.stats
         statistics = _root_statistics(prepared.node, prepared.action_size)
         selection = self._select_policy(prepared, gumbel_state, statistics, options)
         self.last_action = selection.action
@@ -218,6 +222,7 @@ class MCTS:
         self,
         root: _LatentNode,
         gumbel_state: _GumbelRootState | None,
+        search_contempt: SearchContemptState,
         options: _SearchOptions,
         should_stop: Callable[[], bool] | None,
     ) -> None:
@@ -225,7 +230,7 @@ class MCTS:
             if should_stop is not None and should_stop():
                 break
             root_action = gumbel_state.select_action(root) if gumbel_state is not None else None
-            self._latent_simulate(root, root_action=root_action)
+            self._latent_simulate(root, search_contempt, root_action=root_action)
             self.last_simulations += 1
 
     def _select_policy(
@@ -243,18 +248,27 @@ class MCTS:
             return _visited_policy(prepared.action_size, statistics.counts, options.temperature)
         return _prior_policy(prepared, options.temperature)
 
-    def _latent_simulate(self, node: _LatentNode, root_action: int | None = None) -> float:
+    def _latent_simulate(
+        self,
+        node: _LatentNode,
+        search_contempt: SearchContemptState,
+        *,
+        depth: int = 0,
+        root_action: int | None = None,
+    ) -> float:
         """Simulate one path and return its value from ``node``'s perspective."""
         if not node.expanded or not node.children:
             return 0.0
-        best_action = root_action if root_action is not None else _interior_best_action(node, self.params)
+        best_action = (
+            root_action if root_action is not None else search_contempt.select_action(node, depth, self.params)
+        )
         if best_action not in node.children:
             raise RuntimeError(f"search selected absent action {best_action}")
         child = node.children[best_action]
         discount = float(self.params.discount)
         if not child.expanded and node.latent is not None:
             return self._expand_child(node, child, best_action, discount)
-        child_value = self._latent_simulate(child)
+        child_value = self._latent_simulate(child, search_contempt, depth=depth + 1)
         return _record_edge_value(node, child, child.reward - discount * child_value)
 
     def _expand_child(

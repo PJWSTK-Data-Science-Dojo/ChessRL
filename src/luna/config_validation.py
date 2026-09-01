@@ -47,6 +47,8 @@ def validate_mcts_params(params: MCTSParams) -> None:
     _probability("discount", params.discount)
     if params.recurrent_policy_topk is not None:
         _positive_integer("recurrent_policy_topk", params.recurrent_policy_topk)
+    if params.search_contempt_visit_limit is not None:
+        _positive_integer("search_contempt_visit_limit", params.search_contempt_visit_limit)
 
 
 def _validate_training_schedule(run: TrainingRunConfig) -> None:

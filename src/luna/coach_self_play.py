@@ -11,6 +11,7 @@ import numpy as np
 from luna.config import TrainingRunConfig
 from luna.game.chess_game import ChessGame
 from luna.mcts import MCTS
+from luna.mcts_search_contempt import SearchContemptStats
 from luna.replay_buffer import Trajectory
 
 if TYPE_CHECKING:
@@ -82,6 +83,9 @@ class _EpisodeState:
     guard_interventions: int = 0
     guard_forced_fallbacks: int = 0
     guard_excluded_actions: int = 0
+    search_contempt_opponent_selections: int = 0
+    search_contempt_thompson_selections: int = 0
+    search_contempt_frozen_nodes: int = 0
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,7 @@ class _RootDecision:
     observation: np.ndarray
     valid_moves: np.ndarray
     action: int
+    search_contempt: SearchContemptStats
 
 
 def execute_episode(coach: Coach) -> Trajectory:
@@ -131,6 +136,7 @@ def _search_root(coach: Coach, mcts: MCTS, state: _EpisodeState) -> _RootDecisio
             explore=explore,
             gumbel_proposal=mcts.last_action,
         ),
+        search_contempt=mcts.last_search_contempt_stats,
     )
 
 
@@ -173,12 +179,13 @@ def _search_safe_root(
     )
     action = select_self_play_action(coach.run, policy, explore=True, gumbel_proposal=mcts.last_action)
     return _RootDecision(
-        decision.canonical_board,
-        policy,
-        value,
-        decision.observation,
-        decision.valid_moves,
-        action,
+        canonical_board=decision.canonical_board,
+        policy=policy,
+        value=value,
+        observation=decision.observation,
+        valid_moves=decision.valid_moves,
+        action=action,
+        search_contempt=mcts.last_search_contempt_stats,
     )
 
 
@@ -189,7 +196,14 @@ def _apply_decision(game: ChessGame, state: _EpisodeState, decision: _RootDecisi
     state.valid_moves.append(decision.valid_moves)
     state.player = game.push_action(state.board, state.player, decision.action)
     state.actions.append(decision.action)
+    _record_search_contempt(state, decision.search_contempt)
     return game.get_game_outcome(state.board, state.player)
+
+
+def _record_search_contempt(state: _EpisodeState, stats: SearchContemptStats) -> None:
+    state.search_contempt_opponent_selections += stats.opponent_selections
+    state.search_contempt_thompson_selections += stats.thompson_selections
+    state.search_contempt_frozen_nodes += stats.frozen_nodes
 
 
 def _terminal_trajectory(game: ChessGame, state: _EpisodeState, outcome: float) -> Trajectory:
@@ -221,6 +235,9 @@ def _trajectory_from_state(
         repetition_guard_interventions=state.guard_interventions,
         repetition_guard_forced_fallbacks=state.guard_forced_fallbacks,
         repetition_guard_excluded_actions=state.guard_excluded_actions,
+        search_contempt_opponent_selections=state.search_contempt_opponent_selections,
+        search_contempt_thompson_selections=state.search_contempt_thompson_selections,
+        search_contempt_frozen_nodes=state.search_contempt_frozen_nodes,
     )
 
 
@@ -247,6 +264,9 @@ def trajectory_with_terminal_rewards(
     repetition_guard_interventions: int = 0,
     repetition_guard_forced_fallbacks: int = 0,
     repetition_guard_excluded_actions: int = 0,
+    search_contempt_opponent_selections: int = 0,
+    search_contempt_thompson_selections: int = 0,
+    search_contempt_frozen_nodes: int = 0,
 ) -> Trajectory:
     rewards = [0.0] * len(actions)
     rewards[-1] = -float(terminal_value_for_next_player)
@@ -264,4 +284,7 @@ def trajectory_with_terminal_rewards(
         repetition_guard_interventions=repetition_guard_interventions,
         repetition_guard_forced_fallbacks=repetition_guard_forced_fallbacks,
         repetition_guard_excluded_actions=repetition_guard_excluded_actions,
+        search_contempt_opponent_selections=search_contempt_opponent_selections,
+        search_contempt_thompson_selections=search_contempt_thompson_selections,
+        search_contempt_frozen_nodes=search_contempt_frozen_nodes,
     )

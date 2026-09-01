@@ -19,6 +19,7 @@ from luna.game.stockfish_ladder import (
     run_fairy_ladder_eval,
     write_fairy_ladder_state,
 )
+from luna.game.stockfish_ladder_state import fairy_ladder_protocol
 from luna.network import LunaNetwork
 
 
@@ -84,6 +85,14 @@ def test_initial_state_round_trips_atomically(ladder_run: TrainingRunConfig) -> 
     assert restored.protocol["engine_binary_sha256"] == expected_hash
     assert json.loads(path.read_text(encoding="utf-8"))["current_elo"] == 500
     assert list(path.parent.glob(f".{path.name}.tmp-*")) == []
+
+
+def test_self_play_search_contempt_is_absent_from_ladder_protocol(ladder_run: TrainingRunConfig) -> None:
+    run = replace(ladder_run, search_contempt_visit_limit=4)
+
+    protocol = fairy_ladder_protocol(run)
+
+    assert "search_contempt_visit_limit" not in cast(dict[str, object], protocol["mcts"])
 
 
 def test_two_consecutive_majority_results_advance_exactly_one_rung(

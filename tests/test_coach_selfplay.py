@@ -182,6 +182,21 @@ def test_selfplay_outcome_metrics_respect_ply_color_and_exclude_truncations(
     assert metrics["selfplay/unknown_termination_fraction"] == 0.0
 
 
+def test_decisive_to_draw_ratio_stays_positive_when_no_games_draw(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    make_trajectory: TrajectoryFactory,
+) -> None:
+    coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), TrainingRunConfig())
+    decisive = make_trajectory(1, termination=chess.Termination.CHECKMATE)
+    decisive.rewards[-1] = 1.0
+
+    with patch("luna.coach_metrics.wandb.run", object()), patch("luna.coach_metrics.wandb.log") as wandb_log:
+        coach._log_iteration_metrics(1, [decisive], IterProfileStats(iter_index=1))
+
+    assert wandb_log.call_args.args[0]["selfplay/decisive_to_draw_ratio"] == 1.0
+
+
 def test_gumbel_selfplay_reenables_exploration_for_a_repeated_root() -> None:
     board = chess.Board()
     for move in ("g1f3", "g8f6", "f3g1", "f6g8"):

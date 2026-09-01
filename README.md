@@ -8,6 +8,7 @@ This is a research and portfolio project, not a claim of engine parity with esta
 
 - Representation, dynamics, and prediction networks with per-sample latent normalization.
 - Gumbel top-m root selection and Sequential Halving by default; classic PUCT remains available.
+- Opt-in Search-contempt sampling at opponent nodes, with activation and diversity telemetry.
 - Batched latent MCTS for parallel self-play, exact legal-move masks, and two-player value backups.
 - A 4,288-action chess space: 4,096 from/to actions plus distinct knight, rook, and bishop underpromotions.
 - Five spatial dynamics action planes: from, to, and one plane for each underpromotion identity.
@@ -385,6 +386,40 @@ settings fixed when comparing checkpoints. Periodic training evaluation is
 controlled by `--run.stockfish-eval-every`; set it to `0` to disable. Each versioned
 opening is played with both color assignments. A small match is still a noisy estimate.
 
+### Search-contempt ablation
+
+Luna implements [Search-contempt](https://arxiv.org/abs/2504.07757) as an optional
+overlay rather than a third root-search mode. Gumbel Sequential Halving or PUCT remains
+unchanged at the root and every even-depth node. At odd-depth opponent nodes,
+`--run.search-contempt-visit-limit L` freezes the distribution of visited children after
+`L` child visits and samples subsequent selections from that immutable distribution.
+The default is `None`, which leaves the established search path unchanged.
+
+This remains an experiment. The paper reports a promising fixed-network result, but does
+not demonstrate end-to-end training from scratch; its proposed training schedule is
+speculative and uses a much larger search budget than Luna's maintained 32 simulations.
+Search-contempt is therefore disabled for external evaluation and replay reanalysis even
+when enabled for new self-play. Stored self-play root values are still produced by the
+hybrid search, so a short canary phase must verify value calibration before a long run.
+
+Run the fixed-weight gate before starting a training phase. Use an immutable numbered
+checkpoint, not `latest.pth.tar`:
+
+```bash
+make ablate-search-contempt \
+  SEARCH_CONTEMPT_CHECKPOINT=./runs/sources/checkpoint_30.pth.tar \
+  SEARCH_CONTEMPT_REPORT=./runs/search-contempt-ablation/checkpoint-30.json
+```
+
+The default grid compares the current full-game exploration control, a 40-ply exploration
+control, and visit limits 2, 4, and 8 at the same 40-ply threshold over three seeds. The
+counterbalanced JSON report binds results to the checkpoint SHA-256 and Git commit, then
+records per-seed and aggregate throughput, outcomes, truncation, policy entropy, repeated
+8/16/32-ply prefixes, repetition-guard activity, frozen nodes, and the fraction of
+opponent selections made by frozen-distribution sampling. Do not start a long run if the
+candidate fails to activate, loses substantial throughput, or merely changes W/D/L by
+adding truncations or repeated openings.
+
 ## Training flow
 
 1. A sliding pool of games produces batched self-play through latent search.
@@ -408,6 +443,7 @@ make test                # pytest suite
 make check               # format check + lint + types + tests
 make audit               # audit locked runtime dependencies (network required)
 make bench               # throughput benchmark
+make ablate-search-contempt SEARCH_CONTEMPT_CHECKPOINT=...  # fixed-weight search ablation
 make profile-smoke       # bounded end-to-end profile
 make download-pgn-data   # fetch and verify the pinned expert corpus
 make pretrain-pgn        # start or resume supervised PGN warm-start training
@@ -459,6 +495,7 @@ src/main.py                    training entry point
 src/web_app.py                 stable web entry point and public imports
 src/web_*.py                   engine service, game state, security, and API routes
 src/eval_vs_stockfish.py       standalone external evaluation
+src/ablate_search_contempt.py  fixed-weight Search-contempt experiment
 src/luna/config*.py            typed configuration and validation
 src/luna/coach*.py             self-play, training, evaluation, and checkpoints
 src/luna/network*.py           learner, inference, diagnostics, and checkpoint I/O
@@ -479,7 +516,7 @@ tests/                         unit, integration, protocol, and regression tests
 
 - `--seed` seeds Python, NumPy, and PyTorch. Some accelerator kernels may remain nondeterministic.
 - `--learner.model-name` selects `baseline`, `balanced`, or `balanced_reconstruction`; the maintained `make train` preset uses the last option with 128 channels, 10 representation blocks, one dynamics block, and a training-only piece decoder.
-- Gumbel search does not use Dirichlet root noise. Barlow Twins, playout-cap randomization, FP8/TensorRT, and alternative chess-rule backends remain ablation candidates rather than defaults; each changes training semantics or runtime behavior and requires a controlled benchmark.
+- Gumbel search does not use Dirichlet root noise. Search-contempt is opt-in and self-play-only; Barlow Twins, playout-cap randomization, FP8/TensorRT, and alternative chess-rule backends remain ablation candidates rather than defaults. Each changes training semantics or runtime behavior and requires a controlled benchmark.
 - Training checkpoints restore optimizer, scaler, global step, and trainer iteration. The in-memory replay buffer is not serialized.
 - `torch.compile` is optional. Disable it with `--learner.no-compile-inference` or the corresponding web flag when unsupported.
 - Measure throughput with the included benchmark and profiler before changing batch, parallel-game, or search budgets.
