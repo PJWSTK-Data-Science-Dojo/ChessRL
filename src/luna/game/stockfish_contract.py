@@ -10,10 +10,9 @@ from pathlib import Path
 from typing import Literal
 
 from luna.config import MCTSParams, TrainingRunConfig, evaluation_mcts_params
+from luna.game.opening_suite import OPENING_SUITE_VERSION as OPENING_SUITE_VERSION
 
 SkipReason = Literal["too_few_games", "too_many_games", "no_engine", "runtime_error"]
-
-OPENING_SUITE_VERSION = 1
 
 
 @dataclass(frozen=True)

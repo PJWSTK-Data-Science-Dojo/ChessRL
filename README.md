@@ -354,6 +354,22 @@ The standalone Lichess engine and web service must not run independently on one 
 
 ## Evaluate
 
+Gate a candidate checkpoint (B) directly against its baseline (A) with the versioned
+opening suite, both color assignments, and identical deterministic 32-simulation Gumbel
+search:
+
+```bash
+make eval-checkpoints \
+  ARENA_CHECKPOINT_A=./runs/source/checkpoint.pth.tar \
+  ARENA_CHECKPOINT_B=./runs/candidate/checkpoint.pth.tar
+```
+
+The command atomically writes a `*.arena.json` sidecar beside checkpoint B. It contains
+both checkpoint SHA-256 hashes, the complete search/opening protocol, scores, and the
+non-regression decision. Exit status `3` means checkpoint B scored below `0.5`; operational
+or configuration failures use status `2`. Matches accept 2–20 games, in even increments;
+override defaults through `ARGS`, for example `ARGS='--games 10 --max-ply 256'`.
+
 Run an external benchmark without changing checkpoint promotion state:
 
 ```bash

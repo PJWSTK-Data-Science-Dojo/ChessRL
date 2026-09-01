@@ -2,6 +2,8 @@ ARGS ?=
 TRAIN_ARGS ?=
 CHECKPOINT_DIR ?= ./runs/luna-main
 CHECKPOINT_PATH = $(CHECKPOINT_DIR)/latest.pth.tar
+ARENA_CHECKPOINT_A ?=
+ARENA_CHECKPOINT_B ?=
 NEW_PHASE_SOURCE_DIR ?= ./runs/sources
 NEW_PHASE_SOURCE_FILE ?= luna-balanced-precollapse-iter40.pth.tar
 NEW_PHASE_SOURCE_SHA256 ?= dd07d8ddf2aa652719b405b4e3b6f7381bb652873a34d139fe37b95327ba99dd
@@ -338,7 +340,7 @@ pretrain-lc0: _train-env-preflight verify-lc0-data
 		printf '%s  %s\n' "$(LC0_SOURCE_SHA256)" "$(LC0_SOURCE_CHECKPOINT)" | sha256sum --check --status || { \
 			echo "LC0 source checkpoint SHA-256 mismatch: $(LC0_SOURCE_CHECKPOINT)" >&2; exit 2; }; \
 		set -- --source-checkpoint "$(LC0_SOURCE_CHECKPOINT)"; \
-		wandb_resume=never; \
+		wandb_resume=allow; \
 	fi; \
 	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/pretrain_lc0.py \
 		--dataset-path "$(LC0_DATA_PATH)" \
@@ -396,7 +398,7 @@ train-lc0-warmstart: _train-env-preflight _fairy-stockfish-preflight
 		source_dir="$$(dirname -- "$$selected_checkpoint")"; \
 		source_file="$$(basename -- "$$selected_checkpoint")"; \
 		$(MAKE) train CHECKPOINT_DIR="$(LC0_RL_CHECKPOINT_DIR)" \
-			TRAIN_ARGS="--new-training-phase --load-checkpoint-dir \"$$source_dir\" --load-checkpoint-file \"$$source_file\" --wandb-project \"$(WANDB_PROJECT)\" --wandb-run-id \"$(LC0_RL_WANDB_RUN_ID)\" --wandb-run-name \"$(LC0_RL_WANDB_RUN_NAME)\" --wandb-resume never"; \
+			TRAIN_ARGS="--new-training-phase --load-checkpoint-dir \"$$source_dir\" --load-checkpoint-file \"$$source_file\" --wandb-project \"$(WANDB_PROJECT)\" --wandb-run-id \"$(LC0_RL_WANDB_RUN_ID)\" --wandb-run-name \"$(LC0_RL_WANDB_RUN_NAME)\" --wandb-resume allow"; \
 	fi
 
 _train-env-preflight:
@@ -548,6 +550,16 @@ lichess-config:
 eval-stockfish:
 	uv run --frozen python src/eval_vs_stockfish.py --checkpoint "$(CHECKPOINT_PATH)" $(ARGS)
 
+eval-checkpoints:
+	@test -n "$(ARENA_CHECKPOINT_A)" || { echo "ARENA_CHECKPOINT_A is required" >&2; exit 2; }
+	@test -n "$(ARENA_CHECKPOINT_B)" || { echo "ARENA_CHECKPOINT_B is required" >&2; exit 2; }
+	@test -f "$(ARENA_CHECKPOINT_A)" || { echo "Checkpoint A not found: $(ARENA_CHECKPOINT_A)" >&2; exit 2; }
+	@test -f "$(ARENA_CHECKPOINT_B)" || { echo "Checkpoint B not found: $(ARENA_CHECKPOINT_B)" >&2; exit 2; }
+	uv run --frozen python src/eval_vs_checkpoint.py \
+		--checkpoint-a "$(ARENA_CHECKPOINT_A)" \
+		--checkpoint-b "$(ARENA_CHECKPOINT_B)" \
+		$(ARGS)
+
 install-fairy-stockfish:
 	bash scripts/install-fairy-stockfish.sh
 
@@ -574,7 +586,8 @@ test-pipeline-mps:
 	$(MAKE) test-pipeline-cpu ARGS="--learner.device mps $(ARGS)"
 
 .PHONY: _fairy-stockfish-preflight _train-env-preflight audit bench check download-lc0-data download-pgn-data \
-	eval-lc0-warmstart eval-pgn-warmstart eval-stockfish fmt format-check install-fairy-stockfish lichess-config lint \
+	eval-checkpoints eval-lc0-warmstart eval-pgn-warmstart eval-stockfish fmt format-check install-fairy-stockfish \
+	lichess-config lint \
 	migrate-ladder-phase pretrain-lc0 pretrain-pgn profile-smoke release-web-model resume resume-migrated-phase resume-phase \
 	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train train-lc0-warmstart train-phase train-pgn-warmstart \
 	types uci verify-lc0-data verify-pgn-data verify-web-model web-build web-config web-down web-logs web-public-config \

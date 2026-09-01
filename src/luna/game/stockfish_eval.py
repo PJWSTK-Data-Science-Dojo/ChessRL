@@ -15,10 +15,11 @@ from loguru import logger
 
 from luna.config import MCTSParams, TrainingRunConfig, evaluation_mcts_params
 from luna.game.arena import Arena
+from luna.game.checkpoint_arena import ArenaMCTSPlayer
 from luna.game.chess_game import ChessGame
+from luna.game.opening_suite import OPENING_SUITE_VERSION, evaluation_openings
 from luna.game.player import StockfishPlayer
 from luna.game.stockfish_contract import (
-    OPENING_SUITE_VERSION,
     EngineMatchSettings,
     StockfishEvalOutcome,
     StockfishEvalScores,
@@ -31,7 +32,6 @@ from luna.game.stockfish_contract import (
     resolve_engine_path,
     stockfish_evaluation_protocol,
 )
-from luna.mcts import MCTS
 from luna.network import LunaNetwork
 
 __all__ = [
@@ -58,19 +58,6 @@ __all__ = [
 
 _WIN = 0.5
 _StockfishException = cast(type[Exception], chess.engine.EngineError)
-
-_OPENING_LINES = (
-    ("e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"),
-    ("e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4"),
-    ("d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6"),
-    ("d2d4", "g8f6", "c2c4", "g7g6", "b1c3", "d7d5"),
-    ("c2c4", "e7e5", "b1c3", "g8f6", "g1f3", "b8c6"),
-    ("g1f3", "d7d5", "g2g3", "g8f6", "f1g2", "g7g6"),
-    ("e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "g8f6"),
-    ("e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"),
-    ("d2d4", "g8f6", "c2c4", "e7e6", "g1f3", "b7b6"),
-    ("d2d4", "f7f5", "g2g3", "g8f6", "f1g2", "g7g6"),
-)
 
 
 def retry_stockfish_eval(
@@ -113,20 +100,8 @@ def _stockfish_player(settings: EngineMatchSettings) -> StockfishPlayer:
     )
 
 
-def _evaluation_openings(pair_count: int) -> list[chess.Board]:
-    if pair_count > len(_OPENING_LINES):
-        raise ValueError(f"stockfish_eval_games supports at most {2 * len(_OPENING_LINES)} games")
-    openings: list[chess.Board] = []
-    for line in _OPENING_LINES[:pair_count]:
-        board = chess.Board()
-        for move_text in line:
-            board.push_uci(move_text)
-        openings.append(board)
-    return openings
-
-
 def _validate_engine_settings(settings: EngineMatchSettings, *, require_fairy: bool) -> tuple[str, tuple[int, int]]:
-    _evaluation_openings(settings.games // 2)
+    evaluation_openings(settings.games // 2)
     player = _stockfish_player(replace(settings, depth=1))
     try:
         engine_name = player.engine_name
@@ -171,23 +146,6 @@ def validate_ladder_configuration(run: TrainingRunConfig) -> None:
             raise ValueError(f"ladder_max_elo {run.ladder_max_elo} is outside engine range {elo_range}")
     except (OSError, ImportError, ValueError, RuntimeError, _StockfishException) as exc:
         raise RuntimeError(f"Fairy-Stockfish ladder preflight failed: {exc}") from exc
-
-
-class ArenaMCTSPlayer:
-    """Callable player: one MCTS instance, greedy policy (matches batched arena)."""
-
-    def __init__(self, game: ChessGame, nnet: LunaNetwork, mcts_params: MCTSParams) -> None:
-        self._mcts = MCTS(game, nnet, mcts_params)
-
-    def __call__(self, canonical_board: chess.Board) -> int:
-        self._mcts.search_latent(
-            canonical_board,
-            temp=0.0,
-            add_exploration_noise=False,
-        )
-        if self._mcts.last_action is None:
-            raise RuntimeError("Search returned no legal continuation")
-        return self._mcts.last_action
 
 
 def _score_game_for_model(arena_result: float, model_is_player1: bool) -> str:
@@ -255,7 +213,7 @@ def _balanced_game_count(requested_games: int) -> int | StockfishEvalSkipped:
 
 def _openings_for_match(game_count: int) -> list[chess.Board] | StockfishEvalSkipped:
     try:
-        return _evaluation_openings(game_count // 2)
+        return list(evaluation_openings(game_count // 2))
     except ValueError as exc:
         logger.warning("Stockfish eval skipped (opening suite): {}", exc)
         return StockfishEvalSkipped("too_many_games", str(exc))
