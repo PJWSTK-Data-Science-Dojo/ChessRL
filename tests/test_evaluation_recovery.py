@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+import luna.online_checkpoints as online_checkpoints
 import main as training_entry
 from luna.coach import Coach
 from luna.config import EzV2LearnerConfig, TrainCliConfig, TrainingRunConfig
@@ -34,9 +35,9 @@ def test_cross_directory_resume_recovers_newest_numbered_checkpoint(tmp_path: Pa
     )
     iteration = {latest.name: 11, newest.name: 12}
     with patch.object(
-        training_entry.LunaNetwork,
-        "checkpoint_trainer_iteration",
-        side_effect=lambda path: iteration[Path(path).name],
+        online_checkpoints,
+        "_validated_checkpoint_identity",
+        side_effect=lambda path: online_checkpoints._CheckpointIdentity(iteration[Path(path).name], None),
     ):
         plan = training_entry._checkpoint_plan(config, config.to_training_run())
     assert plan.cross_directory

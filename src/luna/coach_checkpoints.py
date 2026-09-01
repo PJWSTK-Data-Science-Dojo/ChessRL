@@ -274,6 +274,24 @@ def atomic_copy(source: Path, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def publish_bootstrap_checkpoint(network: LunaNetwork, checkpoint_dir: str) -> Path:
+    """Durably seed a new online lineage before its first self-play iteration."""
+    if not checkpoint_dir.strip():
+        raise ValueError("Online bootstrap requires a checkpoint directory")
+    if network.global_step != 0 or network.trainer_iteration != 0:
+        raise ValueError("Online bootstrap requires zero training counters")
+    folder = Path(checkpoint_dir).expanduser().resolve()
+    conflicts = _managed_checkpoint_conflicts(folder)
+    if conflicts:
+        raise FileExistsError(f"Online bootstrap target already contains managed files: {conflicts}")
+    checkpoint = folder / "checkpoint_0.pth.tar"
+    network.save_checkpoint(str(folder), checkpoint.name)
+    atomic_copy(checkpoint, folder / "latest.pth.tar")
+    network._loaded_checkpoint_path = checkpoint
+    logger.info("Published online bootstrap checkpoint {}", checkpoint)
+    return checkpoint
+
+
 def update_best_from_stockfish(
     coach: Coach,
     iteration: int,

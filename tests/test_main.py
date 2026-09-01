@@ -7,22 +7,23 @@ from unittest.mock import patch
 
 import pytest
 
+import luna.online_checkpoints as online_checkpoints
 import main as training_entry
 from luna.config import EzV2LearnerConfig, TrainCliConfig, TrainingRunConfig, WandbResumeMode
 
 
 def test_new_training_phase_target_must_be_dedicated_and_empty(tmp_path: Path) -> None:
     target = tmp_path / "phase"
-    training_entry.validate_new_training_phase_target(str(target))
+    online_checkpoints.validate_new_training_phase_target(str(target))
     target.mkdir()
-    training_entry.validate_new_training_phase_target(str(target))
+    online_checkpoints.validate_new_training_phase_target(str(target))
     (target / "notes.txt").write_text("occupied", encoding="utf-8")
 
     with pytest.raises(FileExistsError, match="requires an empty checkpoint directory"):
-        training_entry.validate_new_training_phase_target(str(target))
+        online_checkpoints.validate_new_training_phase_target(str(target))
 
     with pytest.raises(ValueError, match="requires a non-empty"):
-        training_entry.validate_new_training_phase_target("")
+        online_checkpoints.validate_new_training_phase_target("")
 
 
 def test_resume_selects_newest_numbered_checkpoint_when_latest_lags(tmp_path: Path) -> None:
@@ -34,16 +35,19 @@ def test_resume_selects_newest_numbered_checkpoint_when_latest_lags(tmp_path: Pa
     newest.write_bytes(b"new")
 
     with patch.object(
-        training_entry.LunaNetwork,
-        "checkpoint_trainer_iteration",
-        side_effect=lambda path: 11 if Path(path).name == latest.name else 12,
+        online_checkpoints,
+        "_validated_checkpoint_identity",
+        side_effect=lambda path: online_checkpoints._CheckpointIdentity(
+            11 if Path(path).name == latest.name else 12,
+            None,
+        ),
     ):
-        selected = training_entry.resolve_resume_checkpoint(latest, target)
+        selected = online_checkpoints.resolve_resume_checkpoint(latest, target)
 
     assert selected == newest
 
 
-def test_resume_prefers_latest_when_its_iteration_matches_numbered_checkpoint(tmp_path: Path) -> None:
+def test_resume_prefers_immutable_checkpoint_when_latest_has_same_iteration(tmp_path: Path) -> None:
     target = tmp_path / "run"
     target.mkdir()
     latest = target / "latest.pth.tar"
@@ -51,10 +55,12 @@ def test_resume_prefers_latest_when_its_iteration_matches_numbered_checkpoint(tm
     latest.write_bytes(b"latest")
     numbered.write_bytes(b"numbered")
 
-    with patch.object(training_entry.LunaNetwork, "checkpoint_trainer_iteration", return_value=12):
-        selected = training_entry.resolve_resume_checkpoint(latest, target)
+    identity = online_checkpoints._CheckpointIdentity(12, None)
+    with patch.object(online_checkpoints, "_validated_checkpoint_identity", return_value=identity):
+        selected = online_checkpoints.resolve_resume_checkpoint(latest, target)
 
-    assert selected == latest
+    assert selected == numbered
+    assert latest.read_bytes() == numbered.read_bytes()
 
 
 def test_resume_recovers_numbered_checkpoint_when_latest_is_missing(tmp_path: Path) -> None:
@@ -63,8 +69,9 @@ def test_resume_recovers_numbered_checkpoint_when_latest_is_missing(tmp_path: Pa
     numbered = target / "checkpoint_3.pth.tar"
     numbered.write_bytes(b"checkpoint")
 
-    with patch.object(training_entry.LunaNetwork, "checkpoint_trainer_iteration", return_value=3):
-        selected = training_entry.resolve_resume_checkpoint(target / "latest.pth.tar", target)
+    identity = online_checkpoints._CheckpointIdentity(3, None)
+    with patch.object(online_checkpoints, "_validated_checkpoint_identity", return_value=identity):
+        selected = online_checkpoints.resolve_resume_checkpoint(target / "latest.pth.tar", target)
 
     assert selected == numbered
 
@@ -76,10 +83,14 @@ def test_resume_rejects_numbered_checkpoint_with_mismatched_iteration(tmp_path: 
     numbered.write_bytes(b"checkpoint")
 
     with (
-        patch.object(training_entry.LunaNetwork, "checkpoint_trainer_iteration", return_value=3),
+        patch.object(
+            online_checkpoints,
+            "_validated_checkpoint_identity",
+            return_value=online_checkpoints._CheckpointIdentity(3, None),
+        ),
         pytest.raises(RuntimeError, match="differs from its filename"),
     ):
-        training_entry.resolve_resume_checkpoint(target / "latest.pth.tar", target)
+        online_checkpoints.resolve_resume_checkpoint(target / "latest.pth.tar", target)
 
 
 def test_main_rejects_resume_and_new_phase_together() -> None:
@@ -236,6 +247,7 @@ def test_main_routes_new_phase_to_weights_only_initializer(tmp_path: Path) -> No
     with (
         patch.object(training_entry.tyro, "cli", return_value=config),
         patch.object(training_entry, "LunaNetwork") as network_type,
+        patch.object(training_entry, "publish_bootstrap_checkpoint") as publish_bootstrap,
         patch.object(training_entry, "Coach") as coach_type,
     ):
         network_type.__name__ = "LunaNetwork"
@@ -243,6 +255,7 @@ def test_main_routes_new_phase_to_weights_only_initializer(tmp_path: Path) -> No
 
     assert result == 0
     network_type.return_value.initialize_training_phase.assert_called_once_with(str(source), "latest.pth.tar")
+    publish_bootstrap.assert_called_once_with(network_type.return_value, str(target))
     network_type.return_value.load_checkpoint.assert_not_called()
     assert coach_type.call_args.kwargs["wandb_project"] == "ChessRL"
     assert coach_type.call_args.kwargs["wandb_run_id"] == "luna-strength-1500-v1"

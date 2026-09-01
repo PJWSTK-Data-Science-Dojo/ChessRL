@@ -12,6 +12,7 @@ import tyro
 from loguru import logger
 
 from luna.coach import Coach, validate_fresh_checkpoint_target, validate_resume_checkpoint_target
+from luna.coach_checkpoints import publish_bootstrap_checkpoint
 from luna.config import (
     EzV2LearnerConfig,
     TrainCliConfig,
@@ -30,53 +31,7 @@ from luna.game.stockfish_eval import (
 )
 from luna.game.stockfish_ladder import LADDER_STATE_NAME, load_fairy_ladder_state
 from luna.network import LunaNetwork, RepresentationCollapseError
-
-
-def validate_new_training_phase_target(checkpoint_dir: str) -> None:
-    """Require a dedicated empty directory for a weights-only training phase."""
-    if not checkpoint_dir.strip():
-        raise ValueError("new_training_phase requires a non-empty --run.checkpoint directory")
-    target = Path(checkpoint_dir).expanduser().resolve()
-    if not target.exists():
-        return
-    if not target.is_dir():
-        raise FileExistsError(f"New training phase target is not a directory: {target}")
-    contents = sorted(path.name for path in target.iterdir())
-    if contents:
-        raise FileExistsError(
-            f"New training phase requires an empty checkpoint directory, but {target} contains {contents}. "
-            "Choose a new --run.checkpoint directory."
-        )
-
-
-def resolve_resume_checkpoint(requested: Path, target: Path) -> Path:
-    """Select the newest immutable checkpoint when ``latest`` lags after a crash."""
-    resolved = requested.expanduser().resolve()
-    if resolved.name != "latest.pth.tar" or resolved.parent != target.expanduser().resolve():
-        return resolved
-
-    candidates: list[tuple[int, Path]] = []
-    if resolved.is_file():
-        candidates.append((LunaNetwork.checkpoint_trainer_iteration(resolved), resolved))
-    for numbered in resolved.parent.glob("checkpoint_*.pth.tar"):
-        suffix = numbered.name.removeprefix("checkpoint_").removesuffix(".pth.tar")
-        try:
-            filename_iteration = int(suffix)
-        except ValueError as exc:
-            raise RuntimeError(f"Invalid numbered checkpoint name: {numbered}") from exc
-        checkpoint_iteration = LunaNetwork.checkpoint_trainer_iteration(numbered)
-        if checkpoint_iteration != filename_iteration:
-            raise RuntimeError(
-                f"Numbered checkpoint iteration {checkpoint_iteration} differs from its filename: {numbered}"
-            )
-        candidates.append((checkpoint_iteration, numbered))
-    if not candidates:
-        raise FileNotFoundError(f"No resumable checkpoint in {resolved.parent}")
-
-    _, selected = max(candidates, key=lambda candidate: candidate[0])
-    if selected != resolved:
-        logger.warning('Recovering from newest immutable checkpoint "{}" instead of "{}"', selected, resolved)
-    return selected
+from luna.online_checkpoints import resolve_resume_checkpoint, validate_new_training_phase_target
 
 
 @dataclass(frozen=True)
@@ -250,6 +205,7 @@ def _initialize_network(setup: _TrainingSetup, game: Game) -> LunaNetwork:
             setup.cli.load_checkpoint_file,
         )
         network.initialize_training_phase(setup.cli.load_checkpoint_dir, setup.cli.load_checkpoint_file)
+        publish_bootstrap_checkpoint(network, setup.run.checkpoint)
     else:
         logger.info("Starting a new run from randomly initialized weights.")
     return network
