@@ -86,7 +86,8 @@ a 256-ply Monte Carlo value horizon, and a 300,000-position replay window. It se
 13-class piece decoder. SimSiam and reanalysis are disabled during this cold-start
 phase so the learner cannot minimize its objective by copying a collapsed target or
 bootstrapping almost every position from its own near-zero value. BF16 and compiled
-inference/training remain enabled. Root exploration remains active throughout the bounded
+training remain enabled. External evaluation uses eager inference because its variable
+search workload proved unstable under long-running Inductor compilation. Root exploration remains active throughout the bounded
 256-ply self-play game, and a self-play-only guard reruns a root search when the chosen
 move would immediately enable a threefold-repetition claim. The full legal mask is still
 stored as the learning target. The replay capacity counts positions, not trajectories.

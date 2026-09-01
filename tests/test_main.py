@@ -366,7 +366,6 @@ def test_maintained_train_target_uses_fresh_state_anchored_contract() -> None:
         "--learner.reward-loss-weight 0.1",
         "--learner.consistency-loss-weight 0.0",
         "--learner.reconstruction-loss-weight 0.5",
-        "--learner.compile-inference",
         "--learner.compile-training",
         "--run.self-play-repetition-guard",
         "--run.target-replay-ratio 2.0",
