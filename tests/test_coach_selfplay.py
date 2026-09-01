@@ -39,6 +39,8 @@ class TestMaxPlyTruncation:
         assert all(r == 0.0 for r in traj.rewards[:-1])
         assert np.isclose(traj.rewards[-1], 0.0)
         assert traj.truncated is True
+        assert traj.truncation_bootstrap_value is not None
+        assert np.isfinite(traj.truncation_bootstrap_value)
 
 
 class TestBatchedSelfPlay:
@@ -65,6 +67,8 @@ class TestBatchedSelfPlay:
             assert t.game_length <= 5
             assert t.observations.shape[0] == t.game_length
             assert t.truncated is True
+            assert t.truncation_bootstrap_value is not None
+            assert np.isfinite(t.truncation_bootstrap_value)
 
 
 def test_skipped_training_still_logs_iteration_observability(
@@ -100,6 +104,7 @@ def test_skipped_training_still_logs_iteration_observability(
     assert metrics["selfplay/avg_ply"] == 2.5
     assert metrics["selfplay/max_ply_fraction"] == 0.5
     assert metrics["selfplay/truncated_fraction"] == 0.5
+    assert metrics["selfplay/truncation_bootstrap_mean_abs"] == 0.0
     assert metrics["selfplay/decisive_fraction"] == 0.0
     assert metrics["selfplay/draw_fraction"] == 0.5
     assert metrics["selfplay/white_win_fraction"] == 0.0

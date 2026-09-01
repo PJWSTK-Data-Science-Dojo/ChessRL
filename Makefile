@@ -11,6 +11,20 @@ MIGRATION_CHECKPOINT_DIR ?= ./runs/luna-fairy-ladder-v1
 FAIRY_STOCKFISH_PATH ?= ./vendor/stockfish/fairy-stockfish-14
 TRAIN_ENV_FILE ?= .env
 WANDB_PROJECT ?= ChessRL
+PGN_DATA_DIR ?= ./data
+PGN_DATA_FILE ?= lichess_db_broadcast_2026-07.pgn.zst
+PGN_DATA_PATH ?= $(PGN_DATA_DIR)/$(PGN_DATA_FILE)
+PGN_DATA_URL ?= https://database.lichess.org/broadcast/$(PGN_DATA_FILE)
+PGN_DATA_SHA256 ?= 714d0eb99f99fca8d791142038b6c59b5ca6a51b3339bd3891a92f4bdffcbf0c
+PGN_SOURCE_CHECKPOINT ?= ./runs/luna-balanced-ezv2-state-anchor-v3/latest.pth.tar
+PGN_PRETRAIN_CHECKPOINT_DIR ?= ./runs/luna-balanced-pgn-pretrain-v1
+PGN_PRETRAIN_WANDB_RUN_ID ?= luna-balanced-pgn-pretrain-v1
+PGN_PRETRAIN_WANDB_RUN_NAME ?= Luna Balanced · Expert PGN Pretrain v1
+PGN_EVAL_CHECKPOINT ?=
+PGN_SELECTED_CHECKPOINT ?=
+PGN_RL_CHECKPOINT_DIR ?= ./runs/luna-balanced-ezv2-pgn-warmstart-v1
+PGN_RL_WANDB_RUN_ID ?= luna-balanced-ezv2-pgn-warmstart-v1
+PGN_RL_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · PGN Warm Start v1
 NEW_PHASE_WANDB_RUN_ID ?= luna-balanced-ezv2-anti-collapse-v2
 NEW_PHASE_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · Anti-Collapse v2
 MIGRATION_WANDB_RUN_ID ?= luna-fairy-ladder-v1
@@ -127,8 +141,8 @@ audit:
 bench:
 	uv run --frozen python tests/bench_throughput.py $(ARGS)
 
-# Fresh, state-anchored single-accelerator recipe. It deliberately uses full-game
-# Monte Carlo targets and no self-predictive consistency during the cold start.
+# Fresh, state-anchored single-accelerator recipe. It uses bootstrapped n-step
+# targets and no self-predictive consistency during the cold start.
 # ARGS is appended last so every setting can be overridden without editing this file.
 train:
 	uv run --frozen python src/main.py \
@@ -147,13 +161,13 @@ train:
 		--run.max-ply 256 \
 		--run.train-steps-per-iter 200 \
 		--run.target-replay-ratio 2.0 \
-		--run.lr-schedule-total-steps 60000 \
+		--run.lr-schedule-total-steps 72000 \
 		--run.replay-capacity 300000 \
 		--run.replay-warmup-positions 50000 \
 		--run.stockfish-eval-every 25 \
 		--run.stockfish-eval-games 20 \
 		--run.stockfish-elo 1500 \
-		--run.ladder-eval-every 5 \
+		--run.ladder-eval-every 10 \
 		--run.ladder-eval-games 20 \
 		--run.ladder-start-elo 500 \
 		--run.ladder-step-elo 100 \
@@ -177,7 +191,7 @@ train:
 		--learner.weight-decay 1e-4 \
 		--learner.amp-dtype bfloat16 \
 		--learner.unroll-steps 5 \
-		--learner.td-steps 256 \
+		--learner.td-steps 32 \
 		--learner.policy-loss-weight 1.0 \
 		--learner.value-loss-weight 1.0 \
 		--learner.reward-loss-weight 0.1 \
@@ -188,15 +202,97 @@ train:
 		--learner.recurrent-gradient-scale 0.5 \
 		--learner.dataloader-workers 4 \
 		--learner.compile-training \
-		--learner.reanalyze-mcts-sims 0 \
-		--learner.reanalyze-prob 0.0 \
-		--learner.no-reanalyze-policy \
-		--learner.reanalyze-start-step 20000 \
+		--learner.reanalyze-mcts-sims 8 \
+		--learner.reanalyze-prob 0.02 \
+		--learner.reanalyze-policy \
+		--learner.reanalyze-start-step 5000 \
 		$(TRAIN_ARGS) $(ARGS)
 
 resume:
 	$(MAKE) train CHECKPOINT_DIR="$(CHECKPOINT_DIR)" \
 		TRAIN_ARGS='--load-model --load-checkpoint-dir "$(CHECKPOINT_DIR)" --load-checkpoint-file latest.pth.tar $(TRAIN_ARGS)'
+
+download-pgn-data:
+	@mkdir -p "$(PGN_DATA_DIR)"
+	@if test -f "$(PGN_DATA_PATH)"; then \
+		printf '%s  %s\n' "$(PGN_DATA_SHA256)" "$(PGN_DATA_PATH)" | sha256sum --check --status; \
+	else \
+		curl --fail --location --continue-at - --output "$(PGN_DATA_PATH).part" "$(PGN_DATA_URL)"; \
+		printf '%s  %s\n' "$(PGN_DATA_SHA256)" "$(PGN_DATA_PATH).part" | sha256sum --check --status; \
+		mv "$(PGN_DATA_PATH).part" "$(PGN_DATA_PATH)"; \
+	fi
+
+verify-pgn-data:
+	@test -f "$(PGN_DATA_PATH)" || { echo "PGN dataset not found; run make download-pgn-data" >&2; exit 2; }
+	@printf '%s  %s\n' "$(PGN_DATA_SHA256)" "$(PGN_DATA_PATH)" | sha256sum --check --status || { \
+		echo "PGN dataset SHA-256 mismatch: $(PGN_DATA_PATH)" >&2; exit 2; }
+
+# Starts the supervised warm start once and resumes it automatically after a
+# process or host failure. The trainer validates the source/data provenance.
+pretrain-pgn: _train-env-preflight verify-pgn-data
+	@if test -f "$(PGN_PRETRAIN_CHECKPOINT_DIR)/latest.pth.tar" || \
+		find "$(PGN_PRETRAIN_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'pretrain_step_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
+		set -- --resume-checkpoint "$(PGN_PRETRAIN_CHECKPOINT_DIR)/latest.pth.tar"; \
+		wandb_resume=must; \
+	else \
+		test -f "$(PGN_SOURCE_CHECKPOINT)" || { echo "PGN source checkpoint not found: $(PGN_SOURCE_CHECKPOINT)" >&2; exit 2; }; \
+		set -- --source-checkpoint "$(PGN_SOURCE_CHECKPOINT)"; \
+		wandb_resume=never; \
+	fi; \
+	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/pretrain_pgn.py \
+		--dataset-path "$(PGN_DATA_PATH)" \
+		--output-dir "$(PGN_PRETRAIN_CHECKPOINT_DIR)" \
+		"$$@" \
+		--total-steps 10000 \
+		--chunk-steps 1000 \
+		--checkpoint-top-k 10 \
+		--dataset.min-player-elo 2000 \
+		--dataset.max-positions 300000 \
+		--dataset.validation-fraction 0.05 \
+		--dataset.max-game-plies 256 \
+		--learner.cuda-device 0 \
+		--learner.dataloader-workers 4 \
+		--wandb-project "$(WANDB_PROJECT)" \
+		--wandb-run-id "$(PGN_PRETRAIN_WANDB_RUN_ID)" \
+		--wandb-run-name "$(PGN_PRETRAIN_WANDB_RUN_NAME)" \
+		--wandb-resume "$$wandb_resume" \
+		$(ARGS)
+
+# Benchmarks one immutable PGN milestone at the first real Fairy-Stockfish Elo.
+eval-pgn-warmstart: _fairy-stockfish-preflight
+	@test -n "$(PGN_EVAL_CHECKPOINT)" || { echo "PGN_EVAL_CHECKPOINT is required" >&2; exit 2; }
+	@test -f "$(PGN_EVAL_CHECKPOINT)" || { echo "PGN checkpoint not found: $(PGN_EVAL_CHECKPOINT)" >&2; exit 2; }
+	uv run --frozen python src/eval_vs_stockfish.py \
+		--checkpoint "$(PGN_EVAL_CHECKPOINT)" \
+		--opponent fairy \
+		--learner.device cuda \
+		--learner.cuda-device 0 \
+		--run.search-mode gumbel \
+		--run.num-mcts-sims 32 \
+		--run.evaluation-num-mcts-sims 32 \
+		--run.gumbel-max-considered-actions 8 \
+		--run.ladder-eval-games 20 \
+		--run.ladder-start-elo 500 \
+		--run.ladder-depth 10 \
+		--run.ladder-path "$(FAIRY_STOCKFISH_PATH)" \
+		--run.ladder-eval-max-ply 256 \
+		$(ARGS)
+
+# Starts online learning only from an explicitly benchmarked immutable PGN
+# milestone. Repeated calls resume the same optimizer/checkpoint/W&B lineage.
+train-pgn-warmstart: _train-env-preflight _fairy-stockfish-preflight
+	@if test -f "$(PGN_RL_CHECKPOINT_DIR)/latest.pth.tar" || \
+		find "$(PGN_RL_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'checkpoint_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
+		$(MAKE) resume CHECKPOINT_DIR="$(PGN_RL_CHECKPOINT_DIR)" \
+			TRAIN_ARGS='--wandb-project "$(WANDB_PROJECT)" --wandb-run-id "$(PGN_RL_WANDB_RUN_ID)" --wandb-run-name "$(PGN_RL_WANDB_RUN_NAME)" --wandb-resume must'; \
+	else \
+		test -n "$(PGN_SELECTED_CHECKPOINT)" || { \
+			echo "PGN_SELECTED_CHECKPOINT must name a benchmarked immutable checkpoint" >&2; exit 2; }; \
+		test -f "$(PGN_SELECTED_CHECKPOINT)" || { \
+			echo "Selected PGN checkpoint not found: $(PGN_SELECTED_CHECKPOINT)" >&2; exit 2; }; \
+		$(MAKE) train CHECKPOINT_DIR="$(PGN_RL_CHECKPOINT_DIR)" \
+			TRAIN_ARGS='--new-training-phase --load-checkpoint-dir "$(dir $(PGN_SELECTED_CHECKPOINT))" --load-checkpoint-file "$(notdir $(PGN_SELECTED_CHECKPOINT))" --wandb-project "$(WANDB_PROJECT)" --wandb-run-id "$(PGN_RL_WANDB_RUN_ID)" --wandb-run-name "$(PGN_RL_WANDB_RUN_NAME)" --wandb-resume never'; \
+	fi
 
 _train-env-preflight:
 	@test -f "$(TRAIN_ENV_FILE)" || { echo "Training environment file not found: $(TRAIN_ENV_FILE)" >&2; exit 2; }
@@ -372,8 +468,8 @@ test-pipeline-cpu:
 test-pipeline-mps:
 	$(MAKE) test-pipeline-cpu ARGS="--learner.device mps $(ARGS)"
 
-.PHONY: _fairy-stockfish-preflight _train-env-preflight audit bench check eval-stockfish fmt format-check \
-	install-fairy-stockfish lichess-config lint migrate-ladder-phase profile-smoke release-web-model resume resume-migrated-phase resume-phase \
-	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train-phase \
+.PHONY: _fairy-stockfish-preflight _train-env-preflight audit bench check download-pgn-data eval-pgn-warmstart eval-stockfish fmt format-check \
+	install-fairy-stockfish lichess-config lint migrate-ladder-phase pretrain-pgn profile-smoke release-web-model resume resume-migrated-phase resume-phase \
+	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train-phase train-pgn-warmstart \
 	train types uci verify-web-model web-build web-config web-down web-logs web-public-config \
-	web-public-down web-public-logs web-public-up web-up
+	verify-pgn-data web-public-down web-public-logs web-public-up web-up

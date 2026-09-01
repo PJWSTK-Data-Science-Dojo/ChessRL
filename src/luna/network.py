@@ -146,6 +146,14 @@ class LunaNetwork(NetworkCheckpointMixin):
     def training_phase_provenance(self) -> TrainingPhaseProvenance | None:
         return self._training_phase_provenance
 
+    @property
+    def global_step(self) -> int:
+        return self._global_step
+
+    @property
+    def trainer_iteration(self) -> int:
+        return self._trainer_iteration
+
     def warmup_mcts_inference(self, game: ChessGame) -> None:
         if not self._mcts_inference_compiled:
             return

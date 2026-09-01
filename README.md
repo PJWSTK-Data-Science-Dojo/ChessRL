@@ -1,6 +1,6 @@
 # Luna ChessRL
 
-Luna is a model-based reinforcement-learning chess engine trained from self-play. It combines an EfficientZeroV2-style latent world model with Gumbel MuZero search, prioritized replay, full-game outcome targets, and optional auxiliary representation objectives. The repository includes training, evaluation, an interactive browser experience, a UCI adapter, and a secure Lichess deployment helper.
+Luna is a model-based reinforcement-learning chess engine trained from self-play. It combines an EfficientZeroV2-style latent world model with Gumbel MuZero search, prioritized replay, n-step value targets, and optional auxiliary representation objectives. The repository includes training, evaluation, an interactive browser experience, a UCI adapter, and a secure Lichess deployment helper.
 
 This is a research and portfolio project, not a claim of engine parity with established tournament systems. Playing strength depends on training data, compute budget, search settings, and evaluation methodology.
 
@@ -14,7 +14,7 @@ This is a research and portfolio project, not a claim of engine parity with esta
 - A convolutional policy head aligned to source squares, destination squares, and underpromotion identity.
 - A 119-plane observation tensor with eight positions of piece/repetition history and complete current rule state.
 - K-step unrolled policy, value, and reward losses; optional SimSiam consistency and training-only board reconstruction.
-- Three-bin categorical value and reward targets for the exact `{-1, 0, 1}` chess outcome range.
+- Three-bin categorical value and reward supports for scalar targets in the `[-1, 1]` chess value range.
 - Prioritized trajectory replay with compact `float16` observations/policies and boolean legal masks.
 - AdamW, learning-rate warm-up followed by cosine decay, mixed precision, gradient clipping, accumulation, and recurrent gradient scaling.
 - Optional batched search-value estimation and policy reanalysis using the current network.
@@ -81,23 +81,74 @@ Use `uv run python src/main.py --help` for the complete Tyro-generated option re
 
 The maintained preset uses four persistent self-play actors with 32 games each, a
 256-position learner batch split into two microbatches, a five-step latent unroll,
-a 256-ply Monte Carlo value horizon, and a 300,000-position replay window. It selects
+a 32-step bootstrapped value horizon, and a 300,000-position replay window. It selects
 `balanced_reconstruction`: the 128-channel asymmetric SE-ResNet plus a training-only
-13-class piece decoder. SimSiam and reanalysis are disabled during this cold-start
-phase so the learner cannot minimize its objective by copying a collapsed target or
-bootstrapping almost every position from its own near-zero value. BF16 and compiled
-training remain enabled. External evaluation uses eager inference because its variable
+13-class piece decoder. SimSiam remains disabled; after 5,000 optimizer steps, 2% of
+sampled trajectories receive an eight-simulation value and policy reanalysis. BF16 and
+compiled training remain enabled. External evaluation uses eager inference because its variable
 search workload proved unstable under long-running Inductor compilation. Root exploration remains active throughout the bounded
 256-ply self-play game, and a self-play-only guard reruns a root search when the chosen
 move would immediately enable a threefold-repetition claim. The full legal mask is still
-stored as the learning target. The replay capacity counts positions, not trajectories.
+stored as the learning target. If a game reaches the operational ply limit, its final
+post-action state is evaluated and stored as a bootstrap boundary; truncation is never
+treated as a chess draw. The replay capacity counts positions, not trajectories.
 
 After a fresh process or resume, learning waits for 50,000 replay positions. Thereafter
 the learner targets two sampled positions per newly generated position, capped at 200
-optimizer steps per iteration, while the cosine schedule keeps an explicit 60,000-step
-horizon. Reanalysis starts disabled and should be introduced only as a separately named
-ablation after value and latent-diversity metrics are healthy. These limits avoid letting
+optimizer steps per iteration, while the cosine schedule keeps an explicit 72,000-step
+horizon. These limits avoid letting
 unusually short self-play games multiply their own distribution through a fixed update count.
+
+## Expert PGN warm start
+
+For a single-GPU run, the maintained expert warm start trains the same
+`balanced_reconstruction` network before returning it to online Gumbel MuZero self-play.
+It supervises the played expert action, the position value, all five recurrent dynamics
+steps, and board reconstruction. Positions with a Lichess `%eval` annotation use its
+Stockfish WDL expectation from the side-to-move perspective; the final game result is the
+fallback. Reward, SimSiam, and reanalysis losses are disabled in this offline phase.
+The next online phase resets AdamW and the LR schedule while preserving the pretrained
+weights and source-checkpoint SHA-256 provenance.
+
+The default reproducible corpus is the July 2026
+[Lichess Broadcast database](https://database.lichess.org/broadcast/lichess_db_broadcast_2026-07.pgn.zst)
+export: 40,038 official
+broadcast games under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
+The archive is not committed. Its download target verifies the pinned official SHA-256
+`714d0eb99f99fca8d791142038b6c59b5ca6a51b3339bd3891a92f4bdffcbf0c`,
+and the importer keeps at most 300,000 positions from complete standard games where both
+players are rated at least 2000. Training and validation are split by whole-game hash, so
+positions from one game cannot leak across the split.
+
+```bash
+make download-pgn-data
+make verify-pgn-data
+make pretrain-pgn
+```
+
+`src/pretrain_pgn.py` is the typed CLI behind `make pretrain-pgn`. A fresh invocation uses
+the current state-anchor checkpoint as weights-only input; a repeated invocation recovers
+the newest healthy immutable PGN checkpoint, including when `latest.pth.tar` is missing or
+corrupt. Both paths use the explicit W&B ID `luna-balanced-pgn-pretrain-v1`, which is also
+part of the resume contract. Fresh runs use W&B `resume=never`; checkpoint resumes use
+`resume=must`, so neither path can silently create or join an unrelated dashboard.
+
+The ten 1,000-step milestones are retained because supervised validation is not a chess
+strength measurement. Benchmark at least the 2k, 5k, and 10k milestones with the same
+paired openings before choosing one:
+
+```bash
+make eval-pgn-warmstart PGN_EVAL_CHECKPOINT=./runs/luna-balanced-pgn-pretrain-v1/pretrain_step_00002000.pth.tar
+make eval-pgn-warmstart PGN_EVAL_CHECKPOINT=./runs/luna-balanced-pgn-pretrain-v1/pretrain_step_00005000.pth.tar
+make eval-pgn-warmstart PGN_EVAL_CHECKPOINT=./runs/luna-balanced-pgn-pretrain-v1/pretrain_step_00010000.pth.tar
+make train-pgn-warmstart PGN_SELECTED_CHECKPOINT=./runs/luna-balanced-pgn-pretrain-v1/pretrain_step_00005000.pth.tar
+```
+
+The last command starts a weights-only online phase under the separate W&B ID
+`luna-balanced-ezv2-pgn-warmstart-v1`; subsequent calls resume it without requiring the
+selection argument. The PGN phase is a bounded initialization, not a permanent
+human-policy regularizer: online search targets replace imitation targets so the model
+can recover from human mistakes and states outside the expert distribution.
 
 ## Historical phase commands
 
@@ -251,13 +302,13 @@ opening is played with both color assignments. A small match is still a noisy es
 ## Training flow
 
 1. A sliding pool of games produces batched self-play through latent search.
-2. Each position stores observation, action, acting-player reward, improved search policy, root value, and legal mask.
+2. Each position stores observation, action, acting-player reward, improved search policy, root value, and legal mask. A time-limited trajectory also stores the value of its post-action boundary state.
 3. Prioritized replay samples positions and constructs K-step unroll targets with alternating player signs.
 4. Optional reanalysis refreshes selected value and policy targets with the current model.
 5. The learner performs one optimizer update per training step, using accumulation only to form that update.
 6. Numbered and `latest` checkpoints are saved atomically; optional external evaluation may promote `best`.
 
-Chess uses an undiscounted terminal objective (`discount=1.0`). Terminal outcomes are represented explicitly as `None` while ongoing and `-1`, `0`, or `1` when complete. Illegal model actions fail fast instead of being replaced silently.
+Chess uses an undiscounted terminal objective (`discount=1.0`). Terminal outcomes are represented explicitly as `None` while ongoing and `-1`, `0`, or `1` when complete. A maximum-ply cutoff is a truncation, not a terminal outcome, so value targets bootstrap across it. Illegal model actions fail fast instead of being replaced silently.
 
 ## Useful commands
 
@@ -272,6 +323,9 @@ make check               # format check + lint + types + tests
 make audit               # audit locked runtime dependencies (network required)
 make bench               # throughput benchmark
 make profile-smoke       # bounded end-to-end profile
+make download-pgn-data   # fetch and verify the pinned expert corpus
+make pretrain-pgn        # start or resume supervised PGN warm-start training
+make train-pgn-warmstart # start or resume the online phase from PGN weights
 make train-phase         # start the dedicated strength continuation phase
 make resume-phase        # resume that phase after an interruption
 make resume-migrated-phase  # resume the separate complete-state migration
@@ -328,6 +382,7 @@ src/luna/balanced_networks.py  asymmetric SE-ResNet and state-anchored variant
 src/luna/mcts*.py              Gumbel MuZero, PUCT, and batched latent search
 src/luna/replay_buffer.py      prioritized trajectory replay
 src/luna/targets.py            TD and unroll targets
+src/luna/pgn_*.py              expert-PGN ingestion, validation, and warm-start training
 src/luna/uci.py                UCI adapter
 src/luna/lichess_config.py     secure lichess-bot config generator
 src/luna/game/                 chess rules, arena, players, Stockfish eval

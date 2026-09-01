@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from src.web_app import LunaEngineService, WebAppConfig, create_app, parse_exact_trusted_hosts
+from web_app import LunaEngineService, WebAppConfig, create_app, parse_exact_trusted_hosts
 
 
 def _environment_bool(name: str, default: bool) -> bool:

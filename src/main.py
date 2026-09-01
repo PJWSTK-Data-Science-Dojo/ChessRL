@@ -126,8 +126,8 @@ def _checkpoint_plan(cli: TrainCliConfig, run: TrainingRunConfig) -> _Checkpoint
         )
     if cross_directory and _evaluation_enabled(run) and not cli.initialize_evaluation_state:
         raise ValueError("Cross-directory resume with external evaluation requires --initialize-evaluation-state")
-    if cli.load_model and not cross_directory:
-        source = resolve_resume_checkpoint(source, target)
+    if cli.load_model:
+        source = resolve_resume_checkpoint(source, source.parent)
     return _CheckpointPlan(source, target, cross_directory)
 
 

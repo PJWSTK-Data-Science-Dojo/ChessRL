@@ -106,7 +106,13 @@ def execute_episode(coach: Coach) -> Trajectory:
         if outcome is not None:
             return _terminal_trajectory(coach.game, state, outcome)
         if coach.run.max_ply is not None and state.step >= coach.run.max_ply:
-            return _trajectory_from_state(state, terminal_value=0.0, truncated=True)
+            bootstrap_value = evaluate_truncation_bootstrap(coach, state.board, state.player)
+            return _trajectory_from_state(
+                state,
+                terminal_value=0.0,
+                truncated=True,
+                truncation_bootstrap_value=bootstrap_value,
+            )
 
 
 def _search_root(coach: Coach, mcts: MCTS, state: _EpisodeState) -> _RootDecision:
@@ -198,6 +204,7 @@ def _trajectory_from_state(
     *,
     terminal_value: float,
     truncated: bool = False,
+    truncation_bootstrap_value: float | None = None,
     termination: chess.Termination | None = None,
 ) -> Trajectory:
     return trajectory_with_terminal_rewards(
@@ -207,13 +214,22 @@ def _trajectory_from_state(
         state.values,
         state.valid_moves,
         terminal_value,
-        truncated,
-        termination,
-        state.guard_attempts,
-        state.guard_interventions,
-        state.guard_forced_fallbacks,
-        state.guard_excluded_actions,
+        truncated=truncated,
+        truncation_bootstrap_value=truncation_bootstrap_value,
+        termination=termination,
+        repetition_guard_attempts=state.guard_attempts,
+        repetition_guard_interventions=state.guard_interventions,
+        repetition_guard_forced_fallbacks=state.guard_forced_fallbacks,
+        repetition_guard_excluded_actions=state.guard_excluded_actions,
     )
+
+
+def evaluate_truncation_bootstrap(coach: Coach, board: chess.Board, player: int) -> float:
+    canonical = coach.game.get_canonical_form(board, player)
+    observations = np.expand_dims(coach.game.to_array(canonical), axis=0)
+    valid_moves = np.expand_dims(coach.game.get_valid_moves(canonical, 1), axis=0)
+    _policies, values, _latents = coach.nnet.batched_initial_inference(observations, valid_moves)
+    return float(values[0])
 
 
 def trajectory_with_terminal_rewards(
@@ -223,7 +239,9 @@ def trajectory_with_terminal_rewards(
     root_values: list[float],
     valids_list: list[np.ndarray],
     terminal_value_for_next_player: float,
+    *,
     truncated: bool = False,
+    truncation_bootstrap_value: float | None = None,
     termination: chess.Termination | None = None,
     repetition_guard_attempts: int = 0,
     repetition_guard_interventions: int = 0,
@@ -240,6 +258,7 @@ def trajectory_with_terminal_rewards(
         root_values=root_values,
         valids=valids_list,
         truncated=truncated,
+        truncation_bootstrap_value=truncation_bootstrap_value,
         termination=termination,
         repetition_guard_attempts=repetition_guard_attempts,
         repetition_guard_interventions=repetition_guard_interventions,

@@ -383,13 +383,15 @@ def _add_target_metrics(
 ) -> None:
     active_values = batch.value_mask.bool()
     count = active_values.sum().clamp(min=1)
+    absolute_values = batch.target_values.abs()
     active_consistency = batch.consistency_mask[:, -1].bool()
     metrics["train/value_target_nonzero_fraction"] = float(
-        ((batch.target_values.abs() > 0.5) & active_values).sum().item() / count.item()
+        ((absolute_values > 1e-6) & active_values).sum().item() / count.item()
     )
-    metrics["train/value_target_mean_abs"] = float(
-        (batch.target_values.abs() * batch.value_mask).sum().item() / count.item()
+    metrics["train/value_target_fractional_fraction"] = float(
+        (((absolute_values > 1e-6) & (absolute_values < 1.0 - 1e-6)) & active_values).sum().item() / count.item()
     )
+    metrics["train/value_target_mean_abs"] = float((absolute_values * batch.value_mask).sum().item() / count.item())
     metrics["train/next_observation_active_fraction"] = float(batch.consistency_mask.mean().item())
     metrics["train/next_observation_active_samples"] = float(active_consistency.sum().item())
     metrics["train/consistency_objective_enabled"] = float(settings.consistency_enabled)

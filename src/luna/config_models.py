@@ -130,7 +130,7 @@ class TrainingRunConfig(MCTSParams):
     """Numbered checkpoints to retain; zero or ``None`` disables pruning."""
 
     max_ply: int | None = None
-    """Optional self-play safety bound that scores unfinished games as draws."""
+    """Optional self-play safety bound; unfinished trajectories bootstrap from their boundary state."""
 
     profile: bool = False
     """Collect iteration phase timings."""

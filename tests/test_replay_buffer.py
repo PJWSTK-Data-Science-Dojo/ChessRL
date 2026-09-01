@@ -115,6 +115,7 @@ class TestPrioritizedReplayBuffer:
 
         assert complete.truncated is False
         assert restored.truncated is True
+        assert restored.truncation_bootstrap_value == 0.0
 
     def test_trajectory_termination_survives_ipc_pickle(self, make_trajectory: TrajectoryFactory) -> None:
         trajectory = make_trajectory(length=1, termination=chess.Termination.THREEFOLD_REPETITION)
@@ -130,6 +131,14 @@ class TestPrioritizedReplayBuffer:
                 truncated=True,
                 termination=chess.Termination.THREEFOLD_REPETITION,
             )
+
+    def test_truncated_trajectory_requires_finite_boundary_value(self) -> None:
+        with pytest.raises(ValueError, match="requires a finite bootstrap value"):
+            Trajectory(**_trajectory_inputs(), truncated=True)
+
+    def test_complete_trajectory_rejects_truncation_boundary_value(self) -> None:
+        with pytest.raises(ValueError, match="Only a truncated trajectory"):
+            Trajectory(**_trajectory_inputs(), truncation_bootstrap_value=0.25)
 
     def test_invalid_inputs_fail_fast(self, make_trajectory: TrajectoryFactory) -> None:
         with pytest.raises(ValueError, match="capacity"):

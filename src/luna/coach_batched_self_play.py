@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from luna.coach_self_play import (
     enables_threefold_claim,
+    evaluate_truncation_bootstrap,
     non_repetition_actions,
     select_self_play_action,
     self_play_exploration_enabled,
@@ -241,7 +242,13 @@ def _advance_slot(
     if outcome is not None:
         return _terminal_slot_trajectory(coach.game, slot, outcome)
     if coach.run.max_ply is not None and slot.steps >= coach.run.max_ply:
-        return _slot_trajectory(slot, terminal_value=0.0, truncated=True)
+        bootstrap_value = evaluate_truncation_bootstrap(coach, slot.board, slot.player)
+        return _slot_trajectory(
+            slot,
+            terminal_value=0.0,
+            truncated=True,
+            truncation_bootstrap_value=bootstrap_value,
+        )
     return None
 
 
@@ -257,6 +264,7 @@ def _slot_trajectory(
     *,
     terminal_value: float,
     truncated: bool = False,
+    truncation_bootstrap_value: float | None = None,
     termination: chess.Termination | None = None,
 ) -> Trajectory:
     return trajectory_with_terminal_rewards(
@@ -266,12 +274,13 @@ def _slot_trajectory(
         slot.values,
         slot.valid_moves,
         terminal_value,
-        truncated,
-        termination,
-        slot.guard_attempts,
-        slot.guard_interventions,
-        slot.guard_forced_fallbacks,
-        slot.guard_excluded_actions,
+        truncated=truncated,
+        truncation_bootstrap_value=truncation_bootstrap_value,
+        termination=termination,
+        repetition_guard_attempts=slot.guard_attempts,
+        repetition_guard_interventions=slot.guard_interventions,
+        repetition_guard_forced_fallbacks=slot.guard_forced_fallbacks,
+        repetition_guard_excluded_actions=slot.guard_excluded_actions,
     )
 
 

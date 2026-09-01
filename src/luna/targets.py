@@ -54,6 +54,8 @@ def compute_target_value(
     value = _discounted_rewards(trajectory, pos_idx, bootstrap_idx, discount)
     if bootstrap_idx < trajectory.game_length:
         value += _bootstrap_value(trajectory, bootstrap_idx, td_steps, discount, root_value_override)
+    elif trajectory.truncated:
+        value += _truncation_bootstrap_value(trajectory, pos_idx, discount, root_value_override)
     return value
 
 
@@ -86,8 +88,29 @@ def _bootstrap_value(
         value = _finite_override(overrides[bootstrap_idx], bootstrap_idx)
     else:
         value = float(trajectory.root_values[bootstrap_idx])
-    sign = 1.0 if td_steps % 2 == 0 else -1.0
-    return (discount**td_steps) * sign * value
+    return _discounted_bootstrap(value, td_steps, discount)
+
+
+def _truncation_bootstrap_value(
+    trajectory: Trajectory,
+    pos_idx: int,
+    discount: float,
+    overrides: dict[int, float] | None,
+) -> float:
+    bootstrap_idx = trajectory.game_length
+    if overrides is not None and bootstrap_idx in overrides:
+        value = _finite_override(overrides[bootstrap_idx], bootstrap_idx)
+    else:
+        stored_value = trajectory.truncation_bootstrap_value
+        if stored_value is None:
+            raise RuntimeError("Truncated trajectory is missing its validated bootstrap value")
+        value = stored_value
+    return _discounted_bootstrap(value, bootstrap_idx - pos_idx, discount)
+
+
+def _discounted_bootstrap(value: float, steps: int, discount: float) -> float:
+    sign = 1.0 if steps % 2 == 0 else -1.0
+    return (discount**steps) * sign * value
 
 
 @dataclass

@@ -335,7 +335,7 @@ def test_train_phase_make_target_keeps_pinned_source_preflight() -> None:
     assert "dd07d8ddf2aa652719b405b4e3b6f7381bb652873a34d139fe37b95327ba99dd" in result.stdout
 
 
-def test_maintained_train_target_uses_fresh_state_anchored_contract() -> None:
+def test_maintained_train_target_uses_bootstrapped_state_anchored_contract() -> None:
     repository = Path(__file__).resolve().parents[1]
 
     result = subprocess.run(
@@ -353,14 +353,14 @@ def test_maintained_train_target_uses_fresh_state_anchored_contract() -> None:
         "--run.self-play-workers 4",
         "--run.stockfish-eval-every 25",
         "--run.stockfish-elo 1500",
-        "--run.ladder-eval-every 5",
+        "--run.ladder-eval-every 10",
         "--run.ladder-start-elo 500",
         "--learner.model-name balanced_reconstruction",
         "--learner.batch-size 256",
         "--learner.repr-blocks 10",
         "--learner.dyn-blocks 1",
         "--learner.unroll-steps 5",
-        "--learner.td-steps 256",
+        "--learner.td-steps 32",
         "--learner.lr 1e-4",
         "--learner.value-loss-weight 1.0",
         "--learner.reward-loss-weight 0.1",
@@ -369,14 +369,15 @@ def test_maintained_train_target_uses_fresh_state_anchored_contract() -> None:
         "--learner.compile-training",
         "--run.self-play-repetition-guard",
         "--run.target-replay-ratio 2.0",
-        "--run.lr-schedule-total-steps 60000",
+        "--run.lr-schedule-total-steps 72000",
         "--run.replay-warmup-positions 50000",
-        "--learner.reanalyze-mcts-sims 0",
-        "--learner.reanalyze-prob 0.0",
-        "--learner.no-reanalyze-policy",
-        "--learner.reanalyze-start-step 20000",
+        "--learner.reanalyze-mcts-sims 8",
+        "--learner.reanalyze-prob 0.02",
+        "--learner.reanalyze-policy",
+        "--learner.reanalyze-start-step 5000",
     )
     for flag in expected_flags:
         assert flag in result.stdout
+    assert "--learner.no-reanalyze-policy" not in result.stdout
     assert "--load-model" not in result.stdout
     assert "--new-training-phase" not in result.stdout

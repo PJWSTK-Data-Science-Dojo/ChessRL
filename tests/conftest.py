@@ -18,6 +18,7 @@ class TrajectoryFactory(Protocol):
         length: int = 10,
         *,
         truncated: bool = False,
+        truncation_bootstrap_value: float = 0.0,
         termination: chess.Termination | None = None,
     ) -> Trajectory: ...
 
@@ -52,6 +53,7 @@ def make_trajectory() -> TrajectoryFactory:
         length: int = 10,
         *,
         truncated: bool = False,
+        truncation_bootstrap_value: float = 0.0,
         termination: chess.Termination | None = None,
     ) -> Trajectory:
         game = ChessGame()
@@ -67,6 +69,7 @@ def make_trajectory() -> TrajectoryFactory:
             root_values=np.zeros(length, dtype=np.float32),
             valids=np.ones((length, action_size), dtype=np.float32),
             truncated=truncated,
+            truncation_bootstrap_value=truncation_bootstrap_value if truncated else None,
             termination=termination,
         )
 

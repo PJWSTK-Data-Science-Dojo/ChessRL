@@ -28,6 +28,7 @@ class _SelfPlaySummary:
     draws: int = 0
     unknown_terminations: int = 0
     policy_entropy_sum: float = 0.0
+    truncation_bootstrap_abs_sum: float = 0.0
     guard_attempts: int = 0
     guard_interventions: int = 0
     guard_forced_fallbacks: int = 0
@@ -79,6 +80,10 @@ def _policy_entropy(trajectory: Trajectory) -> float:
 def _record_outcome(summary: _SelfPlaySummary, trajectory: Trajectory) -> None:
     if trajectory.truncated:
         summary.truncated_games += 1
+        bootstrap_value = trajectory.truncation_bootstrap_value
+        if bootstrap_value is None:
+            raise RuntimeError("Truncated trajectory is missing its validated bootstrap value")
+        summary.truncation_bootstrap_abs_sum += abs(bootstrap_value)
         return
     if trajectory.termination is None:
         summary.unknown_terminations += 1
@@ -101,6 +106,10 @@ def _fraction(count: int, total: int) -> float:
     return count / total if total else 0.0
 
 
+def _mean(total_value: float, count: int) -> float:
+    return total_value / count if count else 0.0
+
+
 def _self_play_metrics(
     coach: Coach,
     summary: _SelfPlaySummary,
@@ -114,6 +123,10 @@ def _self_play_metrics(
         "selfplay/avg_ply": _fraction(positions, summary.games),
         "selfplay/max_ply_fraction": _fraction(summary.truncated_games, summary.games),
         "selfplay/truncated_fraction": _fraction(summary.truncated_games, summary.games),
+        "selfplay/truncation_bootstrap_mean_abs": _mean(
+            summary.truncation_bootstrap_abs_sum,
+            summary.truncated_games,
+        ),
         "selfplay/decisive_fraction": _fraction(decisive_games, summary.games),
         "selfplay/draw_fraction": _fraction(summary.draws, summary.games),
         "selfplay/white_win_fraction": _fraction(summary.white_wins, summary.games),

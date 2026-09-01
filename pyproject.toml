@@ -17,6 +17,7 @@ dependencies = [
     "wandb>=0.16.0",
     "tensorboard>=2.14.0",
     "torch-tb-profiler>=0.4.3",
+    "zstandard>=0.23,<1",
 ]
 
 [project.optional-dependencies]

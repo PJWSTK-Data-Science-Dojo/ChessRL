@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 import chess
@@ -21,6 +22,7 @@ class TrajectoryInput:
     root_values: list[float] | np.ndarray
     valids: list[np.ndarray] | np.ndarray
     truncated: bool
+    truncation_bootstrap_value: float | None
     termination: chess.Termination | None
     repetition_guard_attempts: int
     repetition_guard_interventions: int
@@ -42,6 +44,7 @@ class TrajectoryArrays:
 @dataclass(frozen=True, slots=True)
 class TrajectoryMetadata:
     truncated: bool
+    truncation_bootstrap_value: float | None
     termination: chess.Termination | None
     repetition_guard_attempts: int
     repetition_guard_interventions: int
@@ -153,16 +156,31 @@ def _validate_metadata(values: TrajectoryInput, game_length: int) -> TrajectoryM
         raise TypeError("termination must be a chess.Termination or None")
     if values.truncated and values.termination is not None:
         raise ValueError("A truncated trajectory cannot have a terminal chess outcome")
+    bootstrap_value = _validate_truncation_bootstrap(values)
     counts = _guard_counts(values)
     _validate_guard_counts(counts, game_length)
     return TrajectoryMetadata(
         truncated=bool(values.truncated),
+        truncation_bootstrap_value=bootstrap_value,
         termination=values.termination,
         repetition_guard_attempts=values.repetition_guard_attempts,
         repetition_guard_interventions=values.repetition_guard_interventions,
         repetition_guard_forced_fallbacks=values.repetition_guard_forced_fallbacks,
         repetition_guard_excluded_actions=values.repetition_guard_excluded_actions,
     )
+
+
+def _validate_truncation_bootstrap(values: TrajectoryInput) -> float | None:
+    bootstrap = values.truncation_bootstrap_value
+    if values.truncated:
+        if bootstrap is None or not math.isfinite(bootstrap):
+            raise ValueError("A truncated trajectory requires a finite bootstrap value")
+        if not -1.0 <= bootstrap <= 1.0:
+            raise ValueError("A truncation bootstrap value must be between -1 and 1")
+        return float(bootstrap)
+    if bootstrap is not None:
+        raise ValueError("Only a truncated trajectory may contain a truncation bootstrap value")
+    return None
 
 
 def _guard_counts(values: TrajectoryInput) -> dict[str, int]:

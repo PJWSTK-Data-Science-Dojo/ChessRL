@@ -29,6 +29,7 @@ class Trajectory:
         "root_values",
         "termination",
         "truncated",
+        "truncation_bootstrap_value",
         "valids",
     )
 
@@ -41,6 +42,7 @@ class Trajectory:
         root_values: list[float] | np.ndarray,
         valids: list[np.ndarray] | np.ndarray,
         truncated: bool = False,
+        truncation_bootstrap_value: float | None = None,
         termination: chess.Termination | None = None,
         repetition_guard_attempts: int = 0,
         repetition_guard_interventions: int = 0,
@@ -56,6 +58,7 @@ class Trajectory:
                 root_values=root_values,
                 valids=valids,
                 truncated=truncated,
+                truncation_bootstrap_value=truncation_bootstrap_value,
                 termination=termination,
                 repetition_guard_attempts=repetition_guard_attempts,
                 repetition_guard_interventions=repetition_guard_interventions,
@@ -77,6 +80,7 @@ class Trajectory:
 
     def _store_metadata(self, metadata: TrajectoryMetadata) -> None:
         self.truncated = metadata.truncated
+        self.truncation_bootstrap_value = metadata.truncation_bootstrap_value
         self.termination = metadata.termination
         self.repetition_guard_attempts = metadata.repetition_guard_attempts
         self.repetition_guard_interventions = metadata.repetition_guard_interventions

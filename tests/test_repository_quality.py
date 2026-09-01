@@ -52,6 +52,15 @@ def test_type_checker_suppressions_are_not_committed() -> None:
     assert not suppressions, "Fix typing and lint failures instead of suppressing them: " + ", ".join(suppressions)
 
 
+def test_container_exposes_copied_web_modules_to_wsgi() -> None:
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile.web").read_text(encoding="utf-8")
+    wsgi_source = (REPOSITORY_ROOT / "wsgi.py").read_text(encoding="utf-8")
+
+    assert "PYTHONPATH=/app/src" in dockerfile
+    assert "from web_app import" in wsgi_source
+    assert "from src.web_app import" not in wsgi_source
+
+
 def _comments(path: Path) -> list[str]:
     source = path.read_text(encoding="utf-8")
     tokens = tokenize.generate_tokens(io.StringIO(source).readline)

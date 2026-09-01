@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 import pytest
 
+import main as training_entry
 from luna.coach import Coach
-from luna.config import EzV2LearnerConfig, TrainingRunConfig
+from luna.config import EzV2LearnerConfig, TrainCliConfig, TrainingRunConfig
 from luna.game.benchmark_state import (
     BENCHMARK_STATE_NAME,
     load_benchmark_state,
@@ -18,6 +19,28 @@ from luna.game.chess_game import ChessGame
 from luna.game.stockfish_eval import StockfishEvalScores, stockfish_evaluation_protocol
 from luna.game.stockfish_ladder import LADDER_STATE_NAME, load_fairy_ladder_state, write_fairy_ladder_state
 from luna.network import LunaNetwork
+
+
+def test_cross_directory_resume_recovers_newest_numbered_checkpoint(tmp_path: Path) -> None:
+    source, target = tmp_path / "source", tmp_path / "target"
+    source.mkdir()
+    latest, newest = source / "latest.pth.tar", source / "checkpoint_12.pth.tar"
+    latest.write_bytes(b"old")
+    newest.write_bytes(b"new")
+    config = TrainCliConfig(
+        load_model=True,
+        load_checkpoint_dir=str(source),
+        run=TrainingRunConfig(checkpoint=str(target), stockfish_eval_every=0),
+    )
+    iteration = {latest.name: 11, newest.name: 12}
+    with patch.object(
+        training_entry.LunaNetwork,
+        "checkpoint_trainer_iteration",
+        side_effect=lambda path: iteration[Path(path).name],
+    ):
+        plan = training_entry._checkpoint_plan(config, config.to_training_run())
+    assert plan.cross_directory
+    assert plan.source == newest
 
 
 @pytest.fixture

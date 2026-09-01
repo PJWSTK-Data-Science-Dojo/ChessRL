@@ -22,6 +22,37 @@ class TestComputeTargetValue:
         val = compute_target_value(traj, pos_idx=0, td_steps=5, discount=1.0)
         assert abs(val - (-1.0)) < 1e-6
 
+    def test_truncation_bootstraps_from_boundary_state(self, make_trajectory: TrajectoryFactory) -> None:
+        trajectory = make_trajectory(length=3, truncated=True, truncation_bootstrap_value=0.8)
+        trajectory.rewards = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+
+        target = compute_target_value(trajectory, pos_idx=0, td_steps=5, discount=0.5)
+
+        assert target == pytest.approx(-0.025)
+
+    def test_truncation_bootstrap_respects_even_player_parity(self, make_trajectory: TrajectoryFactory) -> None:
+        trajectory = make_trajectory(length=3, truncated=True, truncation_bootstrap_value=0.8)
+        trajectory.rewards = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+
+        target = compute_target_value(trajectory, pos_idx=1, td_steps=5, discount=0.5)
+
+        assert target == pytest.approx(0.25)
+
+    def test_reanalysis_can_override_truncation_boundary_value(
+        self,
+        make_trajectory: TrajectoryFactory,
+    ) -> None:
+        trajectory = make_trajectory(length=3, truncated=True, truncation_bootstrap_value=0.8)
+
+        target = compute_target_value(
+            trajectory,
+            pos_idx=1,
+            td_steps=5,
+            root_value_override={trajectory.game_length: -0.25},
+        )
+
+        assert target == pytest.approx(-0.25)
+
 
 class TestBuildUnrollTargets:
     def test_output_shapes(self, make_trajectory: TrajectoryFactory) -> None:
