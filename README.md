@@ -151,6 +151,75 @@ selection argument. The PGN phase is a bounded initialization, not a permanent
 human-policy regularizer: online search targets replace imitation targets so the model
 can recover from human mistakes and states outside the expert distribution.
 
+## LCZero policy/value calibration
+
+The second offline option consumes native [LCZero training data](https://storage.lczero.org/files/training_data/)
+without expanding the archive on disk. The pinned pilot is
+`training-run2-test91-20260901-1317.tar`: 508,417 V6 records in 4,416 game members.
+`make download-lc0-data` retrieves it atomically and verifies SHA-256
+`d6fe77a11c71d758dfbff0d07e80958f04440d26fa1f925e0e3683e1a3ad7409`.
+The collection is provided under ODbL 1.0 and its individual contents under DBCL 1.0;
+the upstream [license text](https://storage.lczero.org/files/training_data/LICENSE.txt)
+is also embedded in the archive. The data remains Git-ignored.
+
+The streaming adapter accepts LCZero V6/V7 records with input formats 1 through 4,
+filters whole Chess960 games, and maps the official 1,858-entry policy into Luna's
+4,288 actions. Castling, en passant, the context-dependent knight-promotion index,
+and all explicit promotion types retain their chess semantics. The value target is
+the complete side-to-move `[loss, draw, win]` distribution; it is never collapsed to
+a scalar. Train and validation are split by whole game, preventing adjacent positions
+from leaking across the boundary.
+
+This phase deliberately trains only `prediction.policy_head` and
+`prediction.value_head`. Representation, dynamics, reward, reconstruction, and
+consistency parameters are frozen and checked by a SHA-256 invariant after every
+chunk. This preserves the latent basis learned by online MuZero. It is a bounded head
+calibration, not a substitute for learning dynamics or a guarantee of higher Elo:
+the same prediction heads serve recurrent MCTS states, so lower held-out cross-entropy
+can still coincide with weaker search.
+
+```bash
+make download-lc0-data
+make verify-lc0-data
+make pretrain-lc0
+```
+
+The maintained pilot uses approximately one pass: 1,000 optimizer steps, batch 512,
+BF16, peak LR `1e-4`, a 50-step warm-up, and checkpoints at steps 250, 500, 750, and
+1,000. It starts from the immutable PGN-online iteration-25 source whose pinned SHA-256
+is `79376fa55a6f276f59af30479dc12f6bc939c87d91d342947578157782d4f7c6`.
+Crashes recover the newest healthy `lc0_step_*.pth.tar` together with its optimizer and
+resume the explicit W&B run `luna-balanced-lc0-heads-pretrain-v1`.
+
+Do not select a milestone from validation loss alone. Compare the retained checkpoints
+under identical 32-simulation search settings, first at Fairy-Stockfish 600 because the
+source already passes the 500 rung. The fixed Stockfish-1500 match remains telemetry;
+the source's 0-20 result makes it too difficult to rank early candidates.
+
+```bash
+make eval-lc0-warmstart \
+  LC0_EVAL_CHECKPOINT=./runs/luna-balanced-lc0-heads-pretrain-v1/lc0_step_00000250.pth.tar \
+  ARGS='--run.ladder-start-elo 600'
+make eval-lc0-warmstart \
+  LC0_EVAL_CHECKPOINT=./runs/luna-balanced-lc0-heads-pretrain-v1/lc0_step_00000500.pth.tar \
+  ARGS='--run.ladder-start-elo 600'
+make eval-lc0-warmstart \
+  LC0_EVAL_CHECKPOINT=./runs/luna-balanced-lc0-heads-pretrain-v1/lc0_step_00000750.pth.tar \
+  ARGS='--run.ladder-start-elo 600'
+make eval-lc0-warmstart \
+  LC0_EVAL_CHECKPOINT=./runs/luna-balanced-lc0-heads-pretrain-v1/lc0_step_00001000.pth.tar \
+  ARGS='--run.ladder-start-elo 600'
+```
+
+Only a checkpoint that does not regress the source under MCTS should start online
+learning. That transition resets AdamW and the LR schedule and uses the distinct W&B
+identity `luna-balanced-ezv2-lc0-warmstart-v1`:
+
+```bash
+make train-lc0-warmstart \
+  LC0_SELECTED_CHECKPOINT=./runs/luna-balanced-lc0-heads-pretrain-v1/lc0_step_00000500.pth.tar
+```
+
 ## Historical phase commands
 
 To carry the complete model, optimizer, scaler, counters, and LR horizon from the current

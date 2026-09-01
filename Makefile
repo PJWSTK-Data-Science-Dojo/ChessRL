@@ -25,6 +25,21 @@ PGN_SELECTED_CHECKPOINT ?=
 PGN_RL_CHECKPOINT_DIR ?= ./runs/luna-balanced-ezv2-pgn-warmstart-v1
 PGN_RL_WANDB_RUN_ID ?= luna-balanced-ezv2-pgn-warmstart-v1
 PGN_RL_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · PGN Warm Start v1
+LC0_DATA_DIR ?= ./data/lc0
+LC0_DATA_FILE ?= training-run2-test91-20260901-1317.tar
+LC0_DATA_PATH ?= $(LC0_DATA_DIR)/$(LC0_DATA_FILE)
+LC0_DATA_URL ?= https://storage.lczero.org/files/training_data/test91/$(LC0_DATA_FILE)
+LC0_DATA_SHA256 ?= d6fe77a11c71d758dfbff0d07e80958f04440d26fa1f925e0e3683e1a3ad7409
+LC0_SOURCE_CHECKPOINT ?= ./runs/sources/luna-balanced-pgn-warmstart-iter25.pth.tar
+LC0_SOURCE_SHA256 ?= 79376fa55a6f276f59af30479dc12f6bc939c87d91d342947578157782d4f7c6
+LC0_PRETRAIN_CHECKPOINT_DIR ?= ./runs/luna-balanced-lc0-heads-pretrain-v1
+LC0_PRETRAIN_WANDB_RUN_ID ?= luna-balanced-lc0-heads-pretrain-v1
+LC0_PRETRAIN_WANDB_RUN_NAME ?= Luna Balanced · LC0 Policy+Value Heads v1
+LC0_EVAL_CHECKPOINT ?=
+LC0_SELECTED_CHECKPOINT ?=
+LC0_RL_CHECKPOINT_DIR ?= ./runs/luna-balanced-ezv2-lc0-warmstart-v1
+LC0_RL_WANDB_RUN_ID ?= luna-balanced-ezv2-lc0-warmstart-v1
+LC0_RL_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · LC0 Warm Start v1
 NEW_PHASE_WANDB_RUN_ID ?= luna-balanced-ezv2-anti-collapse-v2
 NEW_PHASE_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · Anti-Collapse v2
 MIGRATION_WANDB_RUN_ID ?= luna-fairy-ladder-v1
@@ -295,6 +310,95 @@ train-pgn-warmstart: _train-env-preflight _fairy-stockfish-preflight
 			TRAIN_ARGS="--new-training-phase --load-checkpoint-dir \"$$source_dir\" --load-checkpoint-file \"$$source_file\" --wandb-project \"$(WANDB_PROJECT)\" --wandb-run-id \"$(PGN_RL_WANDB_RUN_ID)\" --wandb-run-name \"$(PGN_RL_WANDB_RUN_NAME)\" --wandb-resume allow"; \
 	fi
 
+download-lc0-data:
+	@mkdir -p "$(LC0_DATA_DIR)"
+	@if test -f "$(LC0_DATA_PATH)"; then \
+		printf '%s  %s\n' "$(LC0_DATA_SHA256)" "$(LC0_DATA_PATH)" | sha256sum --check --status; \
+	else \
+		curl --fail --location --continue-at - --output "$(LC0_DATA_PATH).part" "$(LC0_DATA_URL)"; \
+		printf '%s  %s\n' "$(LC0_DATA_SHA256)" "$(LC0_DATA_PATH).part" | sha256sum --check --status; \
+		mv "$(LC0_DATA_PATH).part" "$(LC0_DATA_PATH)"; \
+	fi
+
+verify-lc0-data:
+	@test -f "$(LC0_DATA_PATH)" || { echo "LC0 dataset not found; run make download-lc0-data" >&2; exit 2; }
+	@printf '%s  %s\n' "$(LC0_DATA_SHA256)" "$(LC0_DATA_PATH)" | sha256sum --check --status || { \
+		echo "LC0 dataset SHA-256 mismatch: $(LC0_DATA_PATH)" >&2; exit 2; }
+
+# Fits the shared prediction heads using observed root states only. Keeping the
+# latent model fixed protects recurrent MCTS until a milestone passes an arena.
+pretrain-lc0: _train-env-preflight verify-lc0-data
+	@if test -f "$(LC0_PRETRAIN_CHECKPOINT_DIR)/latest.pth.tar" || \
+		find "$(LC0_PRETRAIN_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'lc0_step_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
+		set -- --resume-checkpoint "$(LC0_PRETRAIN_CHECKPOINT_DIR)/latest.pth.tar"; \
+		wandb_resume=must; \
+	else \
+		test -f "$(LC0_SOURCE_CHECKPOINT)" || { \
+			echo "LC0 source checkpoint not found: $(LC0_SOURCE_CHECKPOINT)" >&2; exit 2; }; \
+		printf '%s  %s\n' "$(LC0_SOURCE_SHA256)" "$(LC0_SOURCE_CHECKPOINT)" | sha256sum --check --status || { \
+			echo "LC0 source checkpoint SHA-256 mismatch: $(LC0_SOURCE_CHECKPOINT)" >&2; exit 2; }; \
+		set -- --source-checkpoint "$(LC0_SOURCE_CHECKPOINT)"; \
+		wandb_resume=never; \
+	fi; \
+	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/pretrain_lc0.py \
+		--dataset-path "$(LC0_DATA_PATH)" \
+		--output-dir "$(LC0_PRETRAIN_CHECKPOINT_DIR)" \
+		"$$@" \
+		--total-steps 1000 \
+		--chunk-steps 250 \
+		--checkpoint-top-k 8 \
+		--validation-positions 20000 \
+		--dataset.validation-fraction 0.02 \
+		--dataset.min-visits 1 \
+		--dataset.shuffle-buffer-size 8192 \
+		--learner.lr 1e-4 \
+		--learner.lr-min 1e-5 \
+		--learner.lr-warmup-steps 50 \
+		--learner.cuda-device 0 \
+		--learner.dataloader-workers 0 \
+		--wandb-project "$(WANDB_PROJECT)" \
+		--wandb-run-id "$(LC0_PRETRAIN_WANDB_RUN_ID)" \
+		--wandb-run-name "$(LC0_PRETRAIN_WANDB_RUN_NAME)" \
+		--wandb-resume "$$wandb_resume" \
+		$(ARGS)
+
+eval-lc0-warmstart: _fairy-stockfish-preflight
+	@test -n "$(LC0_EVAL_CHECKPOINT)" || { echo "LC0_EVAL_CHECKPOINT is required" >&2; exit 2; }
+	@test -f "$(LC0_EVAL_CHECKPOINT)" || { echo "LC0 checkpoint not found: $(LC0_EVAL_CHECKPOINT)" >&2; exit 2; }
+	uv run --frozen python src/eval_vs_stockfish.py \
+		--checkpoint "$(LC0_EVAL_CHECKPOINT)" \
+		--opponent fairy \
+		--learner.device cuda \
+		--learner.cuda-device 0 \
+		--run.search-mode gumbel \
+		--run.num-mcts-sims 32 \
+		--run.evaluation-num-mcts-sims 32 \
+		--run.gumbel-max-considered-actions 8 \
+		--run.ladder-eval-games 20 \
+		--run.ladder-start-elo 500 \
+		--run.ladder-depth 10 \
+		--run.ladder-path "$(FAIRY_STOCKFISH_PATH)" \
+		--run.ladder-eval-max-ply 256 \
+		$(ARGS)
+
+# A benchmarked LC0 milestone starts a new online optimizer and W&B lineage.
+train-lc0-warmstart: _train-env-preflight _fairy-stockfish-preflight
+	@if test -f "$(LC0_RL_CHECKPOINT_DIR)/latest.pth.tar" || \
+		find "$(LC0_RL_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'checkpoint_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
+		$(MAKE) resume CHECKPOINT_DIR="$(LC0_RL_CHECKPOINT_DIR)" \
+			TRAIN_ARGS='--wandb-project "$(WANDB_PROJECT)" --wandb-run-id "$(LC0_RL_WANDB_RUN_ID)" --wandb-run-name "$(LC0_RL_WANDB_RUN_NAME)" --wandb-resume must'; \
+	else \
+		test -n "$(LC0_SELECTED_CHECKPOINT)" || { \
+			echo "LC0_SELECTED_CHECKPOINT must name a benchmarked immutable checkpoint" >&2; exit 2; }; \
+		test -f "$(LC0_SELECTED_CHECKPOINT)" || { \
+			echo "Selected LC0 checkpoint not found: $(LC0_SELECTED_CHECKPOINT)" >&2; exit 2; }; \
+		selected_checkpoint="$(LC0_SELECTED_CHECKPOINT)"; \
+		source_dir="$$(dirname -- "$$selected_checkpoint")"; \
+		source_file="$$(basename -- "$$selected_checkpoint")"; \
+		$(MAKE) train CHECKPOINT_DIR="$(LC0_RL_CHECKPOINT_DIR)" \
+			TRAIN_ARGS="--new-training-phase --load-checkpoint-dir \"$$source_dir\" --load-checkpoint-file \"$$source_file\" --wandb-project \"$(WANDB_PROJECT)\" --wandb-run-id \"$(LC0_RL_WANDB_RUN_ID)\" --wandb-run-name \"$(LC0_RL_WANDB_RUN_NAME)\" --wandb-resume never"; \
+	fi
+
 _train-env-preflight:
 	@test -f "$(TRAIN_ENV_FILE)" || { echo "Training environment file not found: $(TRAIN_ENV_FILE)" >&2; exit 2; }
 	@uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python -c \
@@ -469,8 +573,9 @@ test-pipeline-cpu:
 test-pipeline-mps:
 	$(MAKE) test-pipeline-cpu ARGS="--learner.device mps $(ARGS)"
 
-.PHONY: _fairy-stockfish-preflight _train-env-preflight audit bench check download-pgn-data eval-pgn-warmstart eval-stockfish fmt format-check \
-	install-fairy-stockfish lichess-config lint migrate-ladder-phase pretrain-pgn profile-smoke release-web-model resume resume-migrated-phase resume-phase \
-	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train-phase train-pgn-warmstart \
-	train types uci verify-web-model web-build web-config web-down web-logs web-public-config \
-	verify-pgn-data web-public-down web-public-logs web-public-up web-up
+.PHONY: _fairy-stockfish-preflight _train-env-preflight audit bench check download-lc0-data download-pgn-data \
+	eval-lc0-warmstart eval-pgn-warmstart eval-stockfish fmt format-check install-fairy-stockfish lichess-config lint \
+	migrate-ladder-phase pretrain-lc0 pretrain-pgn profile-smoke release-web-model resume resume-migrated-phase resume-phase \
+	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train train-lc0-warmstart train-phase train-pgn-warmstart \
+	types uci verify-lc0-data verify-pgn-data verify-web-model web-build web-config web-down web-logs web-public-config \
+	web-public-down web-public-logs web-public-up web-up

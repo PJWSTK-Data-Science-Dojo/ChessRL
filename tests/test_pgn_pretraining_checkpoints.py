@@ -8,16 +8,23 @@ import torch
 from luna.pgn_pretraining_checkpoints import (
     CHECKPOINT_METADATA_KEY,
     CheckpointPublication,
+    pretraining_resume_exists,
     publish_pretraining_checkpoints,
     resolve_pretraining_resume,
     validate_resume_contract,
 )
 
 
-def _write_checkpoint(path: Path, step: int, metadata: dict[str, object] | None = None) -> None:
+def _write_checkpoint(
+    path: Path,
+    step: int,
+    metadata: dict[str, object] | None = None,
+    *,
+    metadata_key: str = CHECKPOINT_METADATA_KEY,
+) -> None:
     payload: dict[str, object] = {"format_version": 2, "global_step": step}
     if metadata is not None:
-        payload[CHECKPOINT_METADATA_KEY] = metadata
+        payload[metadata_key] = metadata
     torch.save(payload, path)
 
 
@@ -133,3 +140,30 @@ def test_checkpoint_publication_never_prunes_absolute_training_milestones(tmp_pa
         "pretrain_step_00002000.pth.tar",
         "pretrain_step_00002500.pth.tar",
     ]
+
+
+def test_custom_checkpoint_namespace_controls_publish_resume_and_validation(tmp_path: Path) -> None:
+    metadata_key = "lc0_pretraining"
+    checkpoint_prefix = "lc0_step_"
+    expected: dict[str, object] = {"dataset_sha256": "a" * 64}
+    network = _WritingCheckpointNetwork(global_step=7)
+    publication = CheckpointPublication(tmp_path, keep=1, metadata=expected)
+
+    publish_pretraining_checkpoints(
+        network,
+        publication,
+        metadata_key=metadata_key,
+        checkpoint_prefix=checkpoint_prefix,
+    )
+
+    latest = tmp_path / "latest.pth.tar"
+    numbered = tmp_path / "lc0_step_00000007.pth.tar"
+    validate_resume_contract(latest, expected, metadata_key=metadata_key)
+    assert numbered.is_file()
+    payload = torch.load(numbered, map_location="cpu", weights_only=True)
+    assert payload[metadata_key] == expected
+    assert CHECKPOINT_METADATA_KEY not in payload
+    latest.unlink()
+    assert not pretraining_resume_exists(latest, tmp_path)
+    assert pretraining_resume_exists(latest, tmp_path, checkpoint_prefix=checkpoint_prefix)
+    assert resolve_pretraining_resume(latest, tmp_path, checkpoint_prefix=checkpoint_prefix) == numbered
