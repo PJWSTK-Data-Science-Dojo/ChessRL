@@ -1,5 +1,6 @@
 """Shared test fixtures for ChessRL test suite."""
 
+from pathlib import Path
 from typing import Protocol
 
 import chess
@@ -36,6 +37,13 @@ def small_learner_config() -> EzV2LearnerConfig:
 @pytest.fixture
 def chess_game() -> ChessGame:
     return ChessGame()
+
+
+@pytest.fixture
+def stockfish_binary(tmp_path: Path) -> Path:
+    path = tmp_path / "stockfish"
+    path.write_bytes(b"test-stockfish-binary")
+    return path
 
 
 @pytest.fixture

@@ -44,8 +44,13 @@ def test_orphaned_best_evaluation_metadata_fails_loudly(
     tmp_path: Path,
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
+    stockfish_binary: Path,
 ) -> None:
-    run = TrainingRunConfig(checkpoint=str(tmp_path), stockfish_eval_every=0)
+    run = TrainingRunConfig(
+        checkpoint=str(tmp_path),
+        stockfish_eval_every=0,
+        stockfish_path=str(stockfish_binary),
+    )
     coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), run)
     coach._publish_checkpoint(1)
     (tmp_path / "best_eval.json").write_text("not-json", encoding="utf-8")
@@ -80,8 +85,13 @@ def test_best_checkpoint_record_repairs_metadata_and_is_bound_to_protocol(
     tmp_path: Path,
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
+    stockfish_binary: Path,
 ) -> None:
-    run = TrainingRunConfig(checkpoint=str(tmp_path), stockfish_eval_every=0)
+    run = TrainingRunConfig(
+        checkpoint=str(tmp_path),
+        stockfish_eval_every=0,
+        stockfish_path=str(stockfish_binary),
+    )
     coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), run)
     coach._publish_checkpoint(1)
     score = StockfishEvalScores(model_wins=1, draws=1, stockfish_wins=0)

@@ -19,6 +19,7 @@ from luna.network import LunaNetwork
 def test_wandb_metrics_use_domain_specific_step_axes(
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
+    stockfish_binary: Path,
 ) -> None:
     network = LunaNetwork(chess_game, small_learner_config)
 
@@ -26,7 +27,12 @@ def test_wandb_metrics_use_domain_specific_step_axes(
         patch("luna.coach.wandb.init") as wandb_init,
         patch("luna.coach.wandb.define_metric") as define_metric,
     ):
-        Coach(chess_game, network, TrainingRunConfig(), wandb_project="ChessRL")
+        Coach(
+            chess_game,
+            network,
+            TrainingRunConfig(stockfish_path=str(stockfish_binary)),
+            wandb_project="ChessRL",
+        )
 
     init_kwargs = wandb_init.call_args.kwargs
     assert init_kwargs["project"] == "ChessRL"
@@ -52,6 +58,7 @@ def test_wandb_config_records_training_phase_source_without_private_path(
     tmp_path: Path,
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
+    stockfish_binary: Path,
 ) -> None:
     source = LunaNetwork(chess_game, small_learner_config)
     source._global_step = 123
@@ -67,7 +74,12 @@ def test_wandb_config_records_training_phase_source_without_private_path(
         patch("luna.coach.wandb.init") as wandb_init,
         patch("luna.coach.wandb.define_metric"),
     ):
-        Coach(chess_game, phase, TrainingRunConfig(), wandb_project="ChessRL")
+        Coach(
+            chess_game,
+            phase,
+            TrainingRunConfig(stockfish_path=str(stockfish_binary)),
+            wandb_project="ChessRL",
+        )
 
     provenance_config = wandb_init.call_args.kwargs["config"]["training_phase_provenance"]
     assert provenance_config == {
@@ -84,6 +96,7 @@ def test_wandb_config_records_training_phase_source_without_private_path(
 def test_wandb_run_id_uses_requested_resume_policy(
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
+    stockfish_binary: Path,
     resume_mode: WandbResumeMode,
 ) -> None:
     network = LunaNetwork(chess_game, small_learner_config)
@@ -95,7 +108,7 @@ def test_wandb_run_id_uses_requested_resume_policy(
         Coach(
             chess_game,
             network,
-            TrainingRunConfig(),
+            TrainingRunConfig(stockfish_path=str(stockfish_binary)),
             wandb_project="ChessRL",
             wandb_run_id="luna-throughput-phase-v1",
             wandb_resume=resume_mode,
@@ -110,6 +123,7 @@ def test_wandb_run_id_uses_requested_resume_policy(
 def test_wandb_display_name_is_independent_of_stable_run_id(
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
+    stockfish_binary: Path,
 ) -> None:
     network = LunaNetwork(chess_game, small_learner_config)
 
@@ -120,7 +134,7 @@ def test_wandb_display_name_is_independent_of_stable_run_id(
         Coach(
             chess_game,
             network,
-            TrainingRunConfig(),
+            TrainingRunConfig(stockfish_path=str(stockfish_binary)),
             wandb_project="ChessRL",
             wandb_run_id="luna-strength-1500-v1",
             wandb_run_name="Luna Strength 1500 v1",
@@ -136,6 +150,7 @@ def test_wandb_display_name_is_independent_of_stable_run_id(
 def test_wandb_resume_policy_is_not_forwarded_without_run_id(
     chess_game: ChessGame,
     small_learner_config: EzV2LearnerConfig,
+    stockfish_binary: Path,
     resume_mode: WandbResumeMode,
 ) -> None:
     network = LunaNetwork(chess_game, small_learner_config)
@@ -147,7 +162,7 @@ def test_wandb_resume_policy_is_not_forwarded_without_run_id(
         Coach(
             chess_game,
             network,
-            TrainingRunConfig(),
+            TrainingRunConfig(stockfish_path=str(stockfish_binary)),
             wandb_project="ChessRL",
             wandb_resume=resume_mode,
         )
