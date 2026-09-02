@@ -19,8 +19,18 @@ from luna.lc0_pretraining import (
     _train_batch,
     run_lc0_pretraining,
 )
-from luna.lc0_pretraining_config import Lc0PretrainingConfig, validate_lc0_pretraining_config
-from luna.lc0_pretraining_validation import Lc0TrainingMetrics, Lc0ValidationMetrics
+from luna.lc0_pretraining_config import (
+    LC0_CHECKPOINT_METADATA_KEY,
+    Lc0PretrainingConfig,
+    validate_lc0_online_source,
+    validate_lc0_pretraining_config,
+)
+from luna.lc0_pretraining_validation import (
+    Lc0TrainingMetrics,
+    Lc0ValidationMetrics,
+    _capture_modes,
+    _restore_modes,
+)
 from luna.network import LunaNetwork
 from luna.network_losses import soft_ce_with_support
 
@@ -134,6 +144,58 @@ def test_wandb_requires_explicit_identity_and_resume_semantics(tmp_path: Path) -
         validate_lc0_pretraining_config(resumed)
 
 
+def test_pretraining_accepts_a_multi_archive_dataset(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.tar").write_bytes(b"archive")
+
+    validate_lc0_pretraining_config(replace(config, dataset_path=corpus))
+
+
+def test_online_source_requires_matching_joint_pretraining_metadata(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "best.pth.tar"
+    fingerprint = "a" * 64
+    torch.save(
+        {
+            LC0_CHECKPOINT_METADATA_KEY: {
+                "dataset_fingerprint": fingerprint,
+                "train_scope": "representation_and_heads",
+            }
+        },
+        checkpoint,
+    )
+
+    validate_lc0_online_source(checkpoint, fingerprint)
+
+    with pytest.raises(ValueError, match="corpus fingerprint"):
+        validate_lc0_online_source(checkpoint, "b" * 64)
+
+
+def test_online_source_rejects_heads_only_pretraining(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "best.pth.tar"
+    torch.save(
+        {
+            LC0_CHECKPOINT_METADATA_KEY: {
+                "dataset_fingerprint": "a" * 64,
+                "train_scope": "prediction_heads",
+            }
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="not jointly trained"):
+        validate_lc0_online_source(checkpoint, "a" * 64)
+
+
+def test_online_source_rejects_missing_pretraining_metadata(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "best.pth.tar"
+    torch.save({}, checkpoint)
+
+    with pytest.raises(ValueError, match="no pretraining metadata"):
+        validate_lc0_online_source(checkpoint, "a" * 64)
+
+
 def test_optimizer_step_changes_only_policy_and_value_heads() -> None:
     game = ChessGame()
     network = LunaNetwork(game, _learner())
@@ -170,6 +232,23 @@ def test_joint_scope_updates_representation_and_heads_only() -> None:
     assert all(
         name.startswith(("representation.", "prediction.policy_head.", "prediction.value_head.")) for name in changed
     )
+
+
+def test_validation_restores_joint_training_modes() -> None:
+    network = LunaNetwork(ChessGame(), _learner())
+    network.nnet.eval()
+    network.nnet.representation.train()
+    network.nnet.prediction.policy_head.train()
+    network.nnet.prediction.value_head.train()
+    modes = _capture_modes(network)
+
+    network.nnet.eval()
+    _restore_modes(network, modes)
+
+    assert network.nnet.training is False
+    assert network.nnet.representation.training is True
+    assert network.nnet.prediction.policy_head.training is True
+    assert network.nnet.prediction.value_head.training is True
 
 
 def test_value_loss_consumes_exact_wdl_distribution() -> None:
@@ -236,6 +315,11 @@ def test_run_initializes_new_phase_and_publishes_numbered_checkpoints(tmp_path: 
     assert source_checkpoint is not None
     assert network.initialized_from == (str(source_checkpoint.parent.resolve()), source_checkpoint.name)
     assert [name for name, _metadata in network.saved] == [
+        "lc0_step_00000000.pth.tar",
+        "latest.pth.tar",
+        "lc0_step_00000000.pth.tar",
+        "latest.pth.tar",
+        "best.pth.tar",
         "lc0_step_00000002.pth.tar",
         "latest.pth.tar",
         "lc0_step_00000004.pth.tar",
@@ -248,6 +332,7 @@ def test_run_initializes_new_phase_and_publishes_numbered_checkpoints(tmp_path: 
     lc0_metadata = metadata["lc0_pretraining"]
     assert isinstance(lc0_metadata, dict)
     assert lc0_metadata["pretraining_kind"] == "lc0_policy_value_heads"
+    assert lc0_metadata["validation_objective"] == pytest.approx(1.8)
 
 
 def test_keyboard_interrupt_publishes_completed_optimizer_state(tmp_path: Path) -> None:
@@ -273,6 +358,11 @@ def test_keyboard_interrupt_publishes_completed_optimizer_state(tmp_path: Path) 
         run_lc0_pretraining(config)
 
     assert [name for name, _metadata in network.saved] == [
+        "lc0_step_00000000.pth.tar",
+        "latest.pth.tar",
+        "lc0_step_00000000.pth.tar",
+        "latest.pth.tar",
+        "best.pth.tar",
         "lc0_step_00000001.pth.tar",
         "latest.pth.tar",
     ]

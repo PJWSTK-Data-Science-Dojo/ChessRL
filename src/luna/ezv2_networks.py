@@ -322,7 +322,8 @@ class EZV2Networks(nn.Module):
             obs = obs.unsqueeze(0)
         if obs.dim() == 4 and obs.shape[1] != C and obs.shape[-1] == C:
             obs = obs.permute(0, 3, 1, 2)
-        return obs.contiguous()
+        memory_format = torch.channels_last if obs.is_cuda else torch.contiguous_format
+        return obs.contiguous(memory_format=memory_format)
 
 
 def _scale_latent(latent: torch.Tensor) -> torch.Tensor:

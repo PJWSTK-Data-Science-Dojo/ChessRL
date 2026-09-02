@@ -25,6 +25,21 @@ def self_play_exploration_enabled(board: chess.Board, ply: int, run: TrainingRun
     return run.tree_state_mode == "latent" and run.search_mode == "gumbel" and board.is_repetition(2)
 
 
+@dataclass(frozen=True, slots=True)
+class SelfPlaySearchPlan:
+    simulations: int
+    train_policy: bool
+
+
+def select_self_play_search_plan(run: TrainingRunConfig) -> SelfPlaySearchPlan:
+    """Draw one shared Playout Cap Randomization cohort."""
+    if run.playout_cap_full_probability <= 0.0:
+        return SelfPlaySearchPlan(run.num_mcts_sims, True)
+    full_search = bool(np.random.random() < run.playout_cap_full_probability)
+    simulations = run.playout_cap_full_sims if full_search else run.playout_cap_fast_sims
+    return SelfPlaySearchPlan(simulations, full_search)
+
+
 def select_self_play_action(
     run: TrainingRunConfig,
     policy: np.ndarray | list[float],
@@ -79,6 +94,7 @@ class _EpisodeState:
     policies: list[np.ndarray] = field(default_factory=list)
     values: list[float] = field(default_factory=list)
     valid_moves: list[np.ndarray] = field(default_factory=list)
+    policy_train_mask: list[bool] = field(default_factory=list)
     guard_attempts: int = 0
     guard_interventions: int = 0
     guard_forced_fallbacks: int = 0
@@ -96,6 +112,7 @@ class _RootDecision:
     observation: np.ndarray
     valid_moves: np.ndarray
     action: int
+    search_plan: SelfPlaySearchPlan
     search_contempt: SearchContemptStats
 
 
@@ -122,8 +139,14 @@ def execute_episode(coach: Coach) -> Trajectory:
 
 def _search_root(coach: Coach, mcts: MCTS, state: _EpisodeState) -> _RootDecision:
     canonical = coach.game.get_canonical_form(state.board, state.player)
-    explore = self_play_exploration_enabled(state.board, state.step, coach.run)
-    policy, value = mcts.search_latent(canonical, temp=1.0, add_exploration_noise=explore)
+    search_plan = select_self_play_search_plan(coach.run)
+    explore = search_plan.train_policy and self_play_exploration_enabled(state.board, state.step, coach.run)
+    policy, value = mcts.search_latent(
+        canonical,
+        num_sims=search_plan.simulations,
+        temp=1.0,
+        add_exploration_noise=explore,
+    )
     return _RootDecision(
         canonical_board=canonical,
         policy=policy,
@@ -136,6 +159,7 @@ def _search_root(coach: Coach, mcts: MCTS, state: _EpisodeState) -> _RootDecisio
             explore=explore,
             gumbel_proposal=mcts.last_action,
         ),
+        search_plan=search_plan,
         search_contempt=mcts.last_search_contempt_stats,
     )
 
@@ -173,11 +197,17 @@ def _search_safe_root(
     state.guard_excluded_actions += int(np.count_nonzero(decision.valid_moves)) - len(safe_actions)
     policy, value = mcts.search_latent(
         decision.canonical_board,
+        num_sims=decision.search_plan.simulations,
         temp=1.0,
-        add_exploration_noise=True,
+        add_exploration_noise=decision.search_plan.train_policy,
         allowed_root_actions=safe_actions,
     )
-    action = select_self_play_action(coach.run, policy, explore=True, gumbel_proposal=mcts.last_action)
+    action = select_self_play_action(
+        coach.run,
+        policy,
+        explore=decision.search_plan.train_policy,
+        gumbel_proposal=mcts.last_action,
+    )
     return _RootDecision(
         canonical_board=decision.canonical_board,
         policy=policy,
@@ -185,6 +215,7 @@ def _search_safe_root(
         observation=decision.observation,
         valid_moves=decision.valid_moves,
         action=action,
+        search_plan=decision.search_plan,
         search_contempt=mcts.last_search_contempt_stats,
     )
 
@@ -194,6 +225,7 @@ def _apply_decision(game: ChessGame, state: _EpisodeState, decision: _RootDecisi
     state.policies.append(np.asarray(decision.policy, dtype=np.float32))
     state.values.append(decision.value)
     state.valid_moves.append(decision.valid_moves)
+    state.policy_train_mask.append(decision.search_plan.train_policy)
     state.player = game.push_action(state.board, state.player, decision.action)
     state.actions.append(decision.action)
     _record_search_contempt(state, decision.search_contempt)
@@ -228,6 +260,7 @@ def _trajectory_from_state(
         state.values,
         state.valid_moves,
         terminal_value,
+        policy_train_mask=state.policy_train_mask,
         truncated=truncated,
         truncation_bootstrap_value=truncation_bootstrap_value,
         termination=termination,
@@ -267,6 +300,7 @@ def trajectory_with_terminal_rewards(
     search_contempt_opponent_selections: int = 0,
     search_contempt_thompson_selections: int = 0,
     search_contempt_frozen_nodes: int = 0,
+    policy_train_mask: list[bool] | None = None,
 ) -> Trajectory:
     rewards = [0.0] * len(actions)
     rewards[-1] = -float(terminal_value_for_next_player)
@@ -277,6 +311,7 @@ def trajectory_with_terminal_rewards(
         root_policies=root_policies,
         root_values=root_values,
         valids=valids_list,
+        policy_train_mask=policy_train_mask,
         truncated=truncated,
         truncation_bootstrap_value=truncation_bootstrap_value,
         termination=termination,

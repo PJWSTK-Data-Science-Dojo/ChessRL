@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import struct
 import tarfile
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -12,12 +14,14 @@ import numpy as np
 import pytest
 
 from luna.game.chess_game import ACTION_SIZE, SIDE_TO_MOVE_PLANE, ChessGame, move_to_action
+from luna.lc0_batch_stream import iter_lc0_corpus_batches, iter_lc0_shard_batches
+from luna.lc0_corpus import dataset_fingerprint, lc0_archive_paths
 from luna.lc0_dataset import (
     Lc0DatasetConfig,
     Lc0DatasetError,
     Lc0Split,
     Lc0ValueSource,
-    dataset_fingerprint,
+    _member_window,
     iter_lc0_batches,
     iter_lc0_samples,
 )
@@ -261,6 +265,118 @@ def test_batches_v6_v7_filters_chess960_and_fingerprints(tmp_path: Path, chess_g
     assert fingerprint == dataset_fingerprint(path)
     path.write_bytes(path.read_bytes() + b"changed")
     assert fingerprint != dataset_fingerprint(path)
+
+
+def test_streams_a_deterministic_multi_archive_corpus(tmp_path: Path, chess_game: ChessGame) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    first_dir, second_dir = tmp_path / "first", tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = _write_archive(
+        first_dir,
+        {"first.gz": [_record(_START, {chess.Move.from_uci("e2e4"): 1.0}, visits=7)]},
+    )
+    second = _write_archive(
+        second_dir,
+        {"second.gz": [_record(_START, {chess.Move.from_uci("d2d4"): 1.0}, visits=9)]},
+    )
+    (corpus / "b.tar").write_bytes(second.read_bytes())
+    (corpus / "a.tar").write_bytes(first.read_bytes())
+
+    batches = list(iter_lc0_batches(corpus, _config(batch_size=2), chess_game))
+    rotated = list(
+        iter_lc0_corpus_batches(
+            corpus,
+            _config(batch_size=2),
+            chess_game,
+            archive_offset=1,
+            member_window_index=0,
+            member_window_count=1,
+        )
+    )
+
+    assert [path.name for path in lc0_archive_paths(corpus)] == ["a.tar", "b.tar"]
+    np.testing.assert_array_equal(batches[0].visits, [7, 9])
+    np.testing.assert_array_equal(rotated[0].visits, [9, 7])
+    original = dataset_fingerprint(corpus)
+    (corpus / "a.tar").rename(corpus / "c.tar")
+    assert dataset_fingerprint(corpus) != original
+
+
+def test_member_windows_sample_every_shard_without_reusing_prefixes(tmp_path: Path, chess_game: ChessGame) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for shard, base_visit in (("a.tar", 10), ("b.tar", 20)):
+        members: dict[str, list[bytes]] = {}
+        for window in range(2):
+            index = next(
+                candidate
+                for candidate in range(1_000)
+                if _member_window(f"{shard}/game-{candidate}.gz", 0, 2) == window
+            )
+            members[f"game-{index}.gz"] = [
+                _record(_START, {chess.Move.from_uci("e2e4"): 1.0}, visits=base_visit + window)
+            ]
+        source_dir = tmp_path / shard.removesuffix(".tar")
+        source_dir.mkdir()
+        archive = _write_archive(source_dir, members)
+        (corpus / shard).write_bytes(archive.read_bytes())
+
+    def visits(window: int) -> list[int]:
+        config = replace(_config(batch_size=2), max_samples=2)
+        batches = iter_lc0_corpus_batches(
+            corpus,
+            config,
+            chess_game,
+            archive_offset=0,
+            member_window_index=window,
+            member_window_count=2,
+        )
+        return next(batches).visits.tolist()
+
+    assert visits(0) == [10, 20]
+    assert visits(1) == [11, 21]
+
+
+def test_shard_iterator_preserves_directory_split_identity(tmp_path: Path, chess_game: ChessGame) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    archive = _write_archive(
+        tmp_path,
+        {"training.gz": [_record(_START, {chess.Move.from_uci("e2e4"): 1.0})]},
+    )
+    shard = corpus / "a.tar"
+    shard.write_bytes(archive.read_bytes())
+
+    def split_fraction(seed: int, identity: str) -> float:
+        material = f"{seed}\0{identity}".encode()
+        return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") / 2**64
+
+    seed = next(
+        candidate
+        for candidate in range(10_000)
+        if split_fraction(candidate, "a.tar/training.gz") < 0.5 and split_fraction(candidate, "training.gz") >= 0.5
+    )
+    config = Lc0DatasetConfig(
+        batch_size=1,
+        split="train",
+        validation_fraction=0.5,
+        split_seed=seed,
+        shuffle_buffer_size=1,
+    )
+
+    assert list(iter_lc0_batches(corpus, config, chess_game)) == []
+    assert list(iter_lc0_shard_batches(shard, config, chess_game)) == []
+    assert len(list(iter_lc0_batches(shard, config, chess_game))) == 1
+
+
+def test_rejects_an_empty_multi_archive_corpus(tmp_path: Path) -> None:
+    corpus = tmp_path / "empty"
+    corpus.mkdir()
+
+    with pytest.raises(ValueError, match=r"contains no \.tar archives"):
+        lc0_archive_paths(corpus)
 
 
 def test_rejects_truncated_record(tmp_path: Path, chess_game: ChessGame) -> None:

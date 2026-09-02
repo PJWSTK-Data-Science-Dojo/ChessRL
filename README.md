@@ -1,6 +1,10 @@
 # Luna ChessRL
 
-Luna is a model-based reinforcement-learning chess engine trained from self-play. It combines an EfficientZeroV2-style latent world model with Gumbel MuZero search, prioritized replay, n-step value targets, and optional auxiliary representation objectives. The repository includes training, evaluation, an interactive browser experience, a UCI adapter, and a secure Lichess deployment helper.
+Luna is a neural-search chess engine that supports both EfficientZeroV2-style latent
+model-based RL and LCZero-style exact-state self-play. It combines supervised policy/WDL
+initialization with Gumbel MuZero search, prioritized replay, and online reinforcement
+learning. The repository includes training, evaluation, an interactive browser experience,
+a UCI adapter, and a secure Lichess deployment helper.
 
 This is a research and portfolio project, not a claim of engine parity with established tournament systems. Playing strength depends on training data, compute budget, search settings, and evaluation methodology.
 
@@ -8,8 +12,9 @@ This is a research and portfolio project, not a claim of engine parity with esta
 
 - Representation, dynamics, and prediction networks with per-sample latent normalization.
 - Gumbel top-m root selection and Sequential Halving by default; classic PUCT remains available.
+- Optional playout-cap randomization with separate full and fast search cohorts; only full-search roots supervise policy.
 - Opt-in Search-contempt sampling at opponent nodes, with activation and diversity telemetry.
-- Batched latent MCTS for parallel self-play, exact legal-move masks, and two-player value backups.
+- Batched latent or exact-state MCTS for parallel self-play, exact legal-move masks, and two-player value backups.
 - A 4,288-action chess space: 4,096 from/to actions plus distinct knight, rook, and bishop underpromotions.
 - Five spatial dynamics action planes: from, to, and one plane for each underpromotion identity.
 - A convolutional policy head aligned to source squares, destination squares, and underpromotion identity.
@@ -19,6 +24,7 @@ This is a research and portfolio project, not a claim of engine parity with esta
 - Prioritized trajectory replay with compact `float16` observations/policies and boolean legal masks.
 - AdamW, learning-rate warm-up followed by cosine decay, mixed precision, gradient clipping, accumulation, and recurrent gradient scaling.
 - Optional batched search-value estimation and policy reanalysis using the current network.
+- Optional immutable LCZero policy/WDL anchor batches that remain separate from prioritized online replay.
 - Versioned, atomic checkpoints that include architecture, optimizer, scaler, step,
   trainer iteration, and the learning-rate schedule horizon.
 
@@ -221,16 +227,16 @@ make train-lc0-warmstart \
   LC0_SELECTED_CHECKPOINT=./runs/luna-balanced-lc0-heads-pretrain-v1/lc0_step_00000500.pth.tar
 ```
 
-### Exact-state LCZero-style phase
+### Exact-state LCZero-style phases
 
-The maintained high-strength path uses the same legal-state search contract as
+The exact-state path uses the same legal-state search contract as
 LCZero and AlphaZero. Set `run.tree_state_mode=exact` to apply every selected move
 with `python-chess`, preserve the complete 119-plane observation history, and run
 the representation plus policy/value heads again at each non-terminal leaf.
 Gumbel top-8 Sequential Halving still allocates the small search budget, but learned
 dynamics and predicted rewards no longer affect the tree.
 
-Before online learning, `pretrain-lc0-exact` jointly fine-tunes the 10-block
+The original pilot remains reproducible. `pretrain-lc0-exact` jointly fine-tunes the 10-block
 representation and both prediction heads for 2,000 steps on the pinned 508,417-position
 LCZero V6 corpus. It distills the soft root-WDL estimate and root visit policy; the
 source checkpoint is the measured 1,000-step LCZero milestone rather than a later
@@ -251,6 +257,69 @@ The two phases have separate immutable outputs and W&B identities:
 ply 39, and samples each newly generated position twice on average. A measured
 64- or 128-simulation budget should be used only after it wins a fixed-checkpoint
 match; search cost otherwise scales approximately linearly.
+
+The maintained recovery pipeline expands supervised training to 16 complete LCZero
+test91 shards under `data/lc0-anchor-test91-20260901` (roughly ten million positions).
+`download-lc0-10m-data` resumes interrupted transfers into `.part` files, verifies
+the pinned SHA-256 of every shard, and only then publishes each archive with an
+atomic rename. The training preflight repeats every hash check and rejects missing,
+extra, or partial shards. The 20,000-step
+recovery jointly trains the representation and prediction heads against root visit
+policy and full soft `[loss, draw, win]` targets, validates on 50,000 held-out
+positions, and starts from the immutable exact-state `best.pth.tar` whose expected
+SHA-256 begins with `7a4bd8ea`. Its peak LR is `1e-4`, followed by cosine decay to
+`1e-5` after a 500-step warm-up. Each validation milestone remains resumable through
+`latest.pth.tar`, while `best.pth.tar` is updated only when the weighted held-out
+policy-plus-WDL cross-entropy improves. The online phase starts from that selected
+checkpoint instead of assuming that the final supervised step is the best one.
+
+```bash
+make download-lc0-10m-data
+make pretrain-lc0-exact-10m
+make train-lc0-exact-pcr-anchor
+```
+
+`make train-lc0-exact-10m-pipeline` runs those resumable phases in sequence. Repeating
+either command restores its latest complete optimizer state and the same W&B run;
+it does not create a second lineage. Each fresh phase publishes a validated local
+bootstrap before relying on remote tracking, so a host failure around W&B startup can
+resume under the stable run ID. The supervised phase writes
+`runs/luna-lc0-exact-10m-recovery-v1` and W&B run
+`luna-lc0-exact-10m-recovery-v1`. The online phase writes
+`runs/luna-lc0-exact-pcr128x16-p25-anchor25-v1` and W&B run
+`luna-lc0-exact-pcr128x16-p25-anchor25-v1`.
+
+Online training is a required second phase, not an optional postscript. It creates a
+fresh AdamW schedule and replay buffer, then learns from exact-state self-play at a
+target replay ratio of 2.0. Playout-cap randomization assigns 128 simulations to 25%
+of roots and 16 simulations to the remaining roots, for an expected 44 simulations
+per move. Fast roots still provide game outcomes for value learning, but their shallow
+search distributions are masked out of policy loss. Full roots provide online search
+policy targets. In parallel, every learner update draws an additional LCZero anchor
+minibatch sized at 25% of the 512-position replay batch and weights its policy/WDL
+objective by 0.25. The expert samples never enter prioritized replay, so replay-window
+turnover cannot evict the anchor distribution. The deterministic corpus fingerprint
+is recomputed at launch and checked against resumed checkpoints. PCR adds a per-position
+policy-training mask to replay schema 2; replay snapshots from older schemas are
+intentionally rejected, so this semantic change starts a new online phase.
+
+Evaluation remains at 32 simulations to preserve comparison with the preceding exact
+run. A 500,000-position replay buffer warms up to 100,000 positions before updates;
+the online LR warms from zero to `2e-5` over 1,000 updates and decays toward `2e-6`
+over the fixed 25,000-step horizon. Reconstruction, learned dynamics, reward,
+consistency, and reanalysis losses are disabled in this exact root-only objective.
+Training graph compilation is also disabled in these two BF16 phases: a real-data
+canary exposed incorrect LayerNorm backward gradients under Inductor on the target
+Ada GPU, while eager BF16 matched the FP32 reference. This favors numerically verified
+updates over a speculative compiler speedup; inference compilation remains a separate
+benchmark decision.
+
+These settings are hypotheses under test, not an Elo guarantee. W&B records the actual
+`selfplay/playout_cap_full_fraction`, `selfplay/avg_mcts_sims`, throughput, anchor
+policy/value losses, full/fast search entropy, gradient health, replay state, and paired
+Stockfish results. Keep
+or change the recipe based on those measurements and fixed-protocol matches, not the
+nominal simulation budget alone.
 
 ## Historical phase commands
 
@@ -393,10 +462,13 @@ search:
 ```bash
 make eval-checkpoints \
   ARENA_CHECKPOINT_A=./runs/source/checkpoint.pth.tar \
-  ARENA_CHECKPOINT_B=./runs/candidate/checkpoint.pth.tar
+  ARENA_CHECKPOINT_B=./runs/candidate/checkpoint.pth.tar \
+  ARENA_TREE_STATE_MODE=exact
 ```
 
-The command atomically writes a `*.arena.json` sidecar beside checkpoint B. It contains
+The tree-state mode is mandatory because an exact-state checkpoint must never be
+silently evaluated with latent dynamics (or vice versa). The command atomically writes
+a `*.arena.json` sidecar beside checkpoint B. It contains
 both checkpoint SHA-256 hashes, the complete search/opening protocol, scores, and the
 non-regression decision. Exit status `3` means checkpoint B scored below `0.5`; operational
 or configuration failures use status `2`. Matches accept 2–20 games, in even increments;
@@ -468,7 +540,7 @@ color balance, root-value bias, and both external evaluations are the promotion 
 
 ## Training flow
 
-1. A sliding pool of games produces batched self-play through latent search.
+1. A sliding pool of games produces batched self-play through configured latent- or exact-state search.
 2. Each position stores observation, action, acting-player reward, improved search policy, root value, and legal mask. A time-limited trajectory also stores the value of its post-action boundary state.
 3. Prioritized replay samples positions and constructs K-step unroll targets with alternating player signs.
 4. Optional reanalysis refreshes selected value and policy targets with the current model.
@@ -495,6 +567,10 @@ make profile-smoke       # bounded end-to-end profile
 make download-pgn-data   # fetch and verify the pinned expert corpus
 make pretrain-pgn        # start or resume supervised PGN warm-start training
 make train-pgn-warmstart # start or resume the online phase from PGN weights
+make download-lc0-10m-data       # resume and verify all 16 pinned LCZero shards
+make pretrain-lc0-exact-10m       # start or resume multi-shard exact-state recovery
+make train-lc0-exact-pcr-anchor   # start or resume PCR self-play with an LCZero anchor
+make train-lc0-exact-10m-pipeline # run both maintained exact-state phases in order
 make train-phase         # start the dedicated strength continuation phase
 make resume-phase        # resume that phase after an interruption
 make resume-migrated-phase  # resume the separate complete-state migration
@@ -563,7 +639,7 @@ tests/                         unit, integration, protocol, and regression tests
 
 - `--seed` seeds Python, NumPy, and PyTorch. Some accelerator kernels may remain nondeterministic.
 - `--learner.model-name` selects `baseline`, `balanced`, or `balanced_reconstruction`; the maintained `make train` preset uses the last option with 128 channels, 10 representation blocks, one dynamics block, and a training-only piece decoder.
-- Gumbel search does not use Dirichlet root noise. Search-contempt is opt-in and self-play-only; Barlow Twins, playout-cap randomization, FP8/TensorRT, and alternative chess-rule backends remain ablation candidates rather than defaults. Each changes training semantics or runtime behavior and requires a controlled benchmark.
-- Training checkpoints restore optimizer, scaler, global step, and trainer iteration. The in-memory replay buffer is not serialized.
+- Gumbel search does not use Dirichlet root noise. Search-contempt is opt-in and self-play-only. Playout-cap randomization is enabled only in the named exact-state PCR recipe and logs its realized cohort mix; Barlow Twins, FP8/TensorRT, and alternative chess-rule backends remain ablation candidates. Each semantic or runtime change still requires a controlled benchmark.
+- Training checkpoints restore optimizer, scaler, global step, and trainer iteration. A separate atomically published, compressed replay snapshot restores the matching replay window on ordinary resume.
 - `torch.compile` is optional. Disable it with `--learner.no-compile-inference` or the corresponding web flag when unsupported.
 - Measure throughput with the included benchmark and profiler before changing batch, parallel-game, or search budgets.

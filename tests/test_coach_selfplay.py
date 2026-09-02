@@ -1,19 +1,23 @@
 """Tests for Coach self-play (e.g. max ply truncation, batched self-play)."""
 
+import random
 from unittest.mock import patch
 
 import chess
 import numpy as np
 import pytest
+import torch
 
 from luna.coach import (
     Coach,
     _self_play_exploration_enabled,
 )
+from luna.coach_training import _collect_self_play
 from luna.config import EzV2LearnerConfig, TrainingRunConfig
 from luna.game.chess_game import ChessGame
 from luna.network import LunaNetwork
 from luna.profiling import IterProfileStats
+from luna.replay_buffer import Trajectory
 from tests.conftest import TrajectoryFactory
 
 
@@ -69,6 +73,29 @@ class TestBatchedSelfPlay:
             assert t.truncated is True
             assert t.truncation_bootstrap_value is not None
             assert np.isfinite(t.truncation_bootstrap_value)
+
+
+def test_local_self_play_rng_is_deterministic_per_iteration(
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+    make_trajectory: TrajectoryFactory,
+) -> None:
+    coach = Coach(chess_game, LunaNetwork(chess_game, small_learner_config), TrainingRunConfig(num_episodes=1), seed=7)
+    draws: list[tuple[float, float, float]] = []
+
+    def collect(_count: int) -> list[Trajectory]:
+        draws.append((float(np.random.random()), float(torch.rand(())), random.random()))
+        return [make_trajectory(1)]
+
+    with patch.object(coach, "execute_episodes_batched", side_effect=collect):
+        _collect_self_play(coach, 3, None, IterProfileStats(iter_index=3))
+        np.random.seed(999)
+        torch.manual_seed(999)
+        _collect_self_play(coach, 3, None, IterProfileStats(iter_index=3))
+        _collect_self_play(coach, 4, None, IterProfileStats(iter_index=4))
+
+    assert draws[0] == draws[1]
+    assert draws[2] != draws[1]
 
 
 def test_skipped_training_still_logs_iteration_observability(

@@ -1,4 +1,4 @@
-"""Run a paired-opening latent-MCTS gate between two Luna checkpoints."""
+"""Run a paired-opening MCTS gate between two Luna checkpoints."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import tyro
 from loguru import logger
@@ -37,6 +38,7 @@ class EvalVsCheckpointCli:
 
     checkpoint_a: Path
     checkpoint_b: Path
+    tree_state_mode: Literal["latent", "exact"]
     output: Path | None = None
     games: int = 20
     num_mcts_sims: int = 32
@@ -82,6 +84,7 @@ def _protocol(config: EvalVsCheckpointCli) -> CheckpointArenaProtocol:
     mcts = MCTSParams(
         num_mcts_sims=config.num_mcts_sims,
         search_mode="gumbel",
+        tree_state_mode=config.tree_state_mode,
         gumbel_max_considered_actions=config.gumbel_max_considered_actions,
         dir_noise=False,
     )

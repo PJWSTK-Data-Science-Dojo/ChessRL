@@ -16,7 +16,9 @@ from luna.network_checkpoint_io import TRAINING_PHASE_PROVENANCE_FIELD
 from luna.network_checkpoint_state import clone_state_to_cpu, validate_finite_state, validate_grad_scaler_state
 from luna.network_types import NetworkRuntime, TrainingPhaseProvenance, ValidatedCheckpoint
 
-RUNTIME_LEARNER_FIELDS = frozenset({"device", "cuda_device", "compile_inference", "compile_training"})
+RUNTIME_LEARNER_FIELDS = frozenset(
+    {"device", "cuda_device", "compile_inference", "compile_training", "expert_anchor_path"}
+)
 MODEL_LEARNER_FIELDS = frozenset(
     {"model_name", "num_channels", "support_size", "repr_blocks", "dyn_blocks", "proj_dim"}
 )
@@ -85,6 +87,10 @@ def checkpoint_learner_config(
     if "reconstruction_loss_weight" not in stored and stored_model_name != "balanced_reconstruction":
         stored["reconstruction_loss_weight"] = 0.0
     stored.setdefault("train_value_on_truncated", True)
+    stored.setdefault("expert_anchor_path", "")
+    stored.setdefault("expert_anchor_fingerprint", "")
+    stored.setdefault("expert_anchor_fraction", 0.0)
+    stored.setdefault("expert_anchor_loss_weight", 0.0)
     expected = {field.name for field in fields(EzV2LearnerConfig)} - {"model_name"}
     actual = set(stored)
     if actual != expected:

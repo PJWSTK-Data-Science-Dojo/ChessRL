@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from loguru import logger
 
 from luna.config import MCTSParams
+from luna.expert_anchor import ExpertAnchorBatchSource
 from luna.network_training_batches import TrainingBatchSource
 from luna.network_training_forward import run_microbatches
 from luna.network_training_metrics import record_successful_step, report_training
@@ -24,6 +25,7 @@ class TrainingRequest:
     total_train_steps: int
     discount: float | None
     mcts_for_reanalysis: MCTSParams | None
+    expert_anchor: ExpertAnchorBatchSource | None
     profiler: TrainingProfilerConfig
 
 
@@ -38,7 +40,7 @@ def train_ezv2(
     _validate_reconstruction_head(network)
     profiler = start_profiler(network, request.profiler)
     meters = TrainingMeters()
-    batches = TrainingBatchSource(network, replay, settings, request.mcts_for_reanalysis)
+    batches = TrainingBatchSource(network, replay, settings, request.mcts_for_reanalysis, request.expert_anchor)
     batches.start()
     network.optimizer.zero_grad(set_to_none=True)
     completed_steps = 0

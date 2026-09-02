@@ -16,7 +16,7 @@ import numpy as np
 
 from luna.trajectory import TrajectoryArrays, TrajectoryInput, TrajectoryMetadata, prepare_trajectory
 
-REPLAY_SNAPSHOT_SCHEMA_VERSION = 1
+REPLAY_SNAPSHOT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +43,7 @@ class Trajectory:
         "actions",
         "game_length",
         "observations",
+        "policy_train_mask",
         "repetition_guard_attempts",
         "repetition_guard_excluded_actions",
         "repetition_guard_forced_fallbacks",
@@ -77,6 +78,7 @@ class Trajectory:
         search_contempt_opponent_selections: int = 0,
         search_contempt_thompson_selections: int = 0,
         search_contempt_frozen_nodes: int = 0,
+        policy_train_mask: list[bool] | np.ndarray | None = None,
     ) -> None:
         arrays, metadata = prepare_trajectory(
             TrajectoryInput(
@@ -86,6 +88,7 @@ class Trajectory:
                 root_policies=root_policies,
                 root_values=root_values,
                 valids=valids,
+                policy_train_mask=policy_train_mask,
                 truncated=truncated,
                 truncation_bootstrap_value=truncation_bootstrap_value,
                 termination=termination,
@@ -108,6 +111,7 @@ class Trajectory:
         self.root_policies = arrays.root_policies
         self.root_values = arrays.root_values
         self.valids = arrays.valids
+        self.policy_train_mask = arrays.policy_train_mask
         self.game_length = arrays.game_length
 
     def _store_metadata(self, metadata: TrajectoryMetadata) -> None:

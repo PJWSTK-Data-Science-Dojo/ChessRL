@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 
 from luna.config import MCTSParams
+from luna.expert_anchor import ExpertAnchorBatchSource
 from luna.network_training_types import TrainingSettings
 from luna.network_types import NetworkRuntime, PreparedBatch
 from luna.replay_buffer import PrioritizedReplayBuffer
@@ -17,11 +18,13 @@ class TrainingBatchSource:
         replay: PrioritizedReplayBuffer,
         settings: TrainingSettings,
         mcts_params: MCTSParams | None,
+        expert_anchor: ExpertAnchorBatchSource | None,
     ) -> None:
         self._network = network
         self._replay = replay
         self._settings = settings
         self._mcts_params = mcts_params
+        self._expert_anchor = expert_anchor
         self._asynchronous = network._async_batch_prefetch(settings.steps)
         self._future: Future[PreparedBatch] | None = None
         self._future_step: int | None = None
@@ -54,7 +57,7 @@ class TrainingBatchSource:
         self._future = executor.submit(self._prepare, training_step)
 
     def _prepare(self, training_step: int) -> PreparedBatch:
-        return self._network._prepare_batch(
+        prepared = self._network._prepare_batch(
             self._replay,
             self._settings.batch_size,
             self._settings.unroll,
@@ -63,3 +66,6 @@ class TrainingBatchSource:
             training_step,
             self._mcts_params,
         )
+        if self._expert_anchor is None:
+            return prepared
+        return prepared._replace(expert_anchor=self._expert_anchor.next_batch())

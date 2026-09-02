@@ -124,6 +124,20 @@ class TestPrioritizedReplayBuffer:
 
         assert restored.termination is chess.Termination.THREEFOLD_REPETITION
 
+    def test_policy_training_mask_defaults_true_and_survives_pickle(self) -> None:
+        trajectory = Trajectory(**_trajectory_inputs(), policy_train_mask=[True, False])
+
+        restored = pickle.loads(pickle.dumps(trajectory))
+
+        assert restored.policy_train_mask.tolist() == [True, False]
+        assert Trajectory(**_trajectory_inputs()).policy_train_mask.tolist() == [True, True]
+
+    def test_policy_training_mask_requires_one_boolean_per_position(self) -> None:
+        with pytest.raises(ValueError, match="must contain booleans"):
+            Trajectory(**_trajectory_inputs(), policy_train_mask=[1, 0])
+        with pytest.raises(ValueError, match="fields must all have length"):
+            Trajectory(**_trajectory_inputs(), policy_train_mask=[True])
+
     def test_truncated_trajectory_rejects_terminal_outcome(self) -> None:
         with pytest.raises(ValueError, match="truncated trajectory"):
             Trajectory(

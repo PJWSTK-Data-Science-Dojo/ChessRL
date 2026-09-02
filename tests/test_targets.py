@@ -94,6 +94,14 @@ class TestBuildUnrollTargets:
         assert targets["value_mask"] == [0.0, 0.0, 0.0]
         assert np.asarray(targets["target_policies"]).sum(axis=1) == pytest.approx([1.0, 1.0, 1.0])
 
+    def test_policy_training_mask_is_applied_per_position(self, make_trajectory: TrajectoryFactory) -> None:
+        trajectory = make_trajectory(length=3)
+        trajectory.policy_train_mask[:] = [True, False, True]
+
+        targets = build_unroll_targets(trajectory, pos_idx=0, unroll_steps=2, td_steps=1)
+
+        assert targets["policy_mask"] == [1.0, 0.0, 1.0]
+
 
 def test_collation(make_trajectory: TrajectoryFactory) -> None:
     traj = make_trajectory(length=10)

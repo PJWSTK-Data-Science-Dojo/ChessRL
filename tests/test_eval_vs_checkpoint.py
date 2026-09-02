@@ -24,16 +24,27 @@ def _result(config: EvalVsCheckpointCli, scores: CheckpointArenaScores) -> Check
 
 
 def test_cli_defaults_pin_comparable_mcts_protocol(tmp_path: Path) -> None:
-    config = EvalVsCheckpointCli(tmp_path / "a.pth.tar", tmp_path / "b.pth.tar")
+    config = EvalVsCheckpointCli(tmp_path / "a.pth.tar", tmp_path / "b.pth.tar", "latent")
 
     protocol = _protocol(config)
 
     assert protocol.games == 20
     assert protocol.max_ply == 256
     assert protocol.mcts.search_mode == "gumbel"
+    assert protocol.mcts.tree_state_mode == "latent"
     assert protocol.mcts.num_mcts_sims == 32
     assert protocol.mcts.gumbel_max_considered_actions == 8
     assert protocol.mcts.dir_noise is False
+
+
+def test_cli_can_pin_exact_state_search(tmp_path: Path) -> None:
+    config = EvalVsCheckpointCli(
+        tmp_path / "a.pth.tar",
+        tmp_path / "b.pth.tar",
+        "exact",
+    )
+
+    assert _protocol(config).mcts.tree_state_mode == "exact"
 
 
 def test_cli_writes_result_without_loading_models(
@@ -41,7 +52,13 @@ def test_cli_writes_result_without_loading_models(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     output = tmp_path / "result.json"
-    config = EvalVsCheckpointCli(tmp_path / "a.pth.tar", tmp_path / "b.pth.tar", output=output, games=4)
+    config = EvalVsCheckpointCli(
+        tmp_path / "a.pth.tar",
+        tmp_path / "b.pth.tar",
+        "latent",
+        output=output,
+        games=4,
+    )
     result = _result(config, CheckpointArenaScores(1, 2, 1))
 
     with patch("eval_vs_checkpoint.evaluate_checkpoints", return_value=result):
@@ -55,7 +72,13 @@ def test_cli_writes_result_without_loading_models(
 
 def test_cli_returns_distinct_exit_code_when_candidate_regresses(tmp_path: Path) -> None:
     output = tmp_path / "result.json"
-    config = EvalVsCheckpointCli(tmp_path / "a.pth.tar", tmp_path / "b.pth.tar", output=output, games=4)
+    config = EvalVsCheckpointCli(
+        tmp_path / "a.pth.tar",
+        tmp_path / "b.pth.tar",
+        "latent",
+        output=output,
+        games=4,
+    )
     result = _result(config, CheckpointArenaScores(3, 0, 1))
 
     with patch("eval_vs_checkpoint.evaluate_checkpoints", return_value=result):
@@ -67,7 +90,12 @@ def test_cli_returns_distinct_exit_code_when_candidate_regresses(tmp_path: Path)
 
 def test_cli_refuses_to_overwrite_an_input_checkpoint(tmp_path: Path) -> None:
     checkpoint_a = tmp_path / "a.pth.tar"
-    config = EvalVsCheckpointCli(checkpoint_a, tmp_path / "b.pth.tar", output=checkpoint_a)
+    config = EvalVsCheckpointCli(
+        checkpoint_a,
+        tmp_path / "b.pth.tar",
+        "latent",
+        output=checkpoint_a,
+    )
 
     with pytest.raises(ValueError, match="must not overwrite"):
         _result_path(config)

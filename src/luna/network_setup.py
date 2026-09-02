@@ -29,6 +29,8 @@ def initialize_network(
     network.action_size = game.get_action_size()
     _configure_backend(network)
     network.nnet = build_model(game, network._learner).to(network.device)
+    if network.device.type == "cuda":
+        torch.nn.utils.convert_conv2d_weight_memory_format(network.nnet, torch.channels_last)
     network._action_plane_lookup = _action_plane_lookup(network)
     network.optimizer = network._new_optimizer()
     network.scaler = network._new_grad_scaler()

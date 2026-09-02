@@ -20,6 +20,7 @@ import torch.optim as optim
 from luna.config import EzV2LearnerConfig, MCTSParams
 from luna.ezv2_networks import EZV2Networks
 from luna.game.chess_game import ChessGame
+from luna.lc0_dataset import Lc0Batch
 from luna.replay_buffer import PrioritizedReplayBuffer
 
 
@@ -49,6 +50,7 @@ class PreparedBatch(NamedTuple):
     is_weights: np.ndarray
     tree_indices: list[int]
     reanalysis: ReanalysisBatchStats
+    expert_anchor: Lc0Batch | None = None
 
 
 class RepresentationCollapseError(RuntimeError):

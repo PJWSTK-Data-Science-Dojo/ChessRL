@@ -14,7 +14,8 @@ from luna.game.stockfish_eval import validate_ladder_configuration, validate_sto
 from luna.profiling import IterProfileStats, write_iter_summaries_json
 from luna.replay_buffer import Trajectory
 from luna.replay_persistence import load_replay_snapshot, save_replay_snapshot
-from luna.self_play_actors import SelfPlayActorPool
+from luna.self_play_actors import SelfPlayActorPool, derive_actor_seed
+from luna.self_play_worker import seed_self_play_rng
 
 if TYPE_CHECKING:
     from luna.coach import Coach
@@ -207,6 +208,7 @@ def _collect_self_play(
 ) -> list[Trajectory]:
     started_at = time.perf_counter()
     if actor_pool is None:
+        seed_self_play_rng(derive_actor_seed(coach._seed, actor_id=0, generation=iteration))
         trajectories = coach.execute_episodes_batched(coach.run.num_episodes)
     else:
         trajectories = actor_pool.collect(coach.run.num_episodes, generation=iteration)
@@ -324,6 +326,7 @@ def _run_optimizer_steps(
         total_train_steps=_lr_schedule_total_steps(coach, iteration),
         discount=coach.run.discount,
         mcts_for_reanalyze=replace(coach.run, search_contempt_visit_limit=None),
+        expert_anchor=coach.expert_anchor,
         torch_profile_steps=coach.run.profile_torch_steps if profile_iteration else 0,
         torch_profile_dir=coach.run.profile_dir if profile_iteration else None,
         torch_profile_iter=iteration,

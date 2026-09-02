@@ -14,6 +14,7 @@ import wandb as wandb
 from loguru import logger
 
 from luna.config import EzV2LearnerConfig, MCTSParams
+from luna.expert_anchor import ExpertAnchorBatchSource
 from luna.ezv2_networks import EZV2Networks
 from luna.game.chess_game import ChessGame
 from luna.mcts import BatchedMCTS
@@ -270,6 +271,7 @@ class LunaNetwork(NetworkCheckpointMixin):
         *,
         discount: float | None = None,
         mcts_for_reanalyze: MCTSParams | None = None,
+        expert_anchor: ExpertAnchorBatchSource | None = None,
         torch_profile_steps: int = 0,
         torch_profile_dir: str | None = None,
         torch_profile_iter: int = 0,
@@ -282,6 +284,7 @@ class LunaNetwork(NetworkCheckpointMixin):
             total_train_steps,
             discount,
             mcts_for_reanalyze,
+            expert_anchor,
             TrainingProfilerConfig(
                 torch_profile_steps,
                 torch_profile_dir,

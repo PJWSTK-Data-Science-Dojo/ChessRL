@@ -210,7 +210,7 @@ def _append_transition_target(
 
 def _append_state_target(targets: _TargetLists, request: _TargetRequest, position: int, active: bool) -> None:
     trajectory = request.trajectory
-    targets.policy_mask.append(float(active))
+    targets.policy_mask.append(float(active and trajectory.policy_train_mask[position]))
     if active:
         override = request.policy_override
         policy = (

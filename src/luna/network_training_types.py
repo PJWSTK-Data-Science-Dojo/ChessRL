@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from luna.expert_anchor_loss import ExpertAnchorMetrics
 from luna.ezv2_networks import SimSiamProjector
 from luna.utils import AverageMeter
 
@@ -64,6 +65,7 @@ class Microbatch:
     unroll_mask: torch.Tensor
     consistency_mask: torch.Tensor
     policy_mask: torch.Tensor
+    policy_loss_scale: float
     value_mask: torch.Tensor
     unroll_valid_moves: torch.Tensor
     tree_indices: list[int]
@@ -121,6 +123,7 @@ class StepAccumulation:
     priority_errors: list[np.ndarray] = field(default_factory=list)
     tree_indices: list[list[int]] = field(default_factory=list)
     latent_health: dict[str, float] = field(default_factory=dict)
+    expert_anchor: ExpertAnchorMetrics | None = None
 
     @classmethod
     def empty(cls, device: torch.device) -> StepAccumulation:
@@ -141,6 +144,10 @@ class StepAccumulation:
         self.tree_indices.append(tree_indices)
         self.latent_health.update(result.latent_health)
 
+    def add_expert_anchor(self, metrics: ExpertAnchorMetrics) -> None:
+        self.total = self.total + metrics.weighted_loss
+        self.expert_anchor = metrics
+
 
 @dataclass(slots=True)
 class TrainingMeters:
@@ -150,6 +157,12 @@ class TrainingMeters:
     reward: AverageMeter = field(default_factory=AverageMeter)
     consistency: AverageMeter = field(default_factory=AverageMeter)
     reconstruction: AverageMeter = field(default_factory=AverageMeter)
+    expert_anchor: AverageMeter = field(default_factory=AverageMeter)
+    expert_policy_ce: AverageMeter = field(default_factory=AverageMeter)
+    expert_value_wdl_ce: AverageMeter = field(default_factory=AverageMeter)
+    expert_wdl_accuracy: AverageMeter = field(default_factory=AverageMeter)
+    expert_q_mae: AverageMeter = field(default_factory=AverageMeter)
+    expert_positions: AverageMeter = field(default_factory=AverageMeter)
     step_time: AverageMeter = field(default_factory=AverageMeter)
     grad_norm_preclip: AverageMeter = field(default_factory=AverageMeter)
     grad_norm_postclip: AverageMeter = field(default_factory=AverageMeter)
@@ -167,6 +180,7 @@ class TrainingMeters:
             "reward": self.reward.avg,
             "consistency": self.consistency.avg,
             "reconstruction": self.reconstruction.avg,
+            "expert_anchor": self.expert_anchor.avg,
         }
 
 

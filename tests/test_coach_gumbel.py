@@ -33,11 +33,13 @@ def test_gumbel_selfplay_executes_proposal_but_stores_improved_target(
         def search_latent(
             self,
             _board: chess.Board,
+            num_sims: int | None,
             temp: float,
             *,
             add_exploration_noise: bool | None,
         ) -> tuple[np.ndarray, float]:
             assert temp == 1.0
+            assert num_sims == 1
             assert add_exploration_noise is True
             policy = np.zeros(chess_game.get_action_size(), dtype=np.float32)
             policy[target_action] = 1.0
@@ -81,11 +83,13 @@ def test_batched_gumbel_selfplay_routes_per_root_exploration_and_proposals(
         def search_batch(
             self,
             boards: list[chess.Board],
+            num_sims: int | None,
             temp: float,
             *,
             add_exploration_noise: bool | Sequence[bool] | None,
         ) -> list[tuple[np.ndarray, float, np.ndarray, np.ndarray]]:
             assert temp == 1.0
+            assert num_sims == 1
             assert add_exploration_noise == [True]
             self.last_actions = [proposed_action]
             self.last_search_contempt_stats = [SearchContemptStats()]

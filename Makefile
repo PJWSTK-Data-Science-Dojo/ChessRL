@@ -4,6 +4,7 @@ CHECKPOINT_DIR ?= ./runs/luna-main
 CHECKPOINT_PATH = $(CHECKPOINT_DIR)/latest.pth.tar
 ARENA_CHECKPOINT_A ?=
 ARENA_CHECKPOINT_B ?=
+ARENA_TREE_STATE_MODE ?=
 SEARCH_CONTEMPT_CHECKPOINT ?=
 SEARCH_CONTEMPT_REPORT ?= ./runs/search-contempt-ablation/report.json
 NEW_PHASE_SOURCE_DIR ?= ./runs/sources
@@ -52,6 +53,34 @@ LC0_EXACT_PRETRAIN_WANDB_NAME ?= Luna LC0 Exact · Joint Root-WDL v1
 LC0_EXACT_CHECKPOINT_DIR ?= ./runs/luna-lc0-exact-gumbel32-v1
 LC0_EXACT_WANDB_RUN_ID ?= luna-lc0-exact-gumbel32-v1
 LC0_EXACT_WANDB_RUN_NAME ?= Luna LC0 Exact · Gumbel-32 Self-Play v1
+LC0_10M_DATA_PATH ?= ./data/lc0-anchor-test91-20260901
+LC0_10M_SHARD_COUNT ?= 16
+LC0_10M_DATA_URL ?= https://storage.lczero.org/files/training_data/test91
+LC0_10M_SHARDS = \
+	training-run2-test91-20260901-0017.tar:536e24f2092d57b7b8d90336134eb461a4c8956851210daa9c5b9a8cb8602f84 \
+	training-run2-test91-20260901-0117.tar:e618edaa2464c0111b7a54241dccd6c60fa3004a29e45261f9e857d51548a999 \
+	training-run2-test91-20260901-0217.tar:dc0f348780d19ef2fd3eaa20867a9cabc0598cfd9466ea8c774efcdc280890da \
+	training-run2-test91-20260901-0317.tar:08cc5e5e110c7d465eb12b6878a3d6ef1ef01f53c2aaed4ff0dbd207a0f369b5 \
+	training-run2-test91-20260901-0417.tar:7eb764062e1070dfd341c5599bae7350b97842f174c476adef3152e2f11cfce8 \
+	training-run2-test91-20260901-0517.tar:452ff727f6ddfce8b7a1de19e0e2dff745b57eb175b99969019d70d831182fab \
+	training-run2-test91-20260901-0617.tar:8825cea049d864e33e0a422af6cd505254c8156e35328dd25788a8d9b528c6e5 \
+	training-run2-test91-20260901-0717.tar:d2fc04854d856449051926ff9cd938cd9a645ba5943c9cc66beaed8929981c6d \
+	training-run2-test91-20260901-0817.tar:4db22e8c54c2f3e3cb8da4ed244b766445ea21f53e9d20ac6e33a1901bcda9d8 \
+	training-run2-test91-20260901-0917.tar:e9731cfab06ae6ef8c050694d69264f664ffdc0a6ad05fe065c2ec68a6f046e4 \
+	training-run2-test91-20260901-1017.tar:bfad734008447a959d5e9f2799b2a81d74f6b37f1910dac03db998c44a2662ba \
+	training-run2-test91-20260901-1117.tar:f8a8b9ddb171279701eec99a6d19d3d6377b6e0da600b3a6872aa6dbf1019138 \
+	training-run2-test91-20260901-1217.tar:b37a8d4bcc43be62a1862cdc07734f28639ba0b380a38ba30dbb6c1eac129ead \
+	training-run2-test91-20260901-1317.tar:d6fe77a11c71d758dfbff0d07e80958f04440d26fa1f925e0e3683e1a3ad7409 \
+	training-run2-test91-20260901-1417.tar:d8ef790bb6546d609de499e2f7361bed988935c76854531e2fe6e5f72b886967 \
+	training-run2-test91-20260901-1517.tar:1709204680bf67f1bb68eff07a09fd3583cc5b09a392377d2378e5e67c07c5a6
+LC0_10M_SOURCE_CHECKPOINT ?= ./runs/luna-lc0-exact-gumbel32-v1/best.pth.tar
+LC0_10M_SOURCE_SHA256 ?= 7a4bd8ea37ee640d62e1899f97f84f453491cc3585969cfdb6fca4fd808a9f50
+LC0_10M_PRETRAIN_DIR ?= ./runs/luna-lc0-exact-10m-recovery-v1
+LC0_10M_PRETRAIN_WANDB_RUN_ID ?= luna-lc0-exact-10m-recovery-v1
+LC0_10M_PRETRAIN_WANDB_RUN_NAME ?= Luna LC0 Exact · 10M Joint Recovery v1
+LC0_PCR_CHECKPOINT_DIR ?= ./runs/luna-lc0-exact-pcr128x16-p25-anchor25-v1
+LC0_PCR_WANDB_RUN_ID ?= luna-lc0-exact-pcr128x16-p25-anchor25-v1
+LC0_PCR_WANDB_RUN_NAME ?= Luna LC0 Exact · PCR 128/16 p25 + Expert Anchor 25% v1
 SEARCH_CONTEMPT_CANARY_SOURCE_DIR ?= ./runs/sources
 SEARCH_CONTEMPT_CANARY_SOURCE_FILE ?= luna-lc0-warmstart-iter30.pth.tar
 SEARCH_CONTEMPT_CANARY_SOURCE_SHA256 ?= edb1aee2b5c560eb7b38ba3209c52baa9bc4d982cefa1ce7eed0f8f9448cba4a
@@ -121,6 +150,46 @@ LC0_EXACT_ARGS = \
 	--learner.no-train-value-on-truncated \
 	--learner.grad-clip-norm 10 \
 	--learner.no-compile-inference \
+	--learner.reanalyze-mcts-sims 0 \
+	--learner.reanalyze-prob 0.0 \
+	--learner.no-reanalyze-policy
+
+LC0_PCR_ANCHOR_ARGS = \
+	--run.tree-state-mode exact \
+	--run.search-mode gumbel \
+	--run.gumbel-max-considered-actions 8 \
+	--run.num-mcts-sims 32 \
+	--run.playout-cap-full-sims 128 \
+	--run.playout-cap-fast-sims 16 \
+	--run.playout-cap-full-probability 0.25 \
+	--run.evaluation-num-mcts-sims 32 \
+	--run.self-play-workers 1 \
+	--run.parallel-games 128 \
+	--run.temp-threshold 40 \
+	--run.no-self-play-repetition-guard \
+	--run.max-ply 384 \
+	--run.target-replay-ratio 2.0 \
+	--run.lr-schedule-total-steps 25000 \
+	--run.replay-capacity 500000 \
+	--run.replay-warmup-positions 100000 \
+	--run.ladder-start-elo 700 \
+	--run.ladder-eval-every 5 \
+	--run.checkpoint-top-k 12 \
+	--learner.batch-size 512 \
+	--learner.lr 2e-5 \
+	--learner.lr-min 2e-6 \
+	--learner.lr-warmup-steps 1000 \
+	--learner.unroll-steps 0 \
+	--learner.td-steps 512 \
+	--learner.policy-loss-weight 1.0 \
+	--learner.value-loss-weight 1.0 \
+	--learner.reward-loss-weight 0.0 \
+	--learner.consistency-loss-weight 0.0 \
+	--learner.reconstruction-loss-weight 0.0 \
+	--learner.no-train-value-on-truncated \
+	--learner.grad-clip-norm 10 \
+	--learner.no-compile-inference \
+	--learner.no-compile-training \
 	--learner.reanalyze-mcts-sims 0 \
 	--learner.reanalyze-prob 0.0 \
 	--learner.no-reanalyze-policy
@@ -395,14 +464,14 @@ pretrain-lc0: _train-env-preflight verify-lc0-data
 	@if test -f "$(LC0_PRETRAIN_CHECKPOINT_DIR)/latest.pth.tar" || \
 		find "$(LC0_PRETRAIN_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'lc0_step_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
 		set -- --resume-checkpoint "$(LC0_PRETRAIN_CHECKPOINT_DIR)/latest.pth.tar"; \
-		wandb_resume=must; \
+		wandb_resume=allow; \
 	else \
 		test -f "$(LC0_SOURCE_CHECKPOINT)" || { \
 			echo "LC0 source checkpoint not found: $(LC0_SOURCE_CHECKPOINT)" >&2; exit 2; }; \
 		printf '%s  %s\n' "$(LC0_SOURCE_SHA256)" "$(LC0_SOURCE_CHECKPOINT)" | sha256sum --check --status || { \
 			echo "LC0 source checkpoint SHA-256 mismatch: $(LC0_SOURCE_CHECKPOINT)" >&2; exit 2; }; \
 		set -- --source-checkpoint "$(LC0_SOURCE_CHECKPOINT)"; \
-		wandb_resume=allow; \
+		wandb_resume=never; \
 	fi; \
 	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/pretrain_lc0.py \
 		--dataset-path "$(LC0_DATA_PATH)" \
@@ -420,6 +489,7 @@ pretrain-lc0: _train-env-preflight verify-lc0-data
 		--learner.lr-warmup-steps 50 \
 		--learner.cuda-device 0 \
 		--learner.dataloader-workers 0 \
+		--learner.no-compile-training \
 		--wandb-project "$(WANDB_PROJECT)" \
 		--wandb-run-id "$(LC0_PRETRAIN_WANDB_RUN_ID)" \
 		--wandb-run-name "$(LC0_PRETRAIN_WANDB_RUN_NAME)" \
@@ -485,6 +555,119 @@ train-lc0-exact:
 		LC0_RL_WANDB_RUN_ID="$(LC0_EXACT_WANDB_RUN_ID)" \
 		LC0_RL_WANDB_RUN_NAME="$(LC0_EXACT_WANDB_RUN_NAME)" \
 		ARGS='$(LC0_EXACT_ARGS)'
+
+download-lc0-10m-data:
+	@mkdir -p "$(LC0_10M_DATA_PATH)"
+	@set -eu; \
+	for entry in $(LC0_10M_SHARDS); do \
+		filename="$${entry%%:*}"; \
+		digest="$${entry#*:}"; \
+		target="$(LC0_10M_DATA_PATH)/$$filename"; \
+		partial="$$target.part"; \
+		if test -f "$$target"; then \
+			printf '%s  %s\n' "$$digest" "$$target" | sha256sum --check --status || { \
+				echo "LC0 shard SHA-256 mismatch: $$target" >&2; exit 2; }; \
+			continue; \
+		fi; \
+		curl --fail --location --continue-at - --output "$$partial" "$(LC0_10M_DATA_URL)/$$filename"; \
+		printf '%s  %s\n' "$$digest" "$$partial" | sha256sum --check --status || { \
+			echo "Downloaded LC0 shard SHA-256 mismatch: $$partial" >&2; exit 2; }; \
+		mv "$$partial" "$$target"; \
+	done
+
+_lc0-10m-data-preflight:
+	@test -d "$(LC0_10M_DATA_PATH)" || { \
+		echo "LC0 multi-shard corpus not found; run make download-lc0-10m-data" >&2; exit 2; }
+	@test -z "$$(find "$(LC0_10M_DATA_PATH)" -maxdepth 1 -type f -name '*.part' -print -quit)" || { \
+		echo "LC0 multi-shard corpus still contains a partial download" >&2; exit 2; }
+	@shard_count="$$(find "$(LC0_10M_DATA_PATH)" -maxdepth 1 -type f -name '*.tar' | wc -l)"; \
+		test "$$shard_count" -eq "$(LC0_10M_SHARD_COUNT)" || { \
+			echo "Expected $(LC0_10M_SHARD_COUNT) LC0 shards, found $$shard_count" >&2; exit 2; }
+	@set -eu; \
+	for entry in $(LC0_10M_SHARDS); do \
+		filename="$${entry%%:*}"; \
+		digest="$${entry#*:}"; \
+		target="$(LC0_10M_DATA_PATH)/$$filename"; \
+		test -f "$$target" || { echo "LC0 shard not found: $$target" >&2; exit 2; }; \
+		printf '%s  %s\n' "$$digest" "$$target" | sha256sum --check --status || { \
+			echo "LC0 shard SHA-256 mismatch: $$target" >&2; exit 2; }; \
+	done
+	@uv run --frozen python -c \
+		'import sys; from pathlib import Path; from luna.lc0_dataset import lc0_archive_paths; lc0_archive_paths(Path(sys.argv[1]))' \
+		"$(LC0_10M_DATA_PATH)"
+
+# Jointly recovers the exact-state representation and prediction heads on the
+# complete pinned multi-shard corpus. Repeated calls resume the same local and
+# W&B lineage instead of creating a second experiment.
+pretrain-lc0-exact-10m: _train-env-preflight _lc0-10m-data-preflight
+	@if test -f "$(LC0_10M_PRETRAIN_DIR)/latest.pth.tar" || \
+		find "$(LC0_10M_PRETRAIN_DIR)" -maxdepth 1 -type f -name 'lc0_step_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
+		set -- --resume-checkpoint "$(LC0_10M_PRETRAIN_DIR)/latest.pth.tar"; \
+		wandb_resume=allow; \
+	else \
+		test -f "$(LC0_10M_SOURCE_CHECKPOINT)" || { \
+			echo "LC0 recovery source not found: $(LC0_10M_SOURCE_CHECKPOINT)" >&2; exit 2; }; \
+		printf '%s  %s\n' "$(LC0_10M_SOURCE_SHA256)" "$(LC0_10M_SOURCE_CHECKPOINT)" \
+			| sha256sum --check --status || { echo "LC0 recovery source SHA-256 mismatch" >&2; exit 2; }; \
+		set -- --source-checkpoint "$(LC0_10M_SOURCE_CHECKPOINT)"; \
+		wandb_resume=never; \
+	fi; \
+	uv run --frozen --env-file "$(TRAIN_ENV_FILE)" python src/pretrain_lc0.py \
+		--dataset-path "$(LC0_10M_DATA_PATH)" \
+		--output-dir "$(LC0_10M_PRETRAIN_DIR)" \
+		"$$@" \
+		--train-scope representation_and_heads \
+		--dataset.value-source root \
+		--total-steps 20000 \
+		--chunk-steps 1000 \
+		--checkpoint-top-k 20 \
+		--validation-positions 50000 \
+		--dataset.validation-fraction 0.02 \
+		--dataset.min-visits 1 \
+		--dataset.shuffle-buffer-size 8192 \
+		--learner.batch-size 512 \
+		--learner.lr 1e-4 \
+		--learner.lr-min 1e-5 \
+		--learner.lr-warmup-steps 500 \
+		--learner.cuda-device 0 \
+		--learner.dataloader-workers 0 \
+		--learner.no-compile-training \
+		--wandb-project "$(WANDB_PROJECT)" \
+		--wandb-run-id "$(LC0_10M_PRETRAIN_WANDB_RUN_ID)" \
+		--wandb-run-name "$(LC0_10M_PRETRAIN_WANDB_RUN_NAME)" \
+		--wandb-resume "$$wandb_resume" \
+		$(ARGS)
+
+# Starts a fresh online optimizer/replay phase from the recovered supervised
+# weights, or resumes it after interruption. The anchor fingerprint is derived
+# from the exact shard contents and becomes part of the checkpoint contract.
+train-lc0-exact-pcr-anchor: _train-env-preflight _fairy-stockfish-preflight _lc0-10m-data-preflight
+	@anchor_fingerprint="$$(uv run --frozen python -c \
+		'import sys; from pathlib import Path; from luna.expert_anchor import expert_anchor_fingerprint; print(expert_anchor_fingerprint(Path(sys.argv[1])))' \
+		"$(LC0_10M_DATA_PATH)")"; \
+	anchor_args="--learner.expert-anchor-path \"$(LC0_10M_DATA_PATH)\" --learner.expert-anchor-fingerprint \"$$anchor_fingerprint\" --learner.expert-anchor-fraction 0.25 --learner.expert-anchor-loss-weight 0.25"; \
+	if test -f "$(LC0_PCR_CHECKPOINT_DIR)/latest.pth.tar" || \
+		find "$(LC0_PCR_CHECKPOINT_DIR)" -maxdepth 1 -type f -name 'checkpoint_*.pth.tar' -print -quit 2>/dev/null | grep -q .; then \
+		$(MAKE) resume CHECKPOINT_DIR="$(LC0_PCR_CHECKPOINT_DIR)" \
+			TRAIN_ARGS="--wandb-project \"$(WANDB_PROJECT)\" --wandb-run-id \"$(LC0_PCR_WANDB_RUN_ID)\" --wandb-run-name \"$(LC0_PCR_WANDB_RUN_NAME)\" --wandb-resume allow $$anchor_args" \
+			ARGS='$(LC0_PCR_ANCHOR_ARGS) $(ARGS)'; \
+	else \
+		test -f "$(LC0_10M_PRETRAIN_DIR)/best.pth.tar" || { \
+			echo "Recovered LC0 checkpoint not found; run make pretrain-lc0-exact-10m" >&2; exit 2; }; \
+		uv run --frozen python -c \
+			'import sys; from pathlib import Path; from luna.lc0_pretraining_config import validate_lc0_online_source; validate_lc0_online_source(Path(sys.argv[1]), sys.argv[2])' \
+			"$(LC0_10M_PRETRAIN_DIR)/best.pth.tar" "$$anchor_fingerprint"; \
+		source_dir="$$(dirname -- "$(LC0_10M_PRETRAIN_DIR)/best.pth.tar")"; \
+		source_file="$$(basename -- "$(LC0_10M_PRETRAIN_DIR)/best.pth.tar")"; \
+		$(MAKE) train CHECKPOINT_DIR="$(LC0_PCR_CHECKPOINT_DIR)" \
+			TRAIN_ARGS="--new-training-phase --load-checkpoint-dir \"$$source_dir\" --load-checkpoint-file \"$$source_file\" --wandb-project \"$(WANDB_PROJECT)\" --wandb-run-id \"$(LC0_PCR_WANDB_RUN_ID)\" --wandb-run-name \"$(LC0_PCR_WANDB_RUN_NAME)\" --wandb-resume never $$anchor_args" \
+			ARGS='$(LC0_PCR_ANCHOR_ARGS) $(ARGS)'; \
+	fi
+
+# Runs both resumable phases in order. The second phase necessarily includes
+# online self-play; supervised recovery alone is never the terminal pipeline.
+train-lc0-exact-10m-pipeline: pretrain-lc0-exact-10m
+	$(MAKE) train-lc0-exact-pcr-anchor ARGS='$(ARGS)'
 
 # Migrate the complete LC0 warm-start state on first use, then continue only
 # the canary's optimizer, evaluation sidecars, checkpoints, and W&B lineage.
@@ -654,11 +837,13 @@ eval-stockfish:
 eval-checkpoints:
 	@test -n "$(ARENA_CHECKPOINT_A)" || { echo "ARENA_CHECKPOINT_A is required" >&2; exit 2; }
 	@test -n "$(ARENA_CHECKPOINT_B)" || { echo "ARENA_CHECKPOINT_B is required" >&2; exit 2; }
+	@test "$(ARENA_TREE_STATE_MODE)" = "latent" || test "$(ARENA_TREE_STATE_MODE)" = "exact" || { echo "ARENA_TREE_STATE_MODE must be latent or exact" >&2; exit 2; }
 	@test -f "$(ARENA_CHECKPOINT_A)" || { echo "Checkpoint A not found: $(ARENA_CHECKPOINT_A)" >&2; exit 2; }
 	@test -f "$(ARENA_CHECKPOINT_B)" || { echo "Checkpoint B not found: $(ARENA_CHECKPOINT_B)" >&2; exit 2; }
 	uv run --frozen python src/eval_vs_checkpoint.py \
 		--checkpoint-a "$(ARENA_CHECKPOINT_A)" \
 		--checkpoint-b "$(ARENA_CHECKPOINT_B)" \
+		--tree-state-mode "$(ARENA_TREE_STATE_MODE)" \
 		$(ARGS)
 
 ablate-search-contempt:
@@ -694,11 +879,12 @@ test-pipeline-cpu:
 test-pipeline-mps:
 	$(MAKE) test-pipeline-cpu ARGS="--learner.device mps $(ARGS)"
 
-.PHONY: _fairy-stockfish-preflight _train-env-preflight ablate-search-contempt audit bench check download-lc0-data download-pgn-data \
+.PHONY: _fairy-stockfish-preflight _lc0-10m-data-preflight _train-env-preflight ablate-search-contempt audit bench check download-lc0-10m-data download-lc0-data download-pgn-data \
 	eval-checkpoints eval-lc0-warmstart eval-pgn-warmstart eval-stockfish fmt format-check install-fairy-stockfish \
 	lichess-config lint \
 	migrate-ladder-phase pretrain-lc0 pretrain-pgn profile-smoke release-web-model resume resume-migrated-phase resume-phase \
 	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train train-lc0-warmstart train-phase train-pgn-warmstart \
-	train-lc0-exact train-search-contempt-canary pretrain-lc0-exact \
+	train-lc0-exact train-lc0-exact-10m-pipeline train-lc0-exact-pcr-anchor train-search-contempt-canary \
+	pretrain-lc0-exact pretrain-lc0-exact-10m \
 	types uci verify-lc0-data verify-pgn-data verify-web-model web-build web-config web-down web-logs web-public-config \
 	web-public-down web-public-logs web-public-up web-up

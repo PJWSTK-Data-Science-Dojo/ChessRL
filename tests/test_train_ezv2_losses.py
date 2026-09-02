@@ -14,8 +14,9 @@ from luna.network import (
     LunaNetwork,
     PreparedBatch,
 )
-from luna.network_training_forward import _priority_errors
+from luna.network_training_forward import _policy_loss_scale, _priority_errors
 from luna.network_training_types import Microbatch, RootState
+from luna.network_types import ReanalysisBatchStats
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 
 
@@ -61,6 +62,7 @@ def test_masked_value_priority_uses_policy_kl() -> None:
         unroll_mask=unused,
         consistency_mask=unused,
         policy_mask=torch.ones(2, 1),
+        policy_loss_scale=1.0,
         value_mask=torch.tensor([[1.0], [0.0]]),
         unroll_valid_moves=unused,
         tree_indices=[],
@@ -69,6 +71,23 @@ def test_masked_value_priority_uses_policy_kl() -> None:
     errors = _priority_errors(root, batch)
 
     np.testing.assert_allclose(errors, [0.5, 0.25], atol=1e-6)
+
+
+def test_policy_mask_scale_preserves_is_weighted_gradient_mass() -> None:
+    importance_weights = np.array([1.0, 0.5, 0.25, 0.25], dtype=np.float32)
+    policy_mask = np.array([[1.0, 1.0], [1.0, 0.0], [0.0, 0.0], [0.0, 0.0]], dtype=np.float32)
+    prepared = PreparedBatch(
+        {"policy_mask": policy_mask},
+        importance_weights,
+        [],
+        ReanalysisBatchStats(0, 0, 0.0),
+    )
+
+    scale = _policy_loss_scale(prepared)
+    active_rows = policy_mask.any(axis=1)
+
+    assert scale == pytest.approx(4.0 / 3.0)
+    assert np.mean(importance_weights * active_rows * scale) == pytest.approx(np.mean(importance_weights))
 
 
 def test_reported_total_loss_is_invariant_to_identical_gradient_accumulation() -> None:
@@ -304,7 +323,7 @@ def test_accumulation_updates_duplicate_replay_index_atomically_with_largest_err
     network = LunaNetwork(ChessGame(), small_learner_config)
     replay = PrioritizedReplayBuffer(capacity=1)
     replay.save_trajectory(_make_trajectory(length=1))
-    collated, weights, _indices, reanalysis = network._prepare_batch(
+    sampled = network._prepare_batch(
         replay,
         bs=2,
         unroll=1,
@@ -313,8 +332,9 @@ def test_accumulation_updates_duplicate_replay_index_atomically_with_largest_err
         training_step=1,
         mcts_for_reanalyze=None,
     )
+    collated = sampled.collated
     collated["target_values"][:, 0] = np.array([-1.0, 1.0], dtype=np.float32)
-    prepared = PreparedBatch(collated, weights, [0, 0], reanalysis)
+    prepared = PreparedBatch(collated, sampled.is_weights, [0, 0], sampled.reanalysis)
 
     with (
         patch.object(network, "_prepare_batch", return_value=prepared),

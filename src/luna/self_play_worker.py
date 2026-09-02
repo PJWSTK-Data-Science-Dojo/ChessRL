@@ -88,7 +88,7 @@ def partition_episode_counts(num_episodes: int, worker_count: int) -> list[int]:
     return [quotient + int(actor_id < remainder) for actor_id in range(active_workers)]
 
 
-def _seed_actor(seed: int) -> None:
+def seed_self_play_rng(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -98,7 +98,16 @@ def _seed_actor(seed: int) -> None:
 
 def _actor_learner_config(learner: EzV2LearnerConfig) -> EzV2LearnerConfig:
     """Return the eager-only runtime configuration for a self-play actor."""
-    return replace(learner, compile_inference=False, compile_training=False, dataloader_workers=0)
+    return replace(
+        learner,
+        compile_inference=False,
+        compile_training=False,
+        dataloader_workers=0,
+        expert_anchor_path="",
+        expert_anchor_fingerprint="",
+        expert_anchor_fraction=0.0,
+        expert_anchor_loss_weight=0.0,
+    )
 
 
 def _actor_entry(
@@ -114,7 +123,7 @@ def _actor_entry(
         os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         torch.set_num_threads(1)
-        _seed_actor(derive_actor_seed(base_seed, actor_id, 0))
+        seed_self_play_rng(derive_actor_seed(base_seed, actor_id, 0))
 
         # Delayed imports avoid a module cycle when Coach creates this pool.
         from luna.coach import Coach
@@ -140,7 +149,7 @@ def _actor_entry(
             if request.episode_count <= 0:
                 raise ValueError("Actor collection must request at least one episode")
             episode_count = request.episode_count
-            _seed_actor(request.seed)
+            seed_self_play_rng(request.seed)
             network.nnet.load_state_dict(request.state_dict, strict=True)
             del request
             if not warmed_up:

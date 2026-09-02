@@ -28,7 +28,9 @@ class _SelfPlaySummary:
     black_wins: int = 0
     draws: int = 0
     unknown_terminations: int = 0
-    policy_entropy_sum: float = 0.0
+    full_search_policy_entropy_sum: float = 0.0
+    fast_search_policy_entropy_sum: float = 0.0
+    policy_train_positions: int = 0
     truncation_bootstrap_abs_sum: float = 0.0
     guard_attempts: int = 0
     guard_interventions: int = 0
@@ -74,7 +76,10 @@ def _summarize_trajectories(trajectories: list[Trajectory]) -> _SelfPlaySummary:
     summary = _SelfPlaySummary(games=len(trajectories))
     for trajectory in trajectories:
         summary.positions += trajectory.game_length
-        summary.policy_entropy_sum += _policy_entropy(trajectory)
+        full_entropy, fast_entropy = _policy_entropy_sums(trajectory)
+        summary.full_search_policy_entropy_sum += full_entropy
+        summary.fast_search_policy_entropy_sum += fast_entropy
+        summary.policy_train_positions += int(np.count_nonzero(trajectory.policy_train_mask))
         summary.guard_attempts += trajectory.repetition_guard_attempts
         summary.guard_interventions += trajectory.repetition_guard_interventions
         summary.guard_forced_fallbacks += trajectory.repetition_guard_forced_fallbacks
@@ -97,10 +102,12 @@ def _repeated_prefix_fraction(trajectories: list[Trajectory], length: int) -> fl
     return sum(counts[prefix] > 1 for prefix in prefixes) / len(prefixes)
 
 
-def _policy_entropy(trajectory: Trajectory) -> float:
+def _policy_entropy_sums(trajectory: Trajectory) -> tuple[float, float]:
     probabilities = trajectory.root_policies.astype(np.float32)
     positive = probabilities > 0.0
-    return -float(np.sum(probabilities[positive] * np.log(probabilities[positive])))
+    entropy = -np.sum(np.where(positive, probabilities * np.log(np.where(positive, probabilities, 1.0)), 0.0), axis=1)
+    train_mask = trajectory.policy_train_mask
+    return float(np.sum(entropy[train_mask])), float(np.sum(entropy[~train_mask]))
 
 
 def _record_root_value_calibration(summary: _SelfPlaySummary, trajectory: Trajectory) -> None:
@@ -157,6 +164,8 @@ def _self_play_metrics(
 ) -> dict[str, MetricValue]:
     decisive_games = summary.white_wins + summary.black_wins
     positions = summary.positions
+    full_positions = summary.policy_train_positions
+    fast_positions = positions - full_positions
     return {
         "selfplay/games": summary.games,
         "selfplay/positions": positions,
@@ -171,7 +180,11 @@ def _self_play_metrics(
         "selfplay/draw_fraction": _fraction(summary.draws, summary.games),
         "selfplay/white_win_fraction": _fraction(summary.white_wins, summary.games),
         "selfplay/black_win_fraction": _fraction(summary.black_wins, summary.games),
-        "selfplay/policy_entropy": summary.policy_entropy_sum / positions if positions else 0.0,
+        "selfplay/policy_entropy": _mean(summary.full_search_policy_entropy_sum, full_positions),
+        "selfplay/full_search_policy_entropy": _mean(summary.full_search_policy_entropy_sum, full_positions),
+        "selfplay/fast_search_policy_entropy": _mean(summary.fast_search_policy_entropy_sum, fast_positions),
+        "selfplay/playout_cap_full_fraction": _fraction(summary.policy_train_positions, positions),
+        "selfplay/avg_mcts_sims": _average_mcts_simulations(coach, summary),
         "selfplay/replay_samples_per_new_position": (
             optimizer_steps * coach.nnet._learner.batch_size / positions if positions else 0.0
         ),
@@ -185,6 +198,16 @@ def _self_play_metrics(
         "selfplay/repeated_prefix_8_fraction": summary.repeated_prefix_8_fraction,
         "selfplay/repeated_prefix_16_fraction": summary.repeated_prefix_16_fraction,
     }
+
+
+def _average_mcts_simulations(coach: Coach, summary: _SelfPlaySummary) -> float:
+    if summary.positions == 0:
+        return 0.0
+    if coach.run.playout_cap_full_probability <= 0.0:
+        return float(coach.run.num_mcts_sims)
+    full = summary.policy_train_positions * coach.run.playout_cap_full_sims
+    fast = (summary.positions - summary.policy_train_positions) * coach.run.playout_cap_fast_sims
+    return (full + fast) / summary.positions
 
 
 def _search_contempt_metrics(summary: _SelfPlaySummary) -> dict[str, MetricValue]:

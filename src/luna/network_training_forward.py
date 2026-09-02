@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from luna.expert_anchor_loss import expert_anchor_forward_and_backward
 from luna.ezv2_networks import _scale_latent, _support_to_scalar, scalar_to_support
 from luna.network_runtime import scale_gradient
 from luna.network_training_diagnostics import training_diagnostics
@@ -30,11 +31,14 @@ def run_microbatches(
     functions: TrainingFunctions,
 ) -> StepAccumulation:
     accumulation = StepAccumulation.empty(network.device)
+    policy_loss_scale = _policy_loss_scale(prepared)
     for index in range(settings.gradient_accumulation):
-        microbatch = _build_microbatch(network, prepared, index, settings)
+        microbatch = _build_microbatch(network, prepared, index, settings, policy_loss_scale)
         report = settings.should_report(step) and index == settings.gradient_accumulation - 1
         result = _forward_and_backward(network, microbatch, settings, functions, report)
         accumulation.add(result, microbatch.tree_indices)
+    if prepared.expert_anchor is not None:
+        accumulation.add_expert_anchor(expert_anchor_forward_and_backward(network, prepared.expert_anchor))
     return accumulation
 
 
@@ -43,6 +47,7 @@ def _build_microbatch(
     prepared: PreparedBatch,
     index: int,
     settings: TrainingSettings,
+    policy_loss_scale: float,
 ) -> Microbatch:
     start = index * settings.micro_batch_size
     stop = start + settings.micro_batch_size
@@ -59,10 +64,20 @@ def _build_microbatch(
         unroll_mask=_tensor(network, values["unroll_mask"]),
         consistency_mask=_tensor(network, values["consistency_mask"]),
         policy_mask=_tensor(network, values["policy_mask"]),
+        policy_loss_scale=policy_loss_scale,
         value_mask=_tensor(network, values["value_mask"]),
         unroll_valid_moves=_tensor(network, values["valid_masks_unroll"]),
         tree_indices=prepared.tree_indices[start:stop],
     )
+
+
+def _policy_loss_scale(prepared: PreparedBatch) -> float:
+    policy_counts = prepared.collated["policy_mask"].sum(axis=1)
+    total_weight = float(prepared.is_weights.sum())
+    active_weight = float(prepared.is_weights[policy_counts > 0.0].sum())
+    if active_weight <= 0.0:
+        return 0.0
+    return total_weight / active_weight
 
 
 def _tensor(
@@ -307,6 +322,7 @@ def _weighted_losses(
     settings: TrainingSettings,
 ) -> LossComponents:
     policy = unroll.policy_loss / batch.policy_mask.sum(dim=1).clamp(min=1.0)
+    policy = policy * batch.policy_loss_scale
     value = unroll.value_loss / batch.value_mask.sum(dim=1).clamp(min=1.0)
     reward = unroll.reward_loss / batch.unroll_mask.sum(dim=1).clamp(min=1.0)
     consistency = unroll.consistency_loss / batch.consistency_mask.sum(dim=1).clamp(min=1.0)

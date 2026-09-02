@@ -17,6 +17,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from luna.game.chess_game import ACTION_SIZE, OBS_PLANES, ChessGame, move_to_action
+from luna.lc0_corpus import lc0_archive_paths
 from luna.lc0_policy import LC0_POLICY_SIZE, decode_lc0_policy_move
 
 type FloatArray = NDArray[np.float32]
@@ -24,8 +25,6 @@ type BoolArray = NDArray[np.bool_]
 type IntArray = NDArray[np.int64]
 type Lc0Split = Literal["train", "validation"]
 type Lc0ValueSource = Literal["result", "root"]
-
-LC0_ADAPTER_VERSION = 1
 
 _V6_SIZE, _V7_SIZE = 8356, 8396
 _PLANES_OFFSET, _METADATA_OFFSET, _VISITS_OFFSET = 7440, 8272, 8340
@@ -91,20 +90,19 @@ class _RawRecord:
     index: int
 
 
-def dataset_fingerprint(path: Path) -> str:
-    digest = hashlib.sha256(f"luna-lc0-adapter:{LC0_ADAPTER_VERSION}\0".encode())
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def iter_lc0_samples(path: Path, config: Lc0DatasetConfig, game: ChessGame) -> Iterator[Lc0Sample]:
+    yield from _iter_samples(_iter_records(path, config), config, game)
+
+
+def _iter_samples(
+    records: Iterator[_RawRecord],
+    config: Lc0DatasetConfig,
+    game: ChessGame,
+) -> Iterator[Lc0Sample]:
     if game.get_action_size() != ACTION_SIZE:
         raise ValueError(f"Lc0 adapter requires Luna's {ACTION_SIZE}-action encoding")
     yielded = 0
-    records = _shuffled_records(_iter_records(path, config), config)
-    for record in records:
+    for record in _shuffled_records(records, config):
         visits = int(struct.unpack_from("<I", record.data, _VISITS_OFFSET)[0])
         if visits < config.min_visits or record.data[_METADATA_OFFSET + 6] & _DELETED_MASK:
             continue
@@ -115,10 +113,14 @@ def iter_lc0_samples(path: Path, config: Lc0DatasetConfig, game: ChessGame) -> I
 
 
 def iter_lc0_batches(path: Path, config: Lc0DatasetConfig, game: ChessGame) -> Iterator[Lc0Batch]:
+    yield from _iter_batches(iter_lc0_samples(path, config, game), config.batch_size)
+
+
+def _iter_batches(stream: Iterator[Lc0Sample], batch_size: int) -> Iterator[Lc0Batch]:
     samples: list[Lc0Sample] = []
-    for sample in iter_lc0_samples(path, config, game):
+    for sample in stream:
         samples.append(sample)
-        if len(samples) == config.batch_size:
+        if len(samples) == batch_size:
             yield _collate(samples)
             samples.clear()
     if samples:
@@ -136,6 +138,33 @@ def _collate(samples: list[Lc0Sample]) -> Lc0Batch:
 
 
 def _iter_records(path: Path, config: Lc0DatasetConfig) -> Iterator[_RawRecord]:
+    resolved = path.expanduser().resolve()
+    qualify_members = resolved.is_dir()
+    archives = lc0_archive_paths(resolved)
+    if qualify_members:
+        yield from _iter_shard_records(archives, config)
+        return
+    yield from _iter_archive_records(archives[0], config, False)
+
+
+def _iter_shard_records(
+    archives: tuple[Path, ...],
+    config: Lc0DatasetConfig,
+    windows: tuple[int, ...] = (),
+    window_count: int = 0,
+) -> Iterator[_RawRecord]:
+    for window in windows or (None,):
+        for archive in archives:
+            yield from _iter_archive_records(archive, config, True, window, window_count)
+
+
+def _iter_archive_records(
+    path: Path,
+    config: Lc0DatasetConfig,
+    qualify_members: bool,
+    member_window: int | None = None,
+    member_window_count: int = 0,
+) -> Iterator[_RawRecord]:
     try:
         with tarfile.open(path, mode="r|*") as archive:
             for member in archive:
@@ -143,13 +172,19 @@ def _iter_records(path: Path, config: Lc0DatasetConfig) -> Iterator[_RawRecord]:
                     continue
                 if not member.name.casefold().endswith(".gz"):
                     raise Lc0DatasetError(f"Unexpected non-gzip member in {path}: {member.name}")
-                if _member_split(member.name, config) != config.split:
+                identity = f"{path.name}/{member.name}" if qualify_members else member.name
+                if _member_split(identity, config) != config.split:
+                    continue
+                if (
+                    member_window is not None
+                    and _member_window(identity, config.split_seed, member_window_count) != member_window
+                ):
                     continue
                 extracted = archive.extractfile(member)
                 if extracted is None:
                     raise Lc0DatasetError(f"Cannot read tar member {member.name}")
                 with extracted, gzip.GzipFile(fileobj=extracted, mode="rb") as stream:
-                    yield from _read_game(stream, member.name)
+                    yield from _read_game(stream, identity)
     except (OSError, EOFError, tarfile.TarError, gzip.BadGzipFile, zlib.error) as exc:
         raise Lc0DatasetError(f"Cannot stream Lc0 archive {path}: {exc}") from exc
 
@@ -188,6 +223,11 @@ def _member_split(member: str, config: Lc0DatasetConfig) -> Lc0Split:
     material = f"{config.split_seed}\0{member}".encode()
     fraction = int.from_bytes(hashlib.sha256(material).digest()[:8], "big") / 2**64
     return "validation" if fraction < config.validation_fraction else "train"
+
+
+def _member_window(member: str, seed: int, count: int) -> int:
+    material = f"luna-lc0-window\0{seed}\0{member}".encode()
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") % count
 
 
 def _shuffled_records(records: Iterator[_RawRecord], config: Lc0DatasetConfig) -> Iterator[_RawRecord]:

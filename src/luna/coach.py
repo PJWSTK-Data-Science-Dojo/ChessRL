@@ -27,6 +27,7 @@ from luna.config import (
     validate_wandb_run_id,
     validate_wandb_run_name,
 )
+from luna.expert_anchor import ExpertAnchorBatchSource, build_expert_anchor_source
 from luna.game.benchmark_state import BenchmarkState
 from luna.game.chess_game import ChessGame
 from luna.game.stockfish_eval import (
@@ -80,6 +81,7 @@ class Coach:
     nnet: LunaNetwork
     run: TrainingRunConfig
     replay: PrioritizedReplayBuffer
+    expert_anchor: ExpertAnchorBatchSource | None
 
     def __init__(
         self,
@@ -105,6 +107,7 @@ class Coach:
             alpha=run.per_alpha,
             beta=run.per_beta,
         )
+        self.expert_anchor = build_expert_anchor_source(nnet._learner, game, seed=seed, starting_step=nnet.global_step)
         self._profile_mcts_timings: SelfPlayMCTSTimings | None = None
         self._profile_sp_env_s = 0.0
         self._checkpoint_lineage_iteration: int | None = None

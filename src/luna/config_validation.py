@@ -1,6 +1,7 @@
 """Validation for Luna training and search configuration."""
 
 import math
+from pathlib import Path
 
 from luna.config_models import (
     FAIRY_STOCKFISH_MAX_ELO,
@@ -72,6 +73,7 @@ def _validate_training_schedule(run: TrainingRunConfig) -> None:
     if run.replay_warmup_positions > run.replay_capacity:
         raise ValueError("replay_warmup_positions cannot exceed replay_capacity")
     _non_negative_integer("temp_threshold", run.temp_threshold)
+    _validate_playout_cap_randomization(run)
     _non_negative_integer("stockfish_eval_every", run.stockfish_eval_every)
     _non_negative_integer("ladder_eval_every", run.ladder_eval_every)
     _non_negative_integer("profile_torch_steps", run.profile_torch_steps)
@@ -82,6 +84,21 @@ def _validate_training_schedule(run: TrainingRunConfig) -> None:
         _positive_integer("max_ply", run.max_ply)
     if run.checkpoint_top_k is not None:
         _non_negative_integer("checkpoint_top_k", run.checkpoint_top_k)
+
+
+def _validate_playout_cap_randomization(run: TrainingRunConfig) -> None:
+    full_sims = run.playout_cap_full_sims
+    fast_sims = run.playout_cap_fast_sims
+    probability = run.playout_cap_full_probability
+    _non_negative_integer("playout_cap_full_sims", full_sims)
+    _non_negative_integer("playout_cap_fast_sims", fast_sims)
+    _probability("playout_cap_full_probability", probability)
+    if full_sims == fast_sims == 0 and probability == 0.0:
+        return
+    if full_sims <= 0 or fast_sims <= 0 or probability <= 0.0:
+        raise ValueError("PCR requires positive full/fast simulation budgets and full probability")
+    if fast_sims >= full_sims:
+        raise ValueError("playout_cap_fast_sims must be smaller than playout_cap_full_sims")
 
 
 def _validate_external_evaluation(run: TrainingRunConfig) -> None:
@@ -181,10 +198,33 @@ def _validate_learning_objective(learner: EzV2LearnerConfig) -> None:
         raise ValueError("unroll_steps=0 requires reward_loss_weight=0 and consistency_loss_weight=0")
     if learner.reconstruction_loss_weight > 0.0 and learner.model_name != "balanced_reconstruction":
         raise ValueError("reconstruction_loss_weight requires model_name='balanced_reconstruction'")
+    _validate_expert_anchor(learner)
     _non_negative_integer("dataloader_workers", learner.dataloader_workers)
     _non_negative_integer("reanalyze_mcts_sims", learner.reanalyze_mcts_sims)
     _probability("reanalyze_prob", learner.reanalyze_prob)
     _non_negative_integer("reanalyze_start_step", learner.reanalyze_start_step)
+
+
+def _validate_expert_anchor(learner: EzV2LearnerConfig) -> None:
+    _probability("expert_anchor_fraction", learner.expert_anchor_fraction)
+    _finite_at_least("expert_anchor_loss_weight", learner.expert_anchor_loss_weight, 0.0)
+    values = (
+        bool(learner.expert_anchor_path),
+        bool(learner.expert_anchor_fingerprint),
+        learner.expert_anchor_fraction > 0.0,
+        learner.expert_anchor_loss_weight > 0.0,
+    )
+    if not any(values):
+        return
+    if not all(values):
+        raise ValueError("expert anchor path, fingerprint, fraction, and loss weight must be enabled together")
+    if learner.support_size != 1:
+        raise ValueError("expert anchor requires support_size=1 for exact L/D/W supervision")
+    if learner.policy_loss_weight == 0.0 and learner.value_loss_weight == 0.0:
+        raise ValueError("expert anchor requires a positive policy or value loss weight")
+    fingerprint = learner.expert_anchor_fingerprint
+    if len(fingerprint) != 64 or any(character not in "0123456789abcdef" for character in fingerprint):
+        raise ValueError("expert_anchor_fingerprint must be 64 lowercase hexadecimal characters")
 
 
 def validate_learner_config(learner: EzV2LearnerConfig) -> None:
@@ -204,6 +244,10 @@ def validate_training_configuration(run: TrainingRunConfig, learner: EzV2Learner
     _probability("per_beta", run.per_beta)
     if run.replay_capacity < learner.batch_size:
         raise ValueError("replay_capacity must be at least batch_size or training can never start")
+    if learner.expert_anchor_loss_weight > 0.0 and not Path(learner.expert_anchor_path).expanduser().exists():
+        raise ValueError(f"expert_anchor_path does not exist: {learner.expert_anchor_path}")
+    if run.playout_cap_full_probability > 0.0 and learner.reanalyze_policy:
+        raise ValueError("PCR requires policy reanalysis to remain disabled")
 
 
 def validate_wandb_run_id(run_id: str | None) -> None:

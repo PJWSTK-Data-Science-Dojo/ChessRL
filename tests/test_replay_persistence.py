@@ -155,3 +155,4 @@ def _assert_snapshots_equal(actual: ReplaySnapshot, expected: ReplaySnapshot) ->
         np.testing.assert_array_equal(actual_trajectory.root_policies, expected_trajectory.root_policies)
         np.testing.assert_array_equal(actual_trajectory.root_values, expected_trajectory.root_values)
         np.testing.assert_array_equal(actual_trajectory.valids, expected_trajectory.valids)
+        np.testing.assert_array_equal(actual_trajectory.policy_train_mask, expected_trajectory.policy_train_mask)

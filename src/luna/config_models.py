@@ -102,6 +102,15 @@ class TrainingRunConfig(MCTSParams):
     temp_threshold: int = 15
     """Ply after which ordinary self-play exploration stops; Gumbel re-enables it for repeated roots."""
 
+    playout_cap_full_sims: int = 0
+    """PCR full-search budget; zero keeps Playout Cap Randomization disabled."""
+
+    playout_cap_fast_sims: int = 0
+    """PCR fast-search budget; zero keeps Playout Cap Randomization disabled."""
+
+    playout_cap_full_probability: float = 0.0
+    """Probability that one self-play pool step uses the full PCR budget."""
+
     self_play_repetition_guard: bool = False
     """Retry self-play root search without moves that immediately enable a threefold-repetition claim."""
 
@@ -302,6 +311,11 @@ class EzV2LearnerConfig:
 
     reconstruction_loss_weight: float = 0.0
     """Relative weight of the training-only piece-position reconstruction objective."""
+
+    expert_anchor_path: str = ""
+    expert_anchor_fingerprint: str = ""
+    expert_anchor_fraction: float = 0.0
+    expert_anchor_loss_weight: float = 0.0
 
     train_value_on_truncated: bool = True
     """Train max-ply bootstrap values; disabling retains policy targets while masking those value targets."""

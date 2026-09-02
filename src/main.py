@@ -23,6 +23,7 @@ from luna.config import (
     validate_wandb_run_id,
     validate_wandb_run_name,
 )
+from luna.expert_anchor import build_expert_anchor_source
 from luna.game.benchmark_state import BENCHMARK_STATE_NAME, load_benchmark_state
 from luna.game.chess_game import ChessGame as Game
 from luna.game.stockfish_eval import (
@@ -206,10 +207,25 @@ def _initialize_network(setup: _TrainingSetup, game: Game) -> LunaNetwork:
             setup.cli.load_checkpoint_file,
         )
         network.initialize_training_phase(setup.cli.load_checkpoint_dir, setup.cli.load_checkpoint_file)
+        _preflight_expert_anchor(setup, game, network)
         publish_bootstrap_checkpoint(network, setup.run.checkpoint)
     else:
         logger.info("Starting a new run from randomly initialized weights.")
     return network
+
+
+def _preflight_expert_anchor(setup: _TrainingSetup, game: Game, network: LunaNetwork) -> int:
+    source = build_expert_anchor_source(
+        setup.learner,
+        game,
+        seed=setup.cli.seed,
+        starting_step=network.global_step,
+    )
+    if source is None:
+        return 0
+    positions = len(source.next_batch().observations)
+    logger.info("Validated {} expert-anchor positions before publishing the bootstrap checkpoint.", positions)
+    return positions
 
 
 def _log_profiling(run: TrainingRunConfig) -> None:

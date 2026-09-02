@@ -179,15 +179,17 @@ def validate_lc0_batch(batch: Lc0Batch, network: LunaNetwork) -> int:
     return size
 
 
-def _capture_modes(network: LunaNetwork) -> tuple[bool, bool, bool]:
+def _capture_modes(network: LunaNetwork) -> tuple[bool, bool, bool, bool]:
     return (
         network.nnet.training,
+        network.nnet.representation.training,
         network.nnet.prediction.policy_head.training,
         network.nnet.prediction.value_head.training,
     )
 
 
-def _restore_modes(network: LunaNetwork, modes: tuple[bool, bool, bool]) -> None:
+def _restore_modes(network: LunaNetwork, modes: tuple[bool, bool, bool, bool]) -> None:
     network.nnet.train(modes[0])
-    network.nnet.prediction.policy_head.train(modes[1])
-    network.nnet.prediction.value_head.train(modes[2])
+    network.nnet.representation.train(modes[1])
+    network.nnet.prediction.policy_head.train(modes[2])
+    network.nnet.prediction.value_head.train(modes[3])

@@ -21,6 +21,7 @@ class TrajectoryInput:
     root_policies: list[np.ndarray] | np.ndarray
     root_values: list[float] | np.ndarray
     valids: list[np.ndarray] | np.ndarray
+    policy_train_mask: list[bool] | np.ndarray | None
     truncated: bool
     truncation_bootstrap_value: float | None
     termination: chess.Termination | None
@@ -41,6 +42,7 @@ class TrajectoryArrays:
     root_policies: np.ndarray
     root_values: np.ndarray
     valids: np.ndarray
+    policy_train_mask: np.ndarray
     game_length: int
 
 
@@ -87,6 +89,7 @@ def _convert_arrays(values: TrajectoryInput, raw_actions: np.ndarray) -> Traject
     policies = np.ascontiguousarray(values.root_policies, dtype=np.float16)
     root_values = np.asarray(values.root_values, dtype=np.float32)
     valids = np.asarray(values.valids)
+    policy_train_mask = _convert_policy_train_mask(values.policy_train_mask, len(actions))
     return TrajectoryArrays(
         observations=observations,
         actions=actions,
@@ -94,8 +97,18 @@ def _convert_arrays(values: TrajectoryInput, raw_actions: np.ndarray) -> Traject
         root_policies=policies,
         root_values=root_values,
         valids=valids,
+        policy_train_mask=policy_train_mask,
         game_length=int(actions.shape[0]),
     )
+
+
+def _convert_policy_train_mask(values: list[bool] | np.ndarray | None, game_length: int) -> np.ndarray:
+    if values is None:
+        return np.ones(game_length, dtype=np.bool_)
+    mask = np.asarray(values)
+    if mask.dtype.kind != "b":
+        raise ValueError("Trajectory policy_train_mask must contain booleans")
+    return np.ascontiguousarray(mask, dtype=np.bool_)
 
 
 def _validate_lengths(arrays: TrajectoryArrays) -> None:
@@ -105,6 +118,7 @@ def _validate_lengths(arrays: TrajectoryArrays) -> None:
         "root_policies": len(arrays.root_policies),
         "root_values": len(arrays.root_values),
         "valids": len(arrays.valids),
+        "policy_train_mask": len(arrays.policy_train_mask),
     }
     mismatched = {name: length for name, length in lengths.items() if length != arrays.game_length}
     if mismatched:
@@ -125,6 +139,8 @@ def _validate_shapes(arrays: TrajectoryArrays) -> None:
         )
     if arrays.rewards.ndim != 1 or arrays.root_values.ndim != 1:
         raise ValueError("Trajectory rewards and root values must be one-dimensional")
+    if arrays.policy_train_mask.shape != (arrays.game_length,):
+        raise ValueError("Trajectory policy_train_mask must be one-dimensional")
 
 
 def _validate_finite_values(arrays: TrajectoryArrays) -> None:

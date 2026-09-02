@@ -2,6 +2,8 @@
 
 import math
 from collections.abc import Sequence
+from dataclasses import replace
+from unittest.mock import patch
 
 import chess
 import numpy as np
@@ -26,6 +28,14 @@ def _make_trajectory(length: int = 4) -> Trajectory:
         root_values=np.zeros(length, dtype=np.float32),
         valids=np.ones((length, ACTION_SIZE), dtype=np.float32),
     )
+
+
+def _parameter_gradients(network: LunaNetwork) -> dict[str, torch.Tensor]:
+    return {
+        name: parameter.grad.detach().clone()
+        for name, parameter in network.nnet.named_parameters()
+        if parameter.grad is not None
+    }
 
 
 def test_non_finite_gradient_fails_before_parameter_update(
@@ -182,6 +192,74 @@ def test_finite_gradient_norm_overflow_fails_before_optimizer_mutation(
         torch.testing.assert_close(current, original_item)
 
 
+def test_pcr_policy_mask_has_identical_gradients_and_update_with_accumulation(
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    config = replace(
+        small_learner_config,
+        batch_size=4,
+        grad_accum_steps=1,
+        unroll_steps=1,
+        td_steps=1,
+        lr=1e-3,
+        lr_min=1e-3,
+        lr_warmup_steps=0,
+        weight_decay=0.0,
+        grad_clip_norm=1e6,
+        mixed_precision=False,
+        dataloader_workers=0,
+        policy_loss_weight=1.0,
+        value_loss_weight=0.0,
+        reward_loss_weight=0.0,
+        consistency_loss_weight=0.0,
+        reconstruction_loss_weight=0.0,
+    )
+    full_batch = LunaNetwork(ChessGame(), config)
+    accumulated = LunaNetwork(ChessGame(), replace(config, grad_accum_steps=2))
+    accumulated.nnet.load_state_dict(full_batch.nnet.state_dict())
+    replay = PrioritizedReplayBuffer(capacity=1)
+    replay.save_trajectory(_make_trajectory(length=2))
+    sampled = full_batch._prepare_batch(replay, 4, 1, 1, 1.0, 1, None)
+    collated = {name: values.copy() for name, values in sampled.collated.items()}
+    collated["policy_mask"][:] = 0.0
+    collated["policy_mask"][:2, 0] = 1.0
+    collated["value_mask"][:] = 0.0
+    collated["unroll_mask"][:] = 0.0
+    collated["consistency_mask"][:] = 0.0
+    collated["target_policies"][:] = 0.0
+    for row, action in enumerate((0, 17, 65, 130)):
+        collated["target_policies"][row, :, action] = 1.0
+        collated["observations"][row, :, :, row] = float(row + 1)
+    prepared = sampled._replace(
+        collated=collated,
+        is_weights=np.asarray((1.0, 0.5, 0.25, 0.25), dtype=np.float32),
+    )
+
+    def train_once(network: LunaNetwork) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        gradients: dict[str, torch.Tensor] = {}
+        original_step = network.optimizer.step
+
+        def capture_step(*args: object, **kwargs: object) -> object:
+            gradients.update(_parameter_gradients(network))
+            return original_step(*args, **kwargs)
+
+        with (
+            patch.object(network, "_prepare_batch", return_value=prepared),
+            patch.object(network.optimizer, "step", side_effect=capture_step),
+        ):
+            network.train_ezv2(replay, steps=1, total_train_steps=1)
+        return gradients, network.nnet.state_dict()
+
+    full_gradients, full_state = train_once(full_batch)
+    accumulated_gradients, accumulated_state = train_once(accumulated)
+
+    assert full_gradients.keys() == accumulated_gradients.keys()
+    for name in full_gradients:
+        torch.testing.assert_close(accumulated_gradients[name], full_gradients[name], rtol=1e-5, atol=1e-7)
+    for name in full_state:
+        torch.testing.assert_close(accumulated_state[name], full_state[name], rtol=1e-5, atol=1e-7)
+
+
 def test_reanalysis_restores_training_mode_and_uses_direct_sve(
     monkeypatch: pytest.MonkeyPatch,
     small_learner_config: EzV2LearnerConfig,
@@ -218,7 +296,7 @@ def test_reanalysis_restores_training_mode_and_uses_direct_sve(
     monkeypatch.setattr("luna.network.BatchedMCTS", _FakeBatchedMCTS)
     nnet.nnet.train()
 
-    collated, _weights, _indices, _reanalysis = nnet._prepare_batch(
+    prepared = nnet._prepare_batch(
         replay,
         bs=1,
         unroll=0,
@@ -227,6 +305,7 @@ def test_reanalysis_restores_training_mode_and_uses_direct_sve(
         training_step=0,
         mcts_for_reanalyze=TrainingRunConfig(num_mcts_sims=2),
     )
+    collated = prepared.collated
 
     assert nnet.nnet.training
     assert collated["target_values"][0, 0] == pytest.approx(fresh_value)

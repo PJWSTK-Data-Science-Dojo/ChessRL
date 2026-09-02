@@ -11,10 +11,12 @@ import numpy as np
 from tqdm import tqdm
 
 from luna.coach_self_play import (
+    SelfPlaySearchPlan,
     enables_threefold_claim,
     evaluate_truncation_bootstrap,
     non_repetition_actions,
     select_self_play_action,
+    select_self_play_search_plan,
     self_play_exploration_enabled,
     trajectory_with_terminal_rewards,
 )
@@ -39,6 +41,7 @@ class _GameSlot:
     policies: list[np.ndarray] = field(default_factory=list)
     values: list[float] = field(default_factory=list)
     valid_moves: list[np.ndarray] = field(default_factory=list)
+    policy_train_mask: list[bool] = field(default_factory=list)
     guard_attempts: int = 0
     guard_interventions: int = 0
     guard_forced_fallbacks: int = 0
@@ -54,6 +57,7 @@ class _BatchDecision:
     canonical_boards: list[chess.Board]
     results: list[SearchResult]
     actions: list[int]
+    search_plan: SelfPlaySearchPlan
     search_contempt: list[SearchContemptStats]
 
 
@@ -114,14 +118,22 @@ def _search_active_roots(
     active_indices: list[int],
     environment_started_at: float | None,
 ) -> _BatchDecision:
+    search_plan = select_self_play_search_plan(coach.run)
     exploration = [
-        self_play_exploration_enabled(slots[index].board, slots[index].steps + 1, coach.run) for index in active_indices
+        search_plan.train_policy
+        and self_play_exploration_enabled(slots[index].board, slots[index].steps + 1, coach.run)
+        for index in active_indices
     ]
     canonical_boards = [
         coach.game.get_canonical_form(slots[index].board, slots[index].player) for index in active_indices
     ]
     _record_environment_time(coach, environment_started_at)
-    results = search.search_batch(canonical_boards, temp=1.0, add_exploration_noise=exploration)
+    results = search.search_batch(
+        canonical_boards,
+        num_sims=search_plan.simulations,
+        temp=1.0,
+        add_exploration_noise=exploration,
+    )
     proposals = list(search.last_actions)
     actions = [
         select_self_play_action(
@@ -132,7 +144,7 @@ def _search_active_roots(
         )
         for row, result in enumerate(results)
     ]
-    decision = _BatchDecision(canonical_boards, results, actions, list(search.last_search_contempt_stats))
+    decision = _BatchDecision(canonical_boards, results, actions, search_plan, list(search.last_search_contempt_stats))
     _retry_repetitions(coach, search, slots, active_indices, decision)
     return decision
 
@@ -151,8 +163,9 @@ def _retry_repetitions(
         return
     retry_results = search.search_batch(
         [decision.canonical_boards[row] for row in plan.rows],
+        num_sims=decision.search_plan.simulations,
         temp=1.0,
-        add_exploration_noise=[True] * len(plan.rows),
+        add_exploration_noise=[decision.search_plan.train_policy] * len(plan.rows),
         allowed_root_actions=plan.safe_actions,
     )
     _apply_retry_results(coach, search, decision, plan.rows, retry_results)
@@ -208,7 +221,7 @@ def _apply_retry_results(
         decision.actions[row] = select_self_play_action(
             coach.run,
             retry_policy,
-            explore=True,
+            explore=decision.search_plan.train_policy,
             gumbel_proposal=proposals[retry_index],
         )
         decision.search_contempt[row] = search.last_search_contempt_stats[retry_index]
@@ -230,6 +243,7 @@ def _advance_active_roots(
             slots[index],
             decision.actions[row],
             results_by_index[index],
+            decision.search_plan.train_policy,
             decision.search_contempt[row],
         )
         if trajectory is not None:
@@ -241,6 +255,7 @@ def _advance_slot(
     slot: _GameSlot,
     action: int,
     result: SearchResult,
+    train_policy: bool,
     search_contempt: SearchContemptStats,
 ) -> Trajectory | None:
     policy, root_value, observation, valid_moves = result
@@ -249,6 +264,7 @@ def _advance_slot(
     slot.policies.append(policy)
     slot.values.append(root_value)
     slot.valid_moves.append(valid_moves)
+    slot.policy_train_mask.append(train_policy)
     slot.player = coach.game.push_action(slot.board, slot.player, action)
     slot.actions.append(action)
     _record_search_contempt(slot, search_contempt)
@@ -294,6 +310,7 @@ def _slot_trajectory(
         slot.values,
         slot.valid_moves,
         terminal_value,
+        policy_train_mask=slot.policy_train_mask,
         truncated=truncated,
         truncation_bootstrap_value=truncation_bootstrap_value,
         termination=termination,

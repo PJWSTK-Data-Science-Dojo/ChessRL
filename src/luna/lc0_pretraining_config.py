@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 import random
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -16,7 +17,8 @@ from luna.config import (
     validate_wandb_run_id,
     validate_wandb_run_name,
 )
-from luna.lc0_dataset import LC0_ADAPTER_VERSION, Lc0DatasetConfig
+from luna.lc0_corpus import LC0_ADAPTER_VERSION, lc0_archive_paths
+from luna.lc0_dataset import Lc0DatasetConfig
 from luna.pgn_pretraining_checkpoints import pretraining_resume_exists
 
 LC0_CHECKPOINT_METADATA_KEY = "lc0_pretraining"
@@ -40,7 +42,7 @@ def _default_learner() -> EzV2LearnerConfig:
         batch_size=512,
         grad_accum_steps=2,
         amp_dtype="bfloat16",
-        compile_training=True,
+        compile_training=False,
         unroll_steps=1,
         td_steps=0,
         policy_loss_weight=1.0,
@@ -132,8 +134,7 @@ def _validate_wandb(config: Lc0PretrainingConfig) -> None:
 
 def _validate_paths(config: Lc0PretrainingConfig) -> None:
     dataset = config.dataset_path.expanduser()
-    if not dataset.is_file():
-        raise FileNotFoundError(f"LC0 dataset does not exist: {dataset.resolve()}")
+    lc0_archive_paths(dataset)
     if (config.source_checkpoint is None) == (config.resume_checkpoint is None):
         raise ValueError("Provide exactly one of source_checkpoint or resume_checkpoint")
     if config.resume_checkpoint is None:
@@ -186,6 +187,7 @@ def lc0_resume_contract(
         "dataset_source": config.dataset_source,
         "dataset_license": config.dataset_license,
         "planned_steps": config.total_steps,
+        "chunk_steps": config.chunk_steps,
         "validation_positions": config.validation_positions,
         "seed": config.seed,
         "wandb_run_id": config.wandb_run_id,
@@ -229,3 +231,20 @@ def seed_lc0_pretraining(seed: int) -> None:
 def lc0_resume_seed(seed: int, global_step: int) -> int:
     state = np.random.SeedSequence([seed, global_step]).generate_state(1)
     return int(state[0])
+
+
+def validate_lc0_online_source(checkpoint: Path, expected_fingerprint: str) -> None:
+    resolved = checkpoint.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"LC0 online source checkpoint does not exist: {resolved}")
+    try:
+        payload = torch.load(resolved, map_location="cpu", weights_only=True)
+    except (EOFError, IndexError, OSError, RuntimeError, ValueError, pickle.UnpicklingError) as exc:
+        raise ValueError(f"Cannot read LC0 online source checkpoint: {resolved}") from exc
+    metadata = payload.get(LC0_CHECKPOINT_METADATA_KEY) if isinstance(payload, dict) else None
+    if not isinstance(metadata, dict):
+        raise ValueError(f"LC0 online source checkpoint has no pretraining metadata: {resolved}")
+    if metadata.get("dataset_fingerprint") != expected_fingerprint:
+        raise ValueError(f"LC0 online source checkpoint corpus fingerprint does not match: {resolved}")
+    if metadata.get("train_scope") != "representation_and_heads":
+        raise ValueError(f"LC0 online source checkpoint was not jointly trained: {resolved}")

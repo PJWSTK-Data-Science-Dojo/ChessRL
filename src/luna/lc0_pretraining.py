@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,9 @@ import torch
 import wandb
 
 from luna.game.chess_game import ChessGame
-from luna.lc0_dataset import Lc0Batch, dataset_fingerprint, iter_lc0_batches
+from luna.lc0_batch_stream import iter_lc0_corpus_batches
+from luna.lc0_corpus import dataset_fingerprint
+from luna.lc0_dataset import Lc0Batch, iter_lc0_batches
 from luna.lc0_pretraining_config import (
     LC0_CHECKPOINT_METADATA_KEY,
     LC0_CHECKPOINT_PREFIX,
@@ -42,6 +45,7 @@ from luna.pgn_pretraining_checkpoints import (
 )
 
 _HEAD_PREFIXES = ("prediction.policy_head.", "prediction.value_head.")
+_BEST_CHECKPOINT_NAME = "best.pth.tar"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +80,8 @@ def run_lc0_pretraining(config: Lc0PretrainingConfig) -> Lc0PretrainingResult:
         )
         seed_lc0_pretraining(lc0_resume_seed(config.seed, network.global_step))
     config.output_dir.expanduser().resolve().mkdir(parents=True, exist_ok=True)
+    if resume is None:
+        _publish_checkpoints(network, context, None, None)
     metadata = lc0_dataset_metadata(config, fingerprint, frozen_digest)
     wandb_started = initialize_lc0_wandb(network, config, metadata)
     try:
@@ -163,9 +169,9 @@ def _train_chunks(network: LunaNetwork, context: _Context) -> Lc0PretrainingResu
     network._resolve_lr_schedule_total(config.total_steps, config.total_steps)
     batches = _training_batches(context, network.global_step)
     validation = _evaluate_validation(network, context)
+    best_validation = _load_best_validation(config.output_dir)
     log_lc0_validation(network.global_step, validation)
-    if network.global_step >= config.total_steps:
-        _publish_checkpoints(network, context)
+    best_validation = _publish_checkpoints(network, context, validation, best_validation)
     try:
         while network.global_step < config.total_steps:
             boundary = (network.global_step // config.chunk_steps + 1) * config.chunk_steps
@@ -175,15 +181,65 @@ def _train_chunks(network: LunaNetwork, context: _Context) -> Lc0PretrainingResu
             log_lc0_training(network.global_step, train_metrics)
             validation = _evaluate_validation(network, context)
             log_lc0_validation(network.global_step, validation)
-            _publish_checkpoints(network, context)
+            best_validation = _publish_checkpoints(network, context, validation, best_validation)
     except KeyboardInterrupt:
         _assert_frozen_parameters(network, context.frozen_digest, config.train_scope)
-        _publish_checkpoints(network, context)
+        _publish_checkpoints(network, context, None, best_validation)
         raise
     return Lc0PretrainingResult(network.global_step, validation, config.output_dir / "latest.pth.tar")
 
 
 def _training_batches(context: _Context, skip_batches: int) -> Iterator[Lc0Batch]:
+    if context.config.dataset_path.expanduser().resolve().is_dir():
+        yield from _corpus_training_batches(context, skip_batches)
+        return
+    yield from _archive_training_batches(context, skip_batches)
+
+
+def _corpus_training_batches(context: _Context, starting_step: int) -> Iterator[Lc0Batch]:
+    config = context.config
+    chunk_index, offset = divmod(starting_step, config.chunk_steps)
+    window_count = math.ceil(config.total_steps / config.chunk_steps)
+    while True:
+        epoch = config.dataset.epoch + chunk_index
+        dataset = replace(
+            config.dataset,
+            split="train",
+            epoch=epoch,
+            batch_size=config.learner.batch_size,
+            max_samples=config.chunk_steps * config.learner.batch_size,
+        )
+        batches = iter_lc0_corpus_batches(
+            config.dataset_path,
+            dataset,
+            context.game,
+            archive_offset=epoch,
+            member_window_index=epoch % window_count,
+            member_window_count=window_count,
+        )
+        yield from _window_batches(batches, config.chunk_steps, offset, config.learner.batch_size)
+        chunk_index += 1
+        offset = 0
+
+
+def _window_batches(
+    batches: Iterator[Lc0Batch],
+    steps: int,
+    offset: int,
+    batch_size: int,
+) -> Iterator[Lc0Batch]:
+    for index in range(steps):
+        try:
+            batch = next(batches)
+        except StopIteration:
+            raise ValueError("LC0 training corpus cannot fill a deterministic chunk") from None
+        if len(batch.observations) != batch_size:
+            raise ValueError("LC0 training corpus produced a partial deterministic batch")
+        if index >= offset:
+            yield batch
+
+
+def _archive_training_batches(context: _Context, skip_batches: int) -> Iterator[Lc0Batch]:
     epoch = context.config.dataset.epoch
     remaining_skip = skip_batches
     while True:
@@ -295,9 +351,18 @@ def _assert_frozen_parameters(network: LunaNetwork, expected: str, scope: Lc0Tra
         raise RuntimeError("LC0 root-only pretraining modified a frozen model parameter")
 
 
-def _publish_checkpoints(network: LunaNetwork, context: _Context) -> None:
+def _publish_checkpoints(
+    network: LunaNetwork,
+    context: _Context,
+    validation: Lc0ValidationMetrics | None,
+    best_validation: float | None,
+) -> float | None:
     config = context.config
     metadata = lc0_dataset_metadata(config, context.fingerprint, context.frozen_digest)
+    objective = _validation_objective(validation, config) if validation is not None else None
+    if validation is not None and objective is not None:
+        metadata["validation"] = asdict(validation)
+        metadata["validation_objective"] = objective
     publication = CheckpointPublication(config.output_dir, config.checkpoint_top_k, metadata)
     publish_pretraining_checkpoints(
         network,
@@ -305,3 +370,30 @@ def _publish_checkpoints(network: LunaNetwork, context: _Context) -> None:
         metadata_key=LC0_CHECKPOINT_METADATA_KEY,
         checkpoint_prefix=LC0_CHECKPOINT_PREFIX,
     )
+    if objective is None or (best_validation is not None and objective >= best_validation):
+        return best_validation
+    network.save_checkpoint(
+        str(config.output_dir.expanduser().resolve()),
+        _BEST_CHECKPOINT_NAME,
+        extra_state={LC0_CHECKPOINT_METADATA_KEY: metadata},
+    )
+    return objective
+
+
+def _validation_objective(validation: Lc0ValidationMetrics, config: Lc0PretrainingConfig) -> float:
+    learner = config.learner
+    policy = learner.policy_loss_weight * validation.policy_cross_entropy
+    value = learner.value_loss_weight * validation.value_cross_entropy
+    return policy + value
+
+
+def _load_best_validation(output_dir: Path) -> float | None:
+    checkpoint = output_dir.expanduser().resolve() / _BEST_CHECKPOINT_NAME
+    if not checkpoint.is_file():
+        return None
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    metadata = payload.get(LC0_CHECKPOINT_METADATA_KEY) if isinstance(payload, dict) else None
+    objective = metadata.get("validation_objective") if isinstance(metadata, dict) else None
+    if isinstance(objective, bool) or not isinstance(objective, int | float) or not math.isfinite(objective):
+        raise RuntimeError(f"LC0 best checkpoint has invalid validation metadata: {checkpoint}")
+    return float(objective)

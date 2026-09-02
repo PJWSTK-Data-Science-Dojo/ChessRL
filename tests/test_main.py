@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from typing import cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -275,3 +275,29 @@ def test_main_routes_new_phase_to_weights_only_initializer(tmp_path: Path) -> No
     assert coach_type.call_args.kwargs["wandb_resume"] == "never"
     assert coach_type.call_args.kwargs["restore_replay"] is False
     coach_type.return_value.learn.assert_called_once_with()
+
+
+def test_new_phase_does_not_publish_when_expert_anchor_is_unreadable(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "latest.pth.tar").write_bytes(b"checkpoint placeholder")
+    target = tmp_path / "new-phase"
+    setup = training_entry._TrainingSetup(
+        TrainCliConfig(new_training_phase=True, load_checkpoint_dir=str(source)),
+        TrainingRunConfig(checkpoint=str(target), stockfish_eval_every=0),
+        EzV2LearnerConfig(device="cpu"),
+        training_entry._CheckpointPlan(source / "latest.pth.tar", target, False),
+    )
+    anchor = Mock()
+    anchor.next_batch.side_effect = ValueError("unreadable anchor")
+
+    with (
+        patch.object(training_entry, "LunaNetwork") as network_type,
+        patch.object(training_entry, "build_expert_anchor_source", return_value=anchor),
+        patch.object(training_entry, "publish_bootstrap_checkpoint") as publish_bootstrap,
+        pytest.raises(ValueError, match="unreadable anchor"),
+    ):
+        network_type.__name__ = "LunaNetwork"
+        training_entry._initialize_network(setup, cast(training_entry.Game, object()))
+
+    publish_bootstrap.assert_not_called()

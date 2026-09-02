@@ -43,12 +43,14 @@ def test_single_selfplay_retries_a_move_that_enables_threefold_and_logs_guard_co
         def search_latent(
             self,
             _board: chess.Board,
+            num_sims: int | None,
             temp: float,
             *,
             add_exploration_noise: bool | None,
             allowed_root_actions: Sequence[int] | None = None,
         ) -> tuple[np.ndarray, float]:
             assert temp == 1.0
+            assert num_sims == 1
             assert add_exploration_noise is True
             restriction = None if allowed_root_actions is None else set(allowed_root_actions)
             restrictions.append(restriction)
@@ -128,12 +130,14 @@ def test_batched_selfplay_retries_only_with_non_repetition_root_actions(
         def search_batch(
             self,
             boards: list[chess.Board],
+            num_sims: int | None,
             temp: float,
             *,
             add_exploration_noise: bool | Sequence[bool] | None,
             allowed_root_actions: Sequence[Sequence[int] | None] | None = None,
         ) -> list[tuple[np.ndarray, float, np.ndarray, np.ndarray]]:
             assert temp == 1.0
+            assert num_sims == 1
             assert add_exploration_noise == [True]
             normalized: list[set[int] | None] = (
                 [None] * len(boards)

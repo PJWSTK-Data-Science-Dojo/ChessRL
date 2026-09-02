@@ -1,5 +1,6 @@
 """Training Makefile target contract tests."""
 
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -136,3 +137,95 @@ def test_maintained_train_target_uses_bootstrapped_state_anchored_contract() -> 
     assert "--learner.no-reanalyze-policy" not in result.stdout
     assert "--load-model" not in result.stdout
     assert "--new-training-phase" not in result.stdout
+
+
+def test_lc0_10m_pretrain_target_pins_objective_identity_and_resume_modes() -> None:
+    repository = Path(__file__).resolve().parents[1]
+
+    result = subprocess.run(
+        ["make", "-n", "pretrain-lc0-exact-10m", "ARGS=--learner.lr 9e-5"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    expected_flags = (
+        '--wandb-run-id "luna-lc0-exact-10m-recovery-v1"',
+        '--wandb-run-name "Luna LC0 Exact · 10M Joint Recovery v1"',
+        "--train-scope representation_and_heads",
+        "--dataset.value-source root",
+        "--total-steps 20000",
+        "--chunk-steps 1000",
+        "--validation-positions 50000",
+        "--learner.batch-size 512",
+        "--learner.no-compile-training",
+    )
+    for flag in expected_flags:
+        assert flag in result.stdout
+    assert "wandb_resume=never" in result.stdout
+    assert "wandb_resume=allow" in result.stdout
+    assert '--wandb-resume "$wandb_resume"' in result.stdout
+    assert result.stdout.rfind("--learner.lr 9e-5") > result.stdout.rfind("--learner.lr 1e-4")
+
+
+def test_lc0_pcr_anchor_target_expands_resume_and_fresh_contracts(tmp_path: Path) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    shard = corpus / "audit-shard.tar"
+    shard.write_bytes(b"contract-only shard")
+    shard_digest = hashlib.sha256(shard.read_bytes()).hexdigest()
+    checkpoint_dir = tmp_path / "online"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "latest.pth.tar").write_bytes(b"dry-run checkpoint")
+
+    result = subprocess.run(
+        [
+            "make",
+            "-n",
+            "train-lc0-exact-pcr-anchor",
+            f"LC0_10M_DATA_PATH={corpus}",
+            "LC0_10M_SHARD_COUNT=1",
+            f"LC0_10M_SHARDS={shard.name}:{shard_digest}",
+            f"LC0_PCR_CHECKPOINT_DIR={checkpoint_dir}",
+            "ARGS=--learner.lr 3e-5",
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    expected_flags = (
+        '--wandb-run-id "luna-lc0-exact-pcr128x16-p25-anchor25-v1"',
+        '--wandb-run-name "Luna LC0 Exact · PCR 128/16 p25 + Expert Anchor 25% v1"',
+        "--wandb-resume allow",
+        "--wandb-resume never",
+        "--load-model",
+        "--new-training-phase",
+        "--run.tree-state-mode exact",
+        "--run.playout-cap-full-sims 128",
+        "--run.playout-cap-fast-sims 16",
+        "--run.playout-cap-full-probability 0.25",
+        "--run.evaluation-num-mcts-sims 32",
+        "--run.stockfish-elo 1500",
+        "--run.ladder-eval-every 5",
+        "--run.ladder-start-elo 700",
+        "--run.replay-capacity 500000",
+        "--run.replay-warmup-positions 100000",
+        "--learner.batch-size 512",
+        "--learner.expert-anchor-fraction 0.25",
+        "--learner.expert-anchor-loss-weight 0.25",
+        "--learner.no-compile-inference",
+        "--learner.no-compile-training",
+        "--learner.no-reanalyze-policy",
+    )
+    for flag in expected_flags:
+        assert flag in result.stdout
+    assert str(corpus) in result.stdout
+    assert str(checkpoint_dir) in result.stdout
+    assert result.stdout.rfind("--wandb-resume allow") > result.stdout.rfind("--wandb-resume never")
+    assert result.stdout.rfind("--learner.no-compile-training") > result.stdout.rfind("--learner.compile-training")
+    assert result.stdout.rfind("--learner.no-reanalyze-policy") > result.stdout.rfind("--learner.reanalyze-policy")
+    assert result.stdout.rfind("--learner.lr 3e-5") > result.stdout.rfind("--learner.lr 2e-5")
