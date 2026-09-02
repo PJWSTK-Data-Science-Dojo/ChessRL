@@ -14,6 +14,8 @@ from luna.network import (
     LunaNetwork,
     PreparedBatch,
 )
+from luna.network_training_forward import _priority_errors
+from luna.network_training_types import Microbatch, RootState
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 
 
@@ -26,6 +28,47 @@ def _make_trajectory(length: int = 4) -> Trajectory:
         root_values=np.zeros(length, dtype=np.float32),
         valids=np.ones((length, ACTION_SIZE), dtype=np.float32),
     )
+
+
+def test_masked_value_priority_uses_policy_kl() -> None:
+    policy_target = torch.tensor(
+        [
+            [[0.75, 0.25, 0.0]],
+            [[0.50, 0.50, 0.0]],
+        ]
+    )
+    policy_entropy = -torch.xlogy(policy_target[:, 0], policy_target[:, 0]).sum(dim=1)
+    root = RootState(
+        latent=torch.empty(0),
+        value_prediction=torch.tensor([-0.5, 0.95]),
+        policy_loss=policy_entropy + torch.tensor([0.4, 0.25]),
+        value_loss=torch.empty(0),
+        reconstruction_loss=torch.empty(0),
+        reconstruction_logits=None,
+        reconstruction_target=None,
+        target_latents=None,
+    )
+    unused = torch.empty(0)
+    batch = Microbatch(
+        observations=unused,
+        valid_moves=unused,
+        target_values=torch.tensor([[-1.0], [0.0]]),
+        target_rewards=unused,
+        target_policies=policy_target,
+        unroll_observations=unused,
+        actions=unused,
+        importance_weights=unused,
+        unroll_mask=unused,
+        consistency_mask=unused,
+        policy_mask=torch.ones(2, 1),
+        value_mask=torch.tensor([[1.0], [0.0]]),
+        unroll_valid_moves=unused,
+        tree_indices=[],
+    )
+
+    errors = _priority_errors(root, batch)
+
+    np.testing.assert_allclose(errors, [0.5, 0.25], atol=1e-6)
 
 
 def test_reported_total_loss_is_invariant_to_identical_gradient_accumulation() -> None:

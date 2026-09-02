@@ -1,5 +1,3 @@
-"""Top-level self-play and learner iteration orchestration."""
-
 from __future__ import annotations
 
 import math
@@ -15,6 +13,7 @@ from luna.config import TrainingRunConfig
 from luna.game.stockfish_eval import validate_ladder_configuration, validate_stockfish_configuration
 from luna.profiling import IterProfileStats, write_iter_summaries_json
 from luna.replay_buffer import Trajectory
+from luna.replay_persistence import load_replay_snapshot, save_replay_snapshot
 from luna.self_play_actors import SelfPlayActorPool
 
 if TYPE_CHECKING:
@@ -45,7 +44,6 @@ def optimizer_steps_for_positions(
 
 
 def learn(coach: Coach) -> None:
-    """Run self-play, replay learning, checkpointing, and evaluation."""
     schedule = _prepare_training(coach)
     if schedule.start_iteration > coach.run.num_iters:
         _log_completed_training(coach, schedule.current_iteration)
@@ -58,6 +56,7 @@ def learn(coach: Coach) -> None:
 def _prepare_training(coach: Coach) -> _EvaluationSchedule:
     coach._assert_checkpoint_target()
     coach._assert_checkpoint_lineage()
+    _restore_replay(coach)
     current_iteration = coach.nnet._trainer_iteration
     start_iteration = current_iteration + 1
     schedule = _evaluation_schedule(coach.run, current_iteration)
@@ -67,6 +66,31 @@ def _prepare_training(coach: Coach) -> _EvaluationSchedule:
         coach.nnet.warmup_mcts_inference(coach.game)
     coach._reconcile_current_evaluations(current_iteration)
     return schedule
+
+
+def _restore_replay(coach: Coach) -> None:
+    if not coach._restore_replay_on_start:
+        return
+    source_checkpoint = coach.nnet._loaded_checkpoint_path
+    if source_checkpoint is None:
+        raise RuntimeError("Replay resume requires the loaded checkpoint path")
+    expected_iteration = coach.nnet._trainer_iteration
+    try:
+        restored_iteration = load_replay_snapshot(coach.replay, source_checkpoint.parent, expected_iteration)
+    except FileNotFoundError:
+        logger.warning(
+            "No replay snapshot for checkpoint iteration {}; replay warm-up starts empty.", expected_iteration
+        )
+    else:
+        log = logger.warning if restored_iteration < expected_iteration else logger.info
+        log(
+            "Restored {} replay positions from iteration {} for checkpoint iteration {} (lag={})",
+            coach.replay.size,
+            restored_iteration,
+            expected_iteration,
+            expected_iteration - restored_iteration,
+        )
+    coach._restore_replay_on_start = False
 
 
 def _evaluation_schedule(run: TrainingRunConfig, current_iteration: int) -> _EvaluationSchedule:
@@ -233,8 +257,12 @@ def _finish_warmup_iteration(
     iteration_started_at: float,
     profile_rows: list[IterProfileStats],
 ) -> None:
+    started_at = time.perf_counter()
+    _publish_iteration_state(coach, iteration)
+    stats.checkpoint_publish_s = time.perf_counter() - started_at
     stats.total_s = time.perf_counter() - iteration_started_at
     coach._log_iteration_metrics(iteration, trajectories, stats)
+    coach._reconcile_current_evaluations(iteration)
     _append_profile_row(coach, stats, profile_rows)
 
 
@@ -327,12 +355,20 @@ def _finish_trained_iteration(
     profile_rows: list[IterProfileStats],
 ) -> None:
     started_at = time.perf_counter()
-    coach._publish_checkpoint(iteration)
+    _publish_iteration_state(coach, iteration)
     stats.checkpoint_publish_s = time.perf_counter() - started_at
     stats.total_s = time.perf_counter() - iteration_started_at
     coach._log_iteration_metrics(iteration, trajectories, stats, optimizer_steps=optimizer_steps)
     coach._reconcile_current_evaluations(iteration)
     _append_profile_row(coach, stats, profile_rows)
+
+
+def _publish_iteration_state(coach: Coach, iteration: int) -> None:
+    coach._publish_checkpoint(iteration)
+    if not coach._checkpoint_dir_usable():
+        return
+    path = save_replay_snapshot(coach.replay, coach.run.checkpoint, iteration)
+    logger.info("Published replay snapshot {} with {} positions", path, coach.replay.size)
 
 
 def _append_profile_row(
@@ -357,8 +393,4 @@ def configure_replay_beta_annealing(coach: Coach, iteration: int, optimizer_step
     remaining_iterations = coach.run.num_iters - iteration + 1
     remaining_sample_calls = remaining_iterations * optimizer_steps
     coach.replay.configure_beta_annealing(remaining_sample_calls)
-    logger.info(
-        "PER beta annealing updated at iteration {} over {} estimated optimizer sample calls",
-        iteration,
-        remaining_sample_calls,
-    )
+    logger.info("PER beta annealing: iteration {}, {} sample calls", iteration, remaining_sample_calls)

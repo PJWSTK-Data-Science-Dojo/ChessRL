@@ -123,6 +123,7 @@ class _TargetLists:
     actions: list[int] = field(default_factory=list)
     unroll_mask: list[float] = field(default_factory=list)
     consistency_mask: list[float] = field(default_factory=list)
+    policy_mask: list[float] = field(default_factory=list)
     value_mask: list[float] = field(default_factory=list)
 
 
@@ -135,6 +136,7 @@ class _TargetRequest:
     discount: float
     root_value_override: dict[int, float] | None
     policy_override: dict[int, np.ndarray] | None
+    train_value_on_truncated: bool
 
 
 def build_unroll_targets(
@@ -146,6 +148,7 @@ def build_unroll_targets(
     *,
     root_value_override: dict[int, float] | None = None,
     policy_override: dict[int, np.ndarray] | None = None,
+    train_value_on_truncated: bool = True,
 ) -> dict[str, Any]:
     """Build aligned policy, value, reward, legality, and consistency targets."""
     if isinstance(unroll_steps, bool) or not isinstance(unroll_steps, int) or unroll_steps < 0:
@@ -159,6 +162,7 @@ def build_unroll_targets(
         discount,
         root_value_override,
         policy_override,
+        train_value_on_truncated,
     )
     targets = _TargetLists()
     for step in range(unroll_steps + 1):
@@ -176,7 +180,7 @@ def _append_target_step(targets: _TargetLists, request: _TargetRequest, step: in
 
 
 def _append_value_target(targets: _TargetLists, request: _TargetRequest, position: int, active: bool) -> None:
-    if not active:
+    if not active or (request.trajectory.truncated and not request.train_value_on_truncated):
         targets.values.append(0.0)
         targets.value_mask.append(0.0)
         return
@@ -206,6 +210,7 @@ def _append_transition_target(
 
 def _append_state_target(targets: _TargetLists, request: _TargetRequest, position: int, active: bool) -> None:
     trajectory = request.trajectory
+    targets.policy_mask.append(float(active))
     if active:
         override = request.policy_override
         policy = (
@@ -236,6 +241,7 @@ def _target_mapping(targets: _TargetLists, request: _TargetRequest) -> dict[str,
         "actions": targets.actions,
         "unroll_mask": targets.unroll_mask,
         "consistency_mask": targets.consistency_mask,
+        "policy_mask": targets.policy_mask,
         "value_mask": targets.value_mask,
     }
 
@@ -274,5 +280,6 @@ def _collate_unroll_arrays(batch_targets: list[dict[str, Any]]) -> dict[str, np.
         "actions": np.array([target["actions"] for target in batch_targets], dtype=np.int64),
         "unroll_mask": np.array([target["unroll_mask"] for target in batch_targets], dtype=np.float32),
         "consistency_mask": np.array([target["consistency_mask"] for target in batch_targets], dtype=np.float32),
+        "policy_mask": np.array([target["policy_mask"] for target in batch_targets], dtype=np.float32),
         "value_mask": np.array([target["value_mask"] for target in batch_targets], dtype=np.float32),
     }

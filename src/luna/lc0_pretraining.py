@@ -15,6 +15,7 @@ from luna.lc0_pretraining_config import (
     LC0_CHECKPOINT_METADATA_KEY,
     LC0_CHECKPOINT_PREFIX,
     Lc0PretrainingConfig,
+    Lc0TrainScope,
     lc0_dataset_metadata,
     lc0_resume_contract,
     lc0_resume_seed,
@@ -40,7 +41,7 @@ from luna.pgn_pretraining_checkpoints import (
     validate_resume_contract,
 )
 
-_TRAINABLE_PREFIXES = ("prediction.policy_head.", "prediction.value_head.")
+_HEAD_PREFIXES = ("prediction.policy_head.", "prediction.value_head.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +66,7 @@ def run_lc0_pretraining(config: Lc0PretrainingConfig) -> Lc0PretrainingResult:
     fingerprint = dataset_fingerprint(config.dataset_path.expanduser().resolve())
     network = LunaNetwork(game, config.learner)
     resume = _restore_network(network, config, fingerprint)
-    frozen_digest = _freeze_for_root_supervision(network)
+    frozen_digest = _freeze_for_root_supervision(network, config.train_scope)
     context = _Context(config, game, fingerprint, frozen_digest)
     if resume is not None:
         validate_resume_contract(
@@ -112,32 +113,44 @@ def _restore_network(
     return None
 
 
-def _freeze_for_root_supervision(network: LunaNetwork) -> str:
+def _freeze_for_root_supervision(network: LunaNetwork, scope: Lc0TrainScope = "prediction_heads") -> str:
+    trainable_prefixes = _trainable_prefixes(scope)
     trainable_names: list[str] = []
     for name, parameter in network.nnet.named_parameters():
-        trainable = name.startswith(_TRAINABLE_PREFIXES)
+        trainable = name.startswith(trainable_prefixes)
         parameter.requires_grad_(trainable)
         if trainable:
             trainable_names.append(name)
     if not trainable_names or not all(
-        any(name.startswith(prefix) for name in trainable_names) for prefix in _TRAINABLE_PREFIXES
+        any(name.startswith(prefix) for name in trainable_names) for prefix in _HEAD_PREFIXES
     ):
         raise RuntimeError("Configured model does not expose both LC0 policy and value heads")
     network.optimizer.zero_grad(set_to_none=True)
-    _set_training_mode(network)
-    return _frozen_parameter_digest(network)
+    _set_training_mode(network, scope)
+    return _frozen_parameter_digest(network, trainable_prefixes)
 
 
-def _set_training_mode(network: LunaNetwork) -> None:
+def _trainable_prefixes(scope: Lc0TrainScope) -> tuple[str, ...]:
+    if scope == "representation_and_heads":
+        return ("representation.", *_HEAD_PREFIXES)
+    return _HEAD_PREFIXES
+
+
+def _set_training_mode(network: LunaNetwork, scope: Lc0TrainScope) -> None:
     network.nnet.eval()
+    if scope == "representation_and_heads":
+        network.nnet.representation.train()
     network.nnet.prediction.policy_head.train()
     network.nnet.prediction.value_head.train()
 
 
-def _frozen_parameter_digest(network: LunaNetwork) -> str:
+def _frozen_parameter_digest(
+    network: LunaNetwork,
+    trainable_prefixes: tuple[str, ...] = _HEAD_PREFIXES,
+) -> str:
     digest = hashlib.sha256()
     for name, parameter in network.nnet.named_parameters():
-        if name.startswith(_TRAINABLE_PREFIXES):
+        if name.startswith(trainable_prefixes):
             continue
         digest.update(name.encode("utf-8"))
         raw = parameter.detach().cpu().contiguous().view(torch.uint8).numpy()
@@ -158,13 +171,13 @@ def _train_chunks(network: LunaNetwork, context: _Context) -> Lc0PretrainingResu
             boundary = (network.global_step // config.chunk_steps + 1) * config.chunk_steps
             steps = min(boundary, config.total_steps) - network.global_step
             train_metrics = _train_steps(network, batches, steps, config.total_steps)
-            _assert_frozen_parameters(network, context.frozen_digest)
+            _assert_frozen_parameters(network, context.frozen_digest, config.train_scope)
             log_lc0_training(network.global_step, train_metrics)
             validation = _evaluate_validation(network, context)
             log_lc0_validation(network.global_step, validation)
             _publish_checkpoints(network, context)
     except KeyboardInterrupt:
-        _assert_frozen_parameters(network, context.frozen_digest)
+        _assert_frozen_parameters(network, context.frozen_digest, config.train_scope)
         _publish_checkpoints(network, context)
         raise
     return Lc0PretrainingResult(network.global_step, validation, config.output_dir / "latest.pth.tar")
@@ -277,8 +290,8 @@ def _evaluate_validation(network: LunaNetwork, context: _Context) -> Lc0Validati
     return evaluate_lc0_validation(network, plan)
 
 
-def _assert_frozen_parameters(network: LunaNetwork, expected: str) -> None:
-    if _frozen_parameter_digest(network) != expected:
+def _assert_frozen_parameters(network: LunaNetwork, expected: str, scope: Lc0TrainScope) -> None:
+    if _frozen_parameter_digest(network, _trainable_prefixes(scope)) != expected:
         raise RuntimeError("LC0 root-only pretraining modified a frozen model parameter")
 
 

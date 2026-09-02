@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import chess
 import numpy as np
@@ -33,15 +33,23 @@ class ExpansionTransitions:
     inference_indices: list[int]
 
 
+@dataclass(frozen=True, slots=True)
+class ExactExpansionBatch:
+    policies: np.ndarray
+    values: np.ndarray
+    latents: torch.Tensor
+
+
 def prepare_expansion_transitions(
     game: ChessGame,
     batch: PendingExpansionBatch,
+    tree_state_mode: Literal["latent", "exact"],
 ) -> ExpansionTransitions:
     child_boards: list[chess.Board | None] = []
     valid_masks: list[np.ndarray | None] = []
     terminal_values: list[float | None] = []
     for parent_board, action in zip(batch.parent_boards, batch.actions, strict=True):
-        transition = _prepare_transition(game, parent_board, action)
+        transition = _prepare_transition(game, parent_board, action, tree_state_mode)
         child_board, valid_mask, terminal_value = transition
         child_boards.append(child_board)
         valid_masks.append(valid_mask)
@@ -54,12 +62,16 @@ def _prepare_transition(
     game: ChessGame,
     parent_board: chess.Board | None,
     action: int,
+    tree_state_mode: Literal["latent", "exact"],
 ) -> tuple[chess.Board | None, np.ndarray | None, float | None]:
     if parent_board is None:
         return None, None, None
     try:
         parent_player = player_from_turn(parent_board.turn)
-        child_board, child_player = game.get_next_search_state(parent_board, parent_player, action)
+        transition = (
+            game.get_next_exact_search_state if tree_state_mode == "exact" else game.get_next_latent_search_state
+        )
+        child_board, child_player = transition(parent_board, parent_player, action)
         terminal_value = game.get_game_outcome(child_board, child_player)
         valid_mask = game.get_valid_moves(child_board, child_player) if terminal_value is None else None
         return child_board, valid_mask, terminal_value
@@ -85,6 +97,37 @@ def infer_recurrent_expansions(
     )
 
 
+def infer_exact_expansions(
+    network: LunaNetwork,
+    game: ChessGame,
+    transitions: ExpansionTransitions,
+) -> ExactExpansionBatch | None:
+    indices = transitions.inference_indices
+    if not indices:
+        return None
+    boards = [_canonical_child(game, transitions.child_boards[index]) for index in indices]
+    observations = np.stack([game.to_array(board) for board in boards])
+    valid_masks = np.stack([_required_mask(transitions.valid_masks[index]) for index in indices])
+    policies, values, latents = network.batched_initial_inference(observations, valid_masks)
+    return ExactExpansionBatch(
+        np.asarray(policies, dtype=np.float32),
+        np.asarray(values, dtype=np.float32).reshape(len(indices)),
+        latents,
+    )
+
+
+def _canonical_child(game: ChessGame, board: chess.Board | None) -> chess.Board:
+    if board is None:
+        raise RuntimeError("Exact-state expansion requires a child board")
+    return game.get_canonical_form(board, player_from_turn(board.turn))
+
+
+def _required_mask(mask: np.ndarray | None) -> np.ndarray:
+    if mask is None:
+        raise RuntimeError("Exact-state expansion requires a legal-action mask")
+    return mask
+
+
 def backup_expansions(
     batch: PendingExpansionBatch,
     transitions: ExpansionTransitions,
@@ -101,6 +144,41 @@ def backup_expansions(
         _backup_dense_expansions(batch, transitions, recurrent, q_values, discount)
     else:
         _backup_sparse_expansions(batch, transitions, recurrent, q_values, discount)
+
+
+def backup_exact_expansions(
+    batch: PendingExpansionBatch,
+    transitions: ExpansionTransitions,
+    exact: ExactExpansionBatch | None,
+    discount: float,
+) -> None:
+    _backup_terminal_expansions(batch, transitions, discount)
+    if exact is None:
+        return
+    q_values = -discount * exact.values
+    for output_index, pending_index in enumerate(transitions.inference_indices):
+        child = _initialize_exact_child(batch, transitions, exact, output_index, pending_index)
+        valid_mask = _required_mask(transitions.valid_masks[pending_index])
+        for action in np.flatnonzero(valid_mask):
+            child.children[int(action)] = _LatentNode(prior=float(exact.policies[output_index, action]))
+        pending = batch.pending[pending_index]
+        _backup_latent_path(pending.ancestors, child, float(q_values[output_index]), discount)
+
+
+def _initialize_exact_child(
+    batch: PendingExpansionBatch,
+    transitions: ExpansionTransitions,
+    exact: ExactExpansionBatch,
+    output_index: int,
+    pending_index: int,
+) -> _LatentNode:
+    child = batch.pending[pending_index].child
+    child.latent = exact.latents[output_index : output_index + 1]
+    child.raw_value = float(exact.values[output_index])
+    child.reward = 0.0
+    child.expanded = True
+    child.board = transitions.child_boards[pending_index]
+    return child
 
 
 def _backup_terminal_expansions(

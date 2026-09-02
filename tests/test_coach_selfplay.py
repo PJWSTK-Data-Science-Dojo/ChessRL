@@ -226,7 +226,9 @@ def test_gumbel_selfplay_reenables_exploration_for_a_repeated_root() -> None:
     assert board.is_repetition(2)
 
     gumbel = TrainingRunConfig(search_mode="gumbel", temp_threshold=1)
+    exact_gumbel = TrainingRunConfig(search_mode="gumbel", tree_state_mode="exact", temp_threshold=1)
     puct = TrainingRunConfig(search_mode="puct", temp_threshold=1)
 
     assert _self_play_exploration_enabled(board, 5, gumbel) is True
+    assert _self_play_exploration_enabled(board, 5, exact_gumbel) is False
     assert _self_play_exploration_enabled(board, 5, puct) is False

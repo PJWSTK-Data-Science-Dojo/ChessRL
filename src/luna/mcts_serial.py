@@ -11,6 +11,7 @@ import numpy as np
 
 from luna.config import MCTSParams
 from luna.game.chess_game import ChessGame, player_from_turn
+from luna.mcts_exact import ExactStateExpander
 from luna.mcts_gumbel import (
     _gumbel_improved_policy,
     _GumbelRootState,
@@ -62,7 +63,8 @@ class _PolicySelection:
 
 
 @dataclass(frozen=True, slots=True)
-class _ChildTransition:
+class _LatentChildTransition:
+    board: chess.Board | None
     valid_mask: np.ndarray | None
     terminal_value: float | None
 
@@ -77,6 +79,7 @@ class MCTS:
         self.game = game
         self.nnet = nnet
         self.params = params
+        self._exact_expander = ExactStateExpander(game, nnet, float(params.discount))
         self.last_action: int | None = None
         self.last_simulations = 0
         self.last_search_contempt_stats = SearchContemptStats()
@@ -148,7 +151,12 @@ class MCTS:
         allowed_root_actions: Collection[int] | None,
         options: _SearchOptions,
     ) -> _PreparedRoot | _CompletedSearch:
-        root_board = canonical_board.copy(stack=canonical_board.halfmove_clock)
+        copy_root = (
+            self.game.copy_exact_search_root
+            if self.params.tree_state_mode == "exact"
+            else self.game.copy_latent_search_root
+        )
+        root_board = copy_root(canonical_board)
         terminal_value = self.game.get_game_outcome(root_board, 1)
         if terminal_value is not None:
             return _CompletedSearch([0.0] * self.game.get_action_size(), float(terminal_value))
@@ -278,34 +286,36 @@ class MCTS:
         action: int,
         discount: float,
     ) -> float:
-        transition = self._prepare_child_transition(node, child, action)
+        if self.params.tree_state_mode == "exact":
+            return self._exact_expander.expand(node, child, action)
+        transition = self._prepare_latent_child_transition(node, action)
         child.expanded = True
+        child.board = transition.board
         if transition.terminal_value is not None:
+            child.raw_value = float(transition.terminal_value)
             child.reward = -float(transition.terminal_value)
             child.terminal = True
             return _record_edge_value(node, child, child.reward)
-        q_value = self._infer_child(node, child, action, transition.valid_mask, discount)
+        q_value = self._infer_latent_child(node, child, action, transition.valid_mask, discount)
         return _record_edge_value(node, child, q_value)
 
-    def _prepare_child_transition(
+    def _prepare_latent_child_transition(
         self,
         node: _LatentNode,
-        child: _LatentNode,
         action: int,
-    ) -> _ChildTransition:
+    ) -> _LatentChildTransition:
         if node.board is None:
-            return _ChildTransition(None, None)
+            return _LatentChildTransition(None, None, None)
         try:
             parent_player = player_from_turn(node.board.turn)
-            child_board, child_player = self.game.get_next_search_state(node.board, parent_player, action)
+            child_board, child_player = self.game.get_next_latent_search_state(node.board, parent_player, action)
             terminal_value = self.game.get_game_outcome(child_board, child_player)
-            child.board = child_board
             valid_mask = self.game.get_valid_moves(child_board, child_player) if terminal_value is None else None
-            return _ChildTransition(valid_mask, terminal_value)
+            return _LatentChildTransition(child_board, valid_mask, terminal_value)
         except ValueError as exc:
             raise RuntimeError(f"MCTS selected invalid action {action} at {node.board.fen()}") from exc
 
-    def _infer_child(
+    def _infer_latent_child(
         self,
         node: _LatentNode,
         child: _LatentNode,

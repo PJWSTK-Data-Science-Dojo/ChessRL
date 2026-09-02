@@ -44,6 +44,14 @@ LC0_SELECTED_CHECKPOINT ?=
 LC0_RL_CHECKPOINT_DIR ?= ./runs/luna-balanced-ezv2-lc0-warmstart-v1
 LC0_RL_WANDB_RUN_ID ?= luna-balanced-ezv2-lc0-warmstart-v1
 LC0_RL_WANDB_RUN_NAME ?= Luna Balanced EZ-V2 · LC0 Warm Start v1
+LC0_EXACT_SOURCE_CHECKPOINT ?= ./runs/luna-balanced-lc0-heads-pretrain-v1/lc0_step_00001000.pth.tar
+LC0_EXACT_SOURCE_SHA256 ?= ad9b13f6544137ab806749a7b787d9d6c2a4a413cc48f71067d5567ca31bf116
+LC0_EXACT_PRETRAIN_DIR ?= ./runs/luna-lc0-exact-joint-root-v1
+LC0_EXACT_PRETRAIN_WANDB_ID ?= luna-lc0-exact-joint-root-v1
+LC0_EXACT_PRETRAIN_WANDB_NAME ?= Luna LC0 Exact · Joint Root-WDL v1
+LC0_EXACT_CHECKPOINT_DIR ?= ./runs/luna-lc0-exact-gumbel32-v1
+LC0_EXACT_WANDB_RUN_ID ?= luna-lc0-exact-gumbel32-v1
+LC0_EXACT_WANDB_RUN_NAME ?= Luna LC0 Exact · Gumbel-32 Self-Play v1
 SEARCH_CONTEMPT_CANARY_SOURCE_DIR ?= ./runs/sources
 SEARCH_CONTEMPT_CANARY_SOURCE_FILE ?= luna-lc0-warmstart-iter30.pth.tar
 SEARCH_CONTEMPT_CANARY_SOURCE_SHA256 ?= edb1aee2b5c560eb7b38ba3209c52baa9bc4d982cefa1ce7eed0f8f9448cba4a
@@ -82,6 +90,40 @@ SEARCH_CONTEMPT_CANARY_ARGS = \
 	--run.stockfish-eval-every 10 \
 	--run.ladder-start-elo 600 \
 	--run.ladder-eval-every 5
+
+LC0_EXACT_ARGS = \
+	--run.tree-state-mode exact \
+	--run.gumbel-max-considered-actions 8 \
+	--run.num-mcts-sims 32 \
+	--run.evaluation-num-mcts-sims 32 \
+	--run.self-play-workers 1 \
+	--run.parallel-games 128 \
+	--run.temp-threshold 40 \
+	--run.no-self-play-repetition-guard \
+	--run.max-ply 384 \
+	--run.target-replay-ratio 2.0 \
+	--run.replay-capacity 500000 \
+	--run.replay-warmup-positions 20000 \
+	--run.ladder-start-elo 700 \
+	--run.ladder-eval-every 5 \
+	--run.checkpoint-top-k 12 \
+	--learner.batch-size 512 \
+	--learner.lr 5e-5 \
+	--learner.lr-min 5e-6 \
+	--learner.lr-warmup-steps 500 \
+	--learner.unroll-steps 0 \
+	--learner.td-steps 512 \
+	--learner.policy-loss-weight 1.0 \
+	--learner.value-loss-weight 1.0 \
+	--learner.reward-loss-weight 0.0 \
+	--learner.consistency-loss-weight 0.0 \
+	--learner.reconstruction-loss-weight 0.1 \
+	--learner.no-train-value-on-truncated \
+	--learner.grad-clip-norm 10 \
+	--learner.no-compile-inference \
+	--learner.reanalyze-mcts-sims 0 \
+	--learner.reanalyze-prob 0.0 \
+	--learner.no-reanalyze-policy
 
 PHASE_TRAIN_ARGS = \
 	--run.search-mode gumbel \
@@ -421,6 +463,29 @@ train-lc0-warmstart: _train-env-preflight _fairy-stockfish-preflight
 			TRAIN_ARGS="--new-training-phase --load-checkpoint-dir \"$$source_dir\" --load-checkpoint-file \"$$source_file\" --wandb-project \"$(WANDB_PROJECT)\" --wandb-run-id \"$(LC0_RL_WANDB_RUN_ID)\" --wandb-run-name \"$(LC0_RL_WANDB_RUN_NAME)\" --wandb-resume allow"; \
 	fi
 
+# Exact-state search learns the LC0 objective: every tree leaf is a legal board
+# encoded by the representation network, so recurrent dynamics stays frozen.
+pretrain-lc0-exact:
+	@printf '%s  %s\n' "$(LC0_EXACT_SOURCE_SHA256)" "$(LC0_EXACT_SOURCE_CHECKPOINT)" \
+		| sha256sum --check --status || { echo "LC0 exact source SHA-256 mismatch" >&2; exit 2; }
+	$(MAKE) pretrain-lc0 \
+		LC0_SOURCE_CHECKPOINT="$(LC0_EXACT_SOURCE_CHECKPOINT)" \
+		LC0_SOURCE_SHA256="$(LC0_EXACT_SOURCE_SHA256)" \
+		LC0_PRETRAIN_CHECKPOINT_DIR="$(LC0_EXACT_PRETRAIN_DIR)" \
+		LC0_PRETRAIN_WANDB_RUN_ID="$(LC0_EXACT_PRETRAIN_WANDB_ID)" \
+		LC0_PRETRAIN_WANDB_RUN_NAME="$(LC0_EXACT_PRETRAIN_WANDB_NAME)" \
+		ARGS='--train-scope representation_and_heads --dataset.value-source root --total-steps 2000 --chunk-steps 250'
+
+train-lc0-exact:
+	@test -f "$(LC0_EXACT_PRETRAIN_DIR)/latest.pth.tar" || { \
+		echo "Joint LC0 checkpoint not found; run make pretrain-lc0-exact" >&2; exit 2; }
+	$(MAKE) train-lc0-warmstart \
+		LC0_SELECTED_CHECKPOINT="$(LC0_EXACT_PRETRAIN_DIR)/latest.pth.tar" \
+		LC0_RL_CHECKPOINT_DIR="$(LC0_EXACT_CHECKPOINT_DIR)" \
+		LC0_RL_WANDB_RUN_ID="$(LC0_EXACT_WANDB_RUN_ID)" \
+		LC0_RL_WANDB_RUN_NAME="$(LC0_EXACT_WANDB_RUN_NAME)" \
+		ARGS='$(LC0_EXACT_ARGS)'
+
 # Migrate the complete LC0 warm-start state on first use, then continue only
 # the canary's optimizer, evaluation sidecars, checkpoints, and W&B lineage.
 train-search-contempt-canary: _train-env-preflight _fairy-stockfish-preflight
@@ -634,6 +699,6 @@ test-pipeline-mps:
 	lichess-config lint \
 	migrate-ladder-phase pretrain-lc0 pretrain-pgn profile-smoke release-web-model resume resume-migrated-phase resume-phase \
 	serve serve-cpu serve-mps test test-pipeline-cpu test-pipeline-mps train train-lc0-warmstart train-phase train-pgn-warmstart \
-	train-search-contempt-canary \
+	train-lc0-exact train-search-contempt-canary pretrain-lc0-exact \
 	types uci verify-lc0-data verify-pgn-data verify-web-model web-build web-config web-down web-logs web-public-config \
 	web-public-down web-public-logs web-public-up web-up

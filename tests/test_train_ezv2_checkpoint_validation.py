@@ -1,5 +1,6 @@
 """Regression tests for EfficientZeroV2 training loop."""
 
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -224,6 +225,24 @@ def test_checkpoint_loader_rejects_mismatched_resume_semantics(
 
     with pytest.raises(ValueError, match=r"differs in fields.*unroll_steps"):
         network.load_checkpoint(str(tmp_path), mismatch_path.name, load_optimizer=False)
+
+
+def test_new_phase_accepts_checkpoint_from_before_truncation_value_mask(
+    tmp_path: Path,
+    chess_game: ChessGame,
+    small_learner_config: EzV2LearnerConfig,
+) -> None:
+    source = LunaNetwork(chess_game, small_learner_config)
+    source.save_checkpoint(str(tmp_path), "legacy-source.pth.tar")
+    checkpoint = torch.load(tmp_path / "legacy-source.pth.tar", map_location="cpu", weights_only=True)
+    del checkpoint["learner_config"]["train_value_on_truncated"]
+    torch.save(checkpoint, tmp_path / "legacy-source.pth.tar")
+    target_config = replace(small_learner_config, train_value_on_truncated=False)
+    target = LunaNetwork(chess_game, target_config)
+
+    target.initialize_training_phase(str(tmp_path), "legacy-source.pth.tar")
+
+    assert target._learner.train_value_on_truncated is False
 
 
 def test_checkpoint_loader_rejects_corrupt_learner_metadata(

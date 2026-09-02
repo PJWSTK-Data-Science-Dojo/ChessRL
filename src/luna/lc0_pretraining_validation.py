@@ -100,7 +100,8 @@ def initialize_lc0_wandb(
         name=config.wandb_run_name,
         resume=config.wandb_resume,
         config={
-            "pretraining_kind": "lc0_policy_value_heads",
+            "pretraining_kind": dataset_metadata["pretraining_kind"],
+            "train_scope": config.train_scope,
             "learner": asdict(config.learner),
             "dataset": dataset_metadata,
             "total_steps": config.total_steps,

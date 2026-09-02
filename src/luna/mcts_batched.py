@@ -14,7 +14,9 @@ from luna.config import MCTSParams
 from luna.game.chess_game import ChessGame
 from luna.mcts_batched_expansion import (
     PendingExpansionBatch,
+    backup_exact_expansions,
     backup_expansions,
+    infer_exact_expansions,
     infer_recurrent_expansions,
     prepare_expansion_transitions,
 )
@@ -127,6 +129,7 @@ class BatchedMCTS:
             self.game,
             canonical_boards,
             request.root_action_restrictions,
+            self.params.tree_state_mode,
         )
         if timings is not None:
             timings.encode_s += time.perf_counter() - started_at
@@ -146,20 +149,31 @@ class BatchedMCTS:
         if not batch.pending:
             return
         started_at = time.perf_counter()
-        transitions = prepare_expansion_transitions(self.game, batch)
+        transitions = prepare_expansion_transitions(
+            self.game,
+            batch,
+            self.params.tree_state_mode,
+        )
         if timings is not None:
             timings.expand_backup_s += time.perf_counter() - started_at
             started_at = time.perf_counter()
-        recurrent = infer_recurrent_expansions(
-            self.nnet,
-            batch,
-            transitions,
-            self.params.recurrent_policy_topk,
-        )
+        if self.params.tree_state_mode == "exact":
+            exact = infer_exact_expansions(self.nnet, self.game, transitions)
+        else:
+            exact = None
+            recurrent = infer_recurrent_expansions(
+                self.nnet,
+                batch,
+                transitions,
+                self.params.recurrent_policy_topk,
+            )
         if timings is not None:
             timings.recurrent_inf_s += time.perf_counter() - started_at
             started_at = time.perf_counter()
-        backup_expansions(batch, transitions, recurrent, request.discount)
+        if self.params.tree_state_mode == "exact":
+            backup_exact_expansions(batch, transitions, exact, request.discount)
+        else:
+            backup_expansions(batch, transitions, recurrent, request.discount)
         if timings is not None:
             timings.expand_backup_s += time.perf_counter() - started_at
 

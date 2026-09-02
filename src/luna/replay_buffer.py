@@ -5,12 +5,35 @@ collating a sampled batch. This keeps a long self-play window practical without
 changing the learner's numerical precision.
 """
 
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
 from threading import RLock
 
 import chess
 import numpy as np
 
 from luna.trajectory import TrajectoryArrays, TrajectoryInput, TrajectoryMetadata, prepare_trajectory
+
+REPLAY_SNAPSHOT_SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ReplaySnapshot:
+    """Serializable replay state captured at one completed trainer iteration."""
+
+    schema_version: int
+    trainer_iteration: int
+    capacity: int
+    alpha: float
+    beta: float
+    beta_increment: float
+    max_priority: float
+    write_pos: int
+    size: int
+    leaf_priorities: np.ndarray
+    entries: tuple[tuple[Trajectory, int] | None, ...]
 
 
 class Trajectory:
@@ -257,3 +280,103 @@ class PrioritizedReplayBuffer:
                 priority = raw_priority**self.alpha
                 self._max_priority = max(self._max_priority, raw_priority)
                 self._tree.update(idx, priority)
+
+    def snapshot(self, trainer_iteration: int) -> ReplaySnapshot:
+        """Capture a consistent replay state after a completed iteration."""
+        if isinstance(trainer_iteration, bool) or not isinstance(trainer_iteration, int) or trainer_iteration < 0:
+            raise ValueError("trainer_iteration must be a non-negative integer")
+        with self._lock:
+            return ReplaySnapshot(
+                schema_version=REPLAY_SNAPSHOT_SCHEMA_VERSION,
+                trainer_iteration=trainer_iteration,
+                capacity=self.capacity,
+                alpha=self.alpha,
+                beta=self.beta,
+                beta_increment=self.beta_increment,
+                max_priority=self._max_priority,
+                write_pos=self._tree.write_pos,
+                size=self._tree.size,
+                leaf_priorities=self._tree.tree[self.capacity :].copy(),
+                entries=tuple(self._tree.data),
+            )
+
+    def restore(self, snapshot: ReplaySnapshot, expected_iteration: int) -> int:
+        """Validate and atomically install a persisted replay state."""
+        tree = self._validated_snapshot_tree(snapshot, expected_iteration)
+        with self._lock:
+            self.beta = snapshot.beta
+            self.beta_increment = snapshot.beta_increment
+            self._max_priority = snapshot.max_priority
+            self._tree = tree
+        return snapshot.trainer_iteration
+
+    def _validated_snapshot_tree(self, snapshot: ReplaySnapshot, expected_iteration: int) -> _SumTree:
+        _validate_snapshot_metadata(self, snapshot, expected_iteration)
+        entries = list(snapshot.entries)
+        priorities = np.asarray(snapshot.leaf_priorities)
+        _validate_snapshot_entries(entries, priorities, snapshot)
+        tree = _SumTree(self.capacity)
+        tree.data = entries
+        tree.write_pos = snapshot.write_pos
+        tree.size = snapshot.size
+        tree.tree[self.capacity :] = priorities
+        for index in range(self.capacity - 1, 0, -1):
+            tree.tree[index] = tree.tree[2 * index] + tree.tree[2 * index + 1]
+        return tree
+
+
+def _validate_snapshot_metadata(
+    replay: PrioritizedReplayBuffer,
+    snapshot: ReplaySnapshot,
+    expected_iteration: int,
+) -> None:
+    if not isinstance(snapshot, ReplaySnapshot):
+        raise TypeError("Replay snapshot has an unsupported payload type")
+    if snapshot.schema_version != REPLAY_SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError(f"Unsupported replay snapshot schema version: {snapshot.schema_version}")
+    if snapshot.capacity != replay.capacity:
+        raise ValueError(f"Replay capacity changed from {snapshot.capacity} to {replay.capacity}")
+    if not math.isclose(snapshot.alpha, replay.alpha, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(f"Replay alpha changed from {snapshot.alpha} to {replay.alpha}")
+    if snapshot.trainer_iteration not in {expected_iteration, expected_iteration - 1}:
+        raise ValueError(
+            f"Replay iteration {snapshot.trainer_iteration} is incompatible with checkpoint iteration {expected_iteration}"
+        )
+    if not 0.0 <= snapshot.beta <= 1.0:
+        raise ValueError("Replay beta must be between zero and one")
+    if not math.isfinite(snapshot.beta_increment) or snapshot.beta_increment < 0.0:
+        raise ValueError("Replay beta increment must be finite and non-negative")
+    if not math.isfinite(snapshot.max_priority) or snapshot.max_priority <= 0.0:
+        raise ValueError("Replay max priority must be finite and positive")
+    if not 0 <= snapshot.write_pos < snapshot.capacity:
+        raise ValueError("Replay write position is outside its capacity")
+    if not 0 <= snapshot.size <= snapshot.capacity:
+        raise ValueError("Replay size is outside its capacity")
+
+
+def _validate_snapshot_entries(
+    entries: list[tuple[Trajectory, int] | None],
+    priorities: np.ndarray,
+    snapshot: ReplaySnapshot,
+) -> None:
+    if len(entries) != snapshot.capacity:
+        raise ValueError("Replay entry count differs from its capacity")
+    if priorities.shape != (snapshot.capacity,) or priorities.dtype != np.float64:
+        raise ValueError("Replay priorities have an invalid shape or dtype")
+    if not np.isfinite(priorities).all() or np.any(priorities < 0.0):
+        raise ValueError("Replay priorities must be finite and non-negative")
+    occupied = np.fromiter((entry is not None for entry in entries), dtype=np.bool_, count=len(entries))
+    if int(occupied.sum()) != snapshot.size:
+        raise ValueError("Replay size differs from its occupied entry count")
+    if np.any(priorities[occupied] <= 0.0) or np.any(priorities[~occupied] != 0.0):
+        raise ValueError("Replay priorities do not match occupied entries")
+    if snapshot.size < snapshot.capacity and snapshot.write_pos != snapshot.size:
+        raise ValueError("Partially filled replay has an invalid write position")
+    for entry in entries:
+        if entry is None:
+            continue
+        trajectory, position = entry
+        if not isinstance(trajectory, Trajectory):
+            raise TypeError("Replay entry contains an unsupported trajectory type")
+        if isinstance(position, bool) or not isinstance(position, int) or not 0 <= position < trajectory.game_length:
+            raise ValueError("Replay entry contains an invalid trajectory position")

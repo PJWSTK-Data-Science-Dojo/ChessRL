@@ -2,47 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from luna.ezv2_networks import _scale_latent, _support_to_scalar, scalar_to_support
 from luna.network_runtime import scale_gradient
+from luna.network_training_diagnostics import training_diagnostics
 from luna.network_training_types import (
     ForwardResult,
     LossComponents,
     Microbatch,
+    RootState,
     StepAccumulation,
     TrainingFunctions,
     TrainingSettings,
+    UnrollState,
 )
 from luna.network_types import NetworkRuntime, PreparedBatch
-
-
-@dataclass(frozen=True, slots=True)
-class RootState:
-    latent: torch.Tensor
-    value_prediction: torch.Tensor
-    policy_loss: torch.Tensor
-    value_loss: torch.Tensor
-    reconstruction_loss: torch.Tensor
-    reconstruction_logits: torch.Tensor | None
-    reconstruction_target: torch.Tensor | None
-    target_latents: torch.Tensor | None
-
-
-@dataclass(frozen=True, slots=True)
-class UnrollState:
-    next_latent: torch.Tensor
-    policy_loss: torch.Tensor
-    value_loss: torch.Tensor
-    reward_loss: torch.Tensor
-    consistency_loss: torch.Tensor
-    reconstruction_loss: torch.Tensor
-    reconstruction_logits: torch.Tensor | None
-    reconstruction_target: torch.Tensor | None
 
 
 def run_microbatches(
@@ -81,6 +58,7 @@ def _build_microbatch(
         importance_weights=_tensor(network, prepared.is_weights[start:stop]),
         unroll_mask=_tensor(network, values["unroll_mask"]),
         consistency_mask=_tensor(network, values["consistency_mask"]),
+        policy_mask=_tensor(network, values["policy_mask"]),
         value_mask=_tensor(network, values["value_mask"]),
         unroll_valid_moves=_tensor(network, values["valid_masks_unroll"]),
         tree_indices=prepared.tree_indices[start:stop],
@@ -111,10 +89,20 @@ def _forward_and_backward(
         root = _root_state(network, batch, settings, functions)
         unroll = _unroll_state(network, batch, root, settings, functions)
         losses = _weighted_losses(network, batch, root, unroll, settings)
-        health = _diagnostics(network, batch, root, unroll, settings, functions) if report else {}
+        health = training_diagnostics(network, batch, root, unroll, settings, functions) if report else {}
     torch.autograd.backward(network.scaler.scale(losses.total))
-    errors = (root.value_prediction.float() - batch.target_values[:, 0]).abs().detach().cpu().numpy()
+    errors = _priority_errors(root, batch)
     return ForwardResult(losses, errors, health)
+
+
+def _priority_errors(root: RootState, batch: Microbatch) -> np.ndarray:
+    value_error = (root.value_prediction.float() - batch.target_values[:, 0]).abs()
+    policy_target = batch.target_policies[:, 0].float()
+    policy_entropy = -torch.xlogy(policy_target, policy_target).sum(dim=1)
+    policy_kl = (root.policy_loss.float() - policy_entropy).clamp_min(0.0)
+    policy_error = policy_kl * batch.policy_mask[:, 0]
+    errors = torch.where(batch.value_mask[:, 0].bool(), value_error, policy_error)
+    return errors.detach().cpu().numpy()
 
 
 def _root_state(
@@ -125,7 +113,7 @@ def _root_state(
 ) -> RootState:
     latent, log_policy, value_logits = network._training_initial_inference(batch.observations, batch.valid_moves)
     value_prediction = _support_to_scalar(value_logits, settings.support)
-    policy_loss = -(batch.target_policies[:, 0] * log_policy).sum(dim=1) * batch.value_mask[:, 0]
+    policy_loss = -(batch.target_policies[:, 0] * log_policy).sum(dim=1) * batch.policy_mask[:, 0]
     value_target = scalar_to_support(batch.target_values[:, 0], settings.support)
     value_loss = functions.soft_cross_entropy(value_logits, value_target) * batch.value_mask[:, 0]
     reconstruction_logits, reconstruction_target, reconstruction_loss = _root_reconstruction(
@@ -256,7 +244,8 @@ def _unroll_losses(
         )
         * batch.unroll_mask[:, index]
     )
-    policy = -(batch.target_policies[:, index + 1] * F.log_softmax(policy_logits, dim=1)).sum(dim=1) * value_mask
+    policy_mask = batch.policy_mask[:, index + 1]
+    policy = -(batch.target_policies[:, index + 1] * F.log_softmax(policy_logits, dim=1)).sum(dim=1) * policy_mask
     value = (
         functions.soft_cross_entropy(
             value_logits,
@@ -317,7 +306,7 @@ def _weighted_losses(
     unroll: UnrollState,
     settings: TrainingSettings,
 ) -> LossComponents:
-    policy = unroll.policy_loss / batch.value_mask.sum(dim=1).clamp(min=1.0)
+    policy = unroll.policy_loss / batch.policy_mask.sum(dim=1).clamp(min=1.0)
     value = unroll.value_loss / batch.value_mask.sum(dim=1).clamp(min=1.0)
     reward = unroll.reward_loss / batch.unroll_mask.sum(dim=1).clamp(min=1.0)
     consistency = unroll.consistency_loss / batch.consistency_mask.sum(dim=1).clamp(min=1.0)
@@ -335,65 +324,3 @@ def _weighted_losses(
         (consistency * scale).mean(),
         (reconstruction * scale).mean(),
     )
-
-
-def _diagnostics(
-    network: NetworkRuntime,
-    batch: Microbatch,
-    root: RootState,
-    unroll: UnrollState,
-    settings: TrainingSettings,
-    functions: TrainingFunctions,
-) -> dict[str, float]:
-    metrics = functions.raw_latent_metrics("root", root.latent)
-    active_dynamics = batch.unroll_mask[:, -1].bool()
-    if bool(active_dynamics.any()):
-        metrics.update(functions.raw_latent_metrics("predicted", unroll.next_latent[active_dynamics]))
-    _add_target_metrics(metrics, batch, settings)
-    active_consistency = batch.consistency_mask[:, -1].bool()
-    if root.target_latents is not None and bool(active_consistency.any()):
-        metrics.update(
-            functions.latent_metrics(
-                network.nnet.simsiam,
-                unroll.next_latent[active_consistency],
-                root.target_latents[:, -1][active_consistency],
-            )
-        )
-    if root.reconstruction_logits is not None and root.reconstruction_target is not None:
-        metrics.update(functions.reconstruction_metrics("root", root.reconstruction_logits, root.reconstruction_target))
-    if (
-        unroll.reconstruction_logits is not None
-        and unroll.reconstruction_target is not None
-        and bool(active_consistency.any())
-    ):
-        metrics.update(
-            functions.reconstruction_metrics(
-                "predicted",
-                unroll.reconstruction_logits[active_consistency],
-                unroll.reconstruction_target[active_consistency],
-            )
-        )
-    return metrics
-
-
-def _add_target_metrics(
-    metrics: dict[str, float],
-    batch: Microbatch,
-    settings: TrainingSettings,
-) -> None:
-    active_values = batch.value_mask.bool()
-    count = active_values.sum().clamp(min=1)
-    absolute_values = batch.target_values.abs()
-    active_consistency = batch.consistency_mask[:, -1].bool()
-    metrics["train/value_target_nonzero_fraction"] = float(
-        ((absolute_values > 1e-6) & active_values).sum().item() / count.item()
-    )
-    metrics["train/value_target_fractional_fraction"] = float(
-        (((absolute_values > 1e-6) & (absolute_values < 1.0 - 1e-6)) & active_values).sum().item() / count.item()
-    )
-    metrics["train/value_target_mean_abs"] = float((absolute_values * batch.value_mask).sum().item() / count.item())
-    metrics["train/next_observation_active_fraction"] = float(batch.consistency_mask.mean().item())
-    metrics["train/next_observation_active_samples"] = float(active_consistency.sum().item())
-    metrics["train/consistency_objective_enabled"] = float(settings.consistency_enabled)
-    metrics["train/consistency_active_fraction"] = float(batch.consistency_mask.mean().item())
-    metrics["train/latent_health_active_samples"] = float(active_consistency.sum().item())

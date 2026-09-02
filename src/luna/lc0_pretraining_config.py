@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from luna.pgn_pretraining_checkpoints import pretraining_resume_exists
 
 LC0_CHECKPOINT_METADATA_KEY = "lc0_pretraining"
 LC0_CHECKPOINT_PREFIX = "lc0_step_"
+Lc0TrainScope = Literal["prediction_heads", "representation_and_heads"]
 
 
 def _default_learner() -> EzV2LearnerConfig:
@@ -67,6 +69,7 @@ class Lc0PretrainingConfig:
     dataset_source: str = "Official Leela Chess Zero training data"
     dataset_license: str = "ODbL 1.0 (collection); DBCL 1.0 (contents)"
     seed: int = 0
+    train_scope: Lc0TrainScope = "prediction_heads"
     wandb_project: str | None = None
     wandb_run_id: str | None = "luna-balanced-lc0-heads-pretrain-v1"
     wandb_run_name: str | None = "Luna Balanced · LC0 Policy+Value Heads v1"
@@ -80,6 +83,8 @@ def validate_lc0_pretraining_config(config: Lc0PretrainingConfig) -> None:
     validate_wandb_run_id(config.wandb_run_id)
     validate_wandb_run_name(config.wandb_run_name)
     validate_wandb_resume(config.wandb_resume)
+    if config.train_scope not in {"prediction_heads", "representation_and_heads"}:
+        raise ValueError("train_scope must be 'prediction_heads' or 'representation_and_heads'")
     _validate_positive_fields(config)
     _validate_objectives(config.learner)
     _validate_wandb(config)
@@ -173,7 +178,8 @@ def lc0_resume_contract(
     frozen_digest: str | None = None,
 ) -> dict[str, object]:
     contract: dict[str, object] = {
-        "pretraining_kind": "lc0_policy_value_heads",
+        "pretraining_kind": _pretraining_kind(config.train_scope),
+        "train_scope": config.train_scope,
         "lc0_adapter_version": LC0_ADAPTER_VERSION,
         "dataset_fingerprint": fingerprint,
         "dataset_config": asdict(config.dataset),
@@ -188,6 +194,12 @@ def lc0_resume_contract(
     if frozen_digest is not None:
         contract["frozen_parameters_sha256"] = frozen_digest
     return contract
+
+
+def _pretraining_kind(scope: Lc0TrainScope) -> str:
+    if scope == "representation_and_heads":
+        return "lc0_representation_policy_value"
+    return "lc0_policy_value_heads"
 
 
 def lc0_dataset_metadata(

@@ -96,7 +96,7 @@ def test_replay_warmup_delays_training_until_configured_position_count(
 
     train.assert_called_once()
     assert train.call_args.kwargs["steps"] == 2
-    publish_checkpoint.assert_called_once_with(3)
+    assert publish_checkpoint.call_args_list == [call(1), call(2), call(3)]
 
 
 def test_dynamic_steps_use_fixed_lr_horizon_and_reconfigure_per_each_iteration(

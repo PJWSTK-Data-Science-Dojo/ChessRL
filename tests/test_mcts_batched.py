@@ -24,6 +24,7 @@ class _MateInOneNetwork:
         self.mate_action = mate_action
         self.recurrent_calls = 0
         self.recurrent_batch_sizes: list[int] = []
+        self.observation_batches: list[np.ndarray] = []
 
     def _policy(self, batch_size: int = 1) -> np.ndarray:
         policy = np.zeros((batch_size, self.action_size), dtype=np.float32)
@@ -47,6 +48,7 @@ class _MateInOneNetwork:
     def batched_initial_inference(
         self, observations: np.ndarray, valids: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, torch.Tensor]:
+        self.observation_batches.append(observations.copy())
         batch_size = observations.shape[0]
         policies = np.zeros((batch_size, self.action_size), dtype=np.float32)
         for i, valid in enumerate(valids):
@@ -149,6 +151,30 @@ class _DeterministicSearchNetwork:
 
 
 class TestBatchedMCTS:
+    def test_exact_state_expansion_preserves_temporal_observation(self, chess_game: ChessGame) -> None:
+        board = chess_game.get_init_board()
+        board.push_uci("e2e4")
+        board = chess_game.get_canonical_form(board, -1)
+        action = move_to_action(chess.Move.from_uci("e2e4"))
+        network = _MateInOneNetwork(chess_game.get_action_size(), action)
+        params = MCTSParams(
+            num_mcts_sims=1,
+            gumbel_max_considered_actions=1,
+            tree_state_mode="exact",
+        )
+
+        BatchedMCTS(chess_game, network, params).search_batch(
+            [board],
+            temp=0.0,
+            add_exploration_noise=False,
+        )
+
+        child, child_player = chess_game.get_next_state(board, 1, action)
+        canonical_child = chess_game.get_canonical_form(child, child_player)
+        np.testing.assert_array_equal(network.observation_batches[-1][0], chess_game.to_array(canonical_child))
+        assert len(network.observation_batches) == 2
+        assert network.recurrent_calls == 0
+
     def test_claimable_draw_root_returns_no_action_without_inference(self, chess_game: ChessGame) -> None:
         board = chess.Board()
         for move in ("g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"):
@@ -289,15 +315,22 @@ class TestBatchedMCTS:
             assert int((action_results[index][0] > 0).sum()) == 1
             assert int(np.argmax(action_results[index][0])) == first_actions[index]
 
+    @pytest.mark.parametrize("tree_state_mode", ["latent", "exact"])
     def test_single_and_batch_gumbel_search_match_at_evaluation(
         self,
         chess_game: ChessGame,
         small_learner_config: EzV2LearnerConfig,
+        tree_state_mode: Literal["latent", "exact"],
     ) -> None:
         np.random.seed(7)
         torch.manual_seed(7)
         nnet = LunaNetwork(chess_game, small_learner_config)
-        params = MCTSParams(num_mcts_sims=8, dir_noise=False, recurrent_policy_topk=None)
+        params = MCTSParams(
+            num_mcts_sims=8,
+            dir_noise=False,
+            recurrent_policy_topk=None,
+            tree_state_mode=tree_state_mode,
+        )
         board = chess_game.get_init_board()
 
         single_action = MCTS(chess_game, nnet, params)

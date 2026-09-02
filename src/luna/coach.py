@@ -91,6 +91,7 @@ class Coach:
         wandb_run_name: str | None = None,
         wandb_resume: WandbResumeMode = "allow",
         initialize_evaluation_state: bool = False,
+        restore_replay: bool = False,
         seed: int = 0,
     ) -> None:
         self.game = game
@@ -109,6 +110,7 @@ class Coach:
         self._checkpoint_lineage_iteration: int | None = None
         self._checkpoint_target_validated = False
         self._initialize_evaluation_state = initialize_evaluation_state
+        self._restore_replay_on_start = restore_replay
         self._seed = seed
         validate_wandb_run_id(wandb_run_id)
         validate_wandb_run_name(wandb_run_name)

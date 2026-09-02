@@ -35,6 +35,8 @@ def _probability(name: str, value: float) -> None:
 
 def validate_mcts_params(params: MCTSParams) -> None:
     """Reject search settings that cannot produce a finite legal policy."""
+    if params.tree_state_mode not in {"latent", "exact"}:
+        raise ValueError("tree_state_mode must be 'latent' or 'exact'")
     _positive_integer("num_mcts_sims", params.num_mcts_sims)
     _positive_integer("gumbel_max_considered_actions", params.gumbel_max_considered_actions)
     _finite_at_least("gumbel_scale", params.gumbel_scale, 0.0)
@@ -146,7 +148,7 @@ def _validate_model(learner: EzV2LearnerConfig) -> None:
     _positive_integer("support_size", learner.support_size)
     _non_negative_integer("repr_blocks", learner.repr_blocks)
     _non_negative_integer("dyn_blocks", learner.dyn_blocks)
-    _positive_integer("unroll_steps", learner.unroll_steps)
+    _non_negative_integer("unroll_steps", learner.unroll_steps)
     _non_negative_integer("td_steps", learner.td_steps)
     if learner.amp_dtype.lower() not in {"bfloat16", "float16"}:
         raise ValueError("amp_dtype must be 'bfloat16' or 'float16'")
@@ -157,6 +159,8 @@ def _validate_model(learner: EzV2LearnerConfig) -> None:
 
 
 def _validate_learning_objective(learner: EzV2LearnerConfig) -> None:
+    if not isinstance(learner.train_value_on_truncated, bool):
+        raise ValueError("train_value_on_truncated must be a boolean")
     _probability("discount", learner.discount)
     weights = (
         learner.policy_loss_weight,
@@ -173,6 +177,8 @@ def _validate_learning_objective(learner: EzV2LearnerConfig) -> None:
         _finite_at_least(f"{name}_loss_weight", value, 0.0)
     if not any(weights):
         raise ValueError("at least one training loss weight must be positive")
+    if learner.unroll_steps == 0 and (learner.reward_loss_weight > 0.0 or learner.consistency_loss_weight > 0.0):
+        raise ValueError("unroll_steps=0 requires reward_loss_weight=0 and consistency_loss_weight=0")
     if learner.reconstruction_loss_weight > 0.0 and learner.model_name != "balanced_reconstruction":
         raise ValueError("reconstruction_loss_weight requires model_name='balanced_reconstruction'")
     _non_negative_integer("dataloader_workers", learner.dataloader_workers)

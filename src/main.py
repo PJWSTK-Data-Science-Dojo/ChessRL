@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import tyro
+import wandb
 from loguru import logger
 
 from luna.coach import Coach, validate_fresh_checkpoint_target, validate_resume_checkpoint_target
@@ -239,6 +240,7 @@ def _build_coach(setup: _TrainingSetup, game: Game, network: LunaNetwork) -> Coa
         wandb_run_name=cli.wandb_run_name,
         wandb_resume=cli.wandb_resume,
         initialize_evaluation_state=cli.initialize_evaluation_state,
+        restore_replay=cli.load_model,
         seed=cli.seed,
     )
 
@@ -254,6 +256,16 @@ def _learn(coach: Coach) -> int:
         logger.critical("Training stopped by the representation-collapse guard: {}", exc)
         return 78
     return 0
+
+
+def _learn_and_finish_wandb(coach: Coach) -> int:
+    exit_code = 1
+    try:
+        exit_code = _learn(coach)
+        return exit_code
+    finally:
+        if wandb.run is not None:
+            wandb.finish(exit_code=exit_code)
 
 
 def main() -> int:
@@ -274,7 +286,7 @@ def main() -> int:
     game = Game()
     network = _initialize_network(setup, game)
     _log_profiling(setup.run)
-    return _learn(_build_coach(setup, game, network))
+    return _learn_and_finish_wandb(_build_coach(setup, game, network))
 
 
 if __name__ == "__main__":

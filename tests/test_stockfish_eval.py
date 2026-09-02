@@ -237,12 +237,14 @@ def test_evaluation_mcts_params_matches_run() -> None:
     run = TrainingRunConfig(
         num_mcts_sims=40,
         evaluation_num_mcts_sims=7,
+        tree_state_mode="exact",
         dir_noise=True,
         recurrent_policy_topk=128,
         search_contempt_visit_limit=4,
     )
     p = evaluation_mcts_params(run)
     assert p.num_mcts_sims == 7
+    assert p.tree_state_mode == "exact"
     assert p.dir_noise is False
     assert p.recurrent_policy_topk == 128
     assert p.search_contempt_visit_limit is None

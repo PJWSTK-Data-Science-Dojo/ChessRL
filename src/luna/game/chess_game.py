@@ -198,14 +198,38 @@ class ChessGame:
         next_player = self.push_action(next_board, player, action)
         return next_board, next_player
 
-    def get_next_search_state(self, board: chess.Board, player: int, action: int) -> tuple[chess.Board, int]:
+    def copy_exact_search_root(self, board: chess.Board) -> chess.Board:
+        """Retain the bounded history required by observations and draw rules."""
+        return board.copy(stack=_observation_history_plies(board))
+
+    def copy_latent_search_root(self, board: chess.Board) -> chess.Board:
+        """Retain only reversible history needed for search adjudication."""
+        return board.copy(stack=board.halfmove_clock)
+
+    def get_next_exact_search_state(
+        self,
+        board: chess.Board,
+        player: int,
+        action: int,
+    ) -> tuple[chess.Board, int]:
+        """Execute an exact-tree edge with bounded temporal history."""
+        next_board = self.copy_exact_search_root(board)
+        next_player = self.push_action(next_board, player, action)
+        return next_board, next_player
+
+    def get_next_latent_search_state(
+        self,
+        board: chess.Board,
+        player: int,
+        action: int,
+    ) -> tuple[chess.Board, int]:
         """Execute an MCTS edge while retaining exactly the rule-relevant history.
 
         Recurrent MCTS nodes are never encoded as temporal observations. Their
         move stack is needed only for repetition adjudication, which cannot cross
         the most recent zeroing move represented by ``halfmove_clock``.
         """
-        next_board = board.copy(stack=board.halfmove_clock)
+        next_board = self.copy_latent_search_root(board)
         next_player = self.push_action(next_board, player, action)
         if next_board.halfmove_clock == 0:
             next_board.clear_stack()

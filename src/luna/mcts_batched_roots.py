@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import chess
 import numpy as np
@@ -64,9 +64,11 @@ def encode_root_batch(
     game: ChessGame,
     canonical_boards: list[chess.Board],
     root_action_restrictions: Sequence[Collection[int] | None],
+    tree_state_mode: Literal["latent", "exact"],
 ) -> EncodedRootBatch:
     action_size = game.get_action_size()
-    root_boards = [board.copy(stack=board.halfmove_clock) for board in canonical_boards]
+    copy_root = game.copy_exact_search_root if tree_state_mode == "exact" else game.copy_latent_search_root
+    root_boards = [copy_root(board) for board in canonical_boards]
     root_outcomes = [game.get_game_outcome(board, 1) for board in root_boards]
     sample_observation = game.to_array(canonical_boards[0])
     observations = np.empty((len(canonical_boards), *sample_observation.shape), dtype=np.float32)

@@ -200,7 +200,7 @@ class TestBatchedMCTS:
         network = _MateInOneNetwork(chess_game.get_action_size(), preferred_action)
         timings = SelfPlayMCTSTimings()
         clock = 0.0
-        original_next_state = chess_game.get_next_search_state
+        original_next_state = chess_game.get_next_latent_search_state
         original_recurrent = network.batched_recurrent_inference
 
         def timed_next_state(board: chess.Board, player: int, action: int) -> tuple[chess.Board, int]:
@@ -225,7 +225,7 @@ class TestBatchedMCTS:
             )
 
         monkeypatch.setattr("luna.mcts.time.perf_counter", lambda: clock)
-        monkeypatch.setattr(chess_game, "get_next_search_state", timed_next_state)
+        monkeypatch.setattr(chess_game, "get_next_latent_search_state", timed_next_state)
         monkeypatch.setattr(network, "batched_recurrent_inference", timed_recurrent)
 
         BatchedMCTS(

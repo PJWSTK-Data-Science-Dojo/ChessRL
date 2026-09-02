@@ -47,6 +47,7 @@ def prepare_batch(
             discount,
             root_value_override=roots[index],
             policy_override=policies[index],
+            train_value_on_truncated=network._learner.train_value_on_truncated,
         )
         for index, (trajectory, position) in enumerate(batch)
     ]
@@ -176,8 +177,8 @@ def validate_training_inputs(
         raise ValueError(f"steps must be positive, got {steps}")
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
-    if unroll <= 0:
-        raise ValueError(f"unroll_steps must be positive, got {unroll}")
+    if unroll < 0:
+        raise ValueError(f"unroll_steps cannot be negative, got {unroll}")
     if td_steps < 0:
         raise ValueError(f"td_steps cannot be negative, got {td_steps}")
     if replay.size == 0:

@@ -32,6 +32,9 @@ class MCTSParams:
     search_mode: Literal["gumbel", "puct"] = "gumbel"
     """Root selection algorithm; Gumbel search is intended for the small self-play budgets used here."""
 
+    tree_state_mode: Literal["latent", "exact"] = "latent"
+    """Use learned recurrent dynamics or re-encode each exact chess position in the search tree."""
+
     gumbel_max_considered_actions: int = 16
     """Maximum root candidates admitted to Sequential Halving."""
 
@@ -217,6 +220,7 @@ def evaluation_mcts_params(run: TrainingRunConfig) -> MCTSParams:
     return MCTSParams(
         num_mcts_sims=sims,
         search_mode=run.search_mode,
+        tree_state_mode=run.tree_state_mode,
         gumbel_max_considered_actions=run.gumbel_max_considered_actions,
         gumbel_scale=run.gumbel_scale,
         gumbel_value_scale=run.gumbel_value_scale,
@@ -298,6 +302,9 @@ class EzV2LearnerConfig:
 
     reconstruction_loss_weight: float = 0.0
     """Relative weight of the training-only piece-position reconstruction objective."""
+
+    train_value_on_truncated: bool = True
+    """Train max-ply bootstrap values; disabling retains policy targets while masking those value targets."""
 
     device: str = "cuda"
     """Learner backend: ``cuda``, ``mps``, or ``cpu``."""

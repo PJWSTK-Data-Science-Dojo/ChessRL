@@ -22,7 +22,7 @@ def self_play_exploration_enabled(board: chess.Board, ply: int, run: TrainingRun
     """Keep Gumbel stochastic when a deterministic root starts cycling."""
     if ply < run.temp_threshold:
         return True
-    return run.search_mode == "gumbel" and board.is_repetition(2)
+    return run.tree_state_mode == "latent" and run.search_mode == "gumbel" and board.is_repetition(2)
 
 
 def select_self_play_action(

@@ -248,7 +248,7 @@ class TestSearchState:
             action = move_to_action(move if player == 1 else mirror_move(move))
 
             full_board, full_player = chess_game.get_next_state(board, player, action)
-            search_board, search_player = chess_game.get_next_search_state(board, player, action)
+            search_board, search_player = chess_game.get_next_latent_search_state(board, player, action)
 
             assert search_player == full_player
             assert search_board.fen() == full_board.fen()
@@ -269,7 +269,7 @@ class TestSearchState:
         action = move_to_action(move if player == 1 else mirror_move(move))
 
         full_board, full_player = chess_game.get_next_state(board, player, action)
-        search_board, search_player = chess_game.get_next_search_state(board, player, action)
+        search_board, search_player = chess_game.get_next_latent_search_state(board, player, action)
 
         assert tuple(board.move_stack) == original_stack
         assert len(search_board.move_stack) == board.halfmove_clock + 1
@@ -288,7 +288,7 @@ class TestSearchState:
         move = chess.Move.from_uci("f6g8")
         action = move_to_action(mirror_move(move))
 
-        next_board, next_player = chess_game.get_next_search_state(board, -1, action)
+        next_board, next_player = chess_game.get_next_latent_search_state(board, -1, action)
 
         assert next_board.can_claim_threefold_repetition()
         assert chess_game.get_game_outcome(next_board, next_player) == 0.0
@@ -297,7 +297,7 @@ class TestSearchState:
         board = chess.Board()
         action = move_to_action(chess.Move.from_uci("e2e4"))
 
-        next_board, next_player = chess_game.get_next_search_state(board, 1, action)
+        next_board, next_player = chess_game.get_next_latent_search_state(board, 1, action)
 
         assert next_player == -1
         assert next_board.fen() == chess.Board("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1").fen()

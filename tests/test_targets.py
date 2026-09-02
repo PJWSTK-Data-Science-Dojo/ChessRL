@@ -65,6 +65,7 @@ class TestBuildUnrollTargets:
         assert targets["observation"].shape == (8, 8, OBS_PLANES)
         assert len(targets["unroll_mask"]) == 3
         assert len(targets["consistency_mask"]) == 3
+        assert len(targets["policy_mask"]) == 4
         assert len(targets["value_mask"]) == 4
 
     def test_past_end_padding(self, make_trajectory: TrajectoryFactory) -> None:
@@ -74,7 +75,24 @@ class TestBuildUnrollTargets:
         assert targets["target_values"][-1] == 0.0
         assert targets["unroll_mask"] == [1.0, 1.0, 0.0, 0.0, 0.0]
         assert targets["consistency_mask"] == [1.0, 0.0, 0.0, 0.0, 0.0]
+        assert targets["policy_mask"] == [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
         assert targets["value_mask"] == [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+
+    def test_truncated_value_targets_can_be_masked(self, make_trajectory: TrajectoryFactory) -> None:
+        trajectory = make_trajectory(length=3, truncated=True, truncation_bootstrap_value=0.8)
+
+        targets = build_unroll_targets(
+            trajectory,
+            pos_idx=0,
+            unroll_steps=2,
+            td_steps=5,
+            train_value_on_truncated=False,
+        )
+
+        assert targets["target_values"] == [0.0, 0.0, 0.0]
+        assert targets["policy_mask"] == [1.0, 1.0, 1.0]
+        assert targets["value_mask"] == [0.0, 0.0, 0.0]
+        assert np.asarray(targets["target_policies"]).sum(axis=1) == pytest.approx([1.0, 1.0, 1.0])
 
 
 def test_collation(make_trajectory: TrajectoryFactory) -> None:
@@ -89,6 +107,7 @@ def test_collation(make_trajectory: TrajectoryFactory) -> None:
     assert collated["valid_masks_unroll"].shape == (4, 4, ACTION_SIZE)
     assert collated["unroll_mask"].shape == (4, 3)
     assert collated["consistency_mask"].shape == (4, 3)
+    assert collated["policy_mask"].shape == (4, 4)
     assert collated["value_mask"].shape == (4, 4)
 
 

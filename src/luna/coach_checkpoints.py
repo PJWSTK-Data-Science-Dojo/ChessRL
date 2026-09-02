@@ -23,6 +23,7 @@ from luna.game.stockfish_eval import (
 )
 from luna.game.stockfish_ladder import LADDER_STATE_NAME
 from luna.network import LunaNetwork
+from luna.replay_persistence import REPLAY_SNAPSHOT_NAME
 
 if TYPE_CHECKING:
     from luna.coach import Coach
@@ -36,7 +37,14 @@ def _managed_checkpoint_conflicts(folder: Path) -> list[str]:
     managed = list(folder.glob("checkpoint_*.pth.tar"))
     managed.extend(
         folder / name
-        for name in ("latest.pth.tar", "best.pth.tar", _BEST_EVAL_NAME, BENCHMARK_STATE_NAME, LADDER_STATE_NAME)
+        for name in (
+            "latest.pth.tar",
+            "best.pth.tar",
+            _BEST_EVAL_NAME,
+            BENCHMARK_STATE_NAME,
+            LADDER_STATE_NAME,
+            REPLAY_SNAPSHOT_NAME,
+        )
     )
     return sorted(path.name for path in managed if path.exists())
 

@@ -153,6 +153,25 @@ def test_optimizer_step_changes_only_policy_and_value_heads() -> None:
     assert _frozen_parameter_digest(network) == frozen_digest
 
 
+def test_joint_scope_updates_representation_and_heads_only() -> None:
+    game = ChessGame()
+    network = LunaNetwork(game, _learner())
+    before = {name: parameter.detach().clone() for name, parameter in network.nnet.named_parameters()}
+    _freeze_for_root_supervision(network, "representation_and_heads")
+
+    _train_batch(network, _batch(game), total_steps=1)
+
+    changed = {
+        name for name, parameter in network.nnet.named_parameters() if not torch.equal(parameter.detach(), before[name])
+    }
+    assert any(name.startswith("representation.") for name in changed)
+    assert any(name.startswith("prediction.policy_head.") for name in changed)
+    assert any(name.startswith("prediction.value_head.") for name in changed)
+    assert all(
+        name.startswith(("representation.", "prediction.policy_head.", "prediction.value_head.")) for name in changed
+    )
+
+
 def test_value_loss_consumes_exact_wdl_distribution() -> None:
     game = ChessGame()
     network = LunaNetwork(game, _learner())

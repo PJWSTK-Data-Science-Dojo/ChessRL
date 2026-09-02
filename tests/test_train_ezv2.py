@@ -23,7 +23,7 @@ from luna.network import (
 from luna.replay_buffer import PrioritizedReplayBuffer, Trajectory
 
 
-def _make_trajectory(length: int = 4) -> Trajectory:
+def _make_trajectory(length: int = 4, *, truncated: bool = False) -> Trajectory:
     return Trajectory(
         observations=[np.random.randn(8, 8, OBS_PLANES).astype(np.float32) for _ in range(length)],
         actions=[np.random.randint(0, min(256, ACTION_SIZE)) for _ in range(length)],
@@ -31,6 +31,8 @@ def _make_trajectory(length: int = 4) -> Trajectory:
         root_policies=[np.full(ACTION_SIZE, 1.0 / ACTION_SIZE, dtype=np.float32) for _ in range(length)],
         root_values=np.zeros(length, dtype=np.float32),
         valids=np.ones((length, ACTION_SIZE), dtype=np.float32),
+        truncated=truncated,
+        truncation_bootstrap_value=0.0 if truncated else None,
     )
 
 
@@ -189,6 +191,7 @@ def test_reconstruction_model_trains_without_simsiam_target_branch(
     network = LunaNetwork(ChessGame(), config)
     replay = PrioritizedReplayBuffer(capacity=8)
     replay.save_trajectory(_make_trajectory(length=4))
+    np.random.seed(0)
     representation_before = network.nnet.representation.conv_in.weight.detach().clone()
     dynamics_before = network.nnet.dynamics.conv_in.weight.detach().clone()
     assert network.nnet.piece_reconstruction is not None
@@ -213,6 +216,42 @@ def test_reconstruction_model_trains_without_simsiam_target_branch(
         reconstruction_before,
         network.nnet.piece_reconstruction.classifier.weight,
     )
+
+
+def test_root_only_training_skips_dynamics() -> None:
+    config = EzV2LearnerConfig(
+        device="cpu",
+        model_name="balanced_reconstruction",
+        num_channels=16,
+        repr_blocks=1,
+        dyn_blocks=1,
+        proj_dim=32,
+        batch_size=1,
+        grad_accum_steps=1,
+        mixed_precision=False,
+        dataloader_workers=0,
+        unroll_steps=0,
+        td_steps=4,
+        reward_loss_weight=0.0,
+        consistency_loss_weight=0.0,
+        reconstruction_loss_weight=0.25,
+        train_value_on_truncated=False,
+    )
+    network = LunaNetwork(ChessGame(), config)
+    replay = PrioritizedReplayBuffer(capacity=8)
+    replay.save_trajectory(_make_trajectory(length=4, truncated=True))
+    representation_before = network.nnet.representation.conv_in.weight.detach().clone()
+    dynamics_before = network.nnet.dynamics.conv_in.weight.detach().clone()
+
+    metrics = network.train_ezv2(replay, steps=1, total_train_steps=1)
+
+    assert math.isfinite(metrics["total"])
+    assert metrics["policy"] > 0.0
+    assert metrics["value"] == pytest.approx(0.0)
+    assert metrics["reward"] == pytest.approx(0.0)
+    assert metrics["consistency"] == pytest.approx(0.0)
+    assert not torch.equal(representation_before, network.nnet.representation.conv_in.weight)
+    assert torch.equal(dynamics_before, network.nnet.dynamics.conv_in.weight)
 
 
 def test_state_anchor_collapse_guard_requires_three_consecutive_reports(
@@ -309,58 +348,3 @@ def test_recurrent_inference_copies_only_legal_policy_candidates(
     assert result.topk_indices.shape == (1, 2)
     assert set(result.topk_indices[0]) == {12, 34}
     assert float(result.topk_probs.sum()) == pytest.approx(1.0)
-
-
-@pytest.mark.parametrize(
-    ("field_name", "value", "message"),
-    [
-        ("model_name", "unknown", "model_name must be one of"),
-        ("grad_accum_steps", 0, "grad_accum_steps must be a positive integer"),
-        ("dataloader_workers", -1, "dataloader_workers must be a non-negative integer"),
-        ("support_size", 0, "support_size must be a positive integer"),
-        ("grad_clip_norm", 0.0, "grad_clip_norm must be positive and finite"),
-        ("grad_clip_norm", float("inf"), "grad_clip_norm must be positive and finite"),
-        ("lr", float("nan"), "lr must be finite"),
-        ("reanalyze_prob", 1.1, "reanalyze_prob must be between 0 and 1"),
-        ("consistency_loss_weight", float("inf"), "consistency_loss_weight must be finite"),
-        ("reconstruction_loss_weight", float("inf"), "reconstruction_loss_weight must be finite"),
-    ],
-)
-def test_invalid_execution_settings_fail_loudly(
-    small_learner_config: EzV2LearnerConfig,
-    field_name: str,
-    value: object,
-    message: str,
-) -> None:
-    setattr(small_learner_config, field_name, value)
-
-    with pytest.raises(ValueError, match=message):
-        LunaNetwork(ChessGame(), small_learner_config)
-
-
-def test_learner_rejects_zero_unroll_horizon(
-    small_learner_config: EzV2LearnerConfig,
-) -> None:
-    small_learner_config.unroll_steps = 0
-
-    with pytest.raises(ValueError, match="unroll_steps must be a positive integer"):
-        LunaNetwork(ChessGame(), small_learner_config)
-
-
-def test_reconstruction_loss_requires_matching_model(
-    small_learner_config: EzV2LearnerConfig,
-) -> None:
-    small_learner_config.reconstruction_loss_weight = 0.5
-
-    with pytest.raises(ValueError, match="requires model_name='balanced_reconstruction'"):
-        LunaNetwork(ChessGame(), small_learner_config)
-
-
-def test_learner_requires_equal_accumulation_microbatches(
-    small_learner_config: EzV2LearnerConfig,
-) -> None:
-    small_learner_config.batch_size = 3
-    small_learner_config.grad_accum_steps = 2
-
-    with pytest.raises(ValueError, match="batch_size must be divisible by grad_accum_steps"):
-        LunaNetwork(ChessGame(), small_learner_config)

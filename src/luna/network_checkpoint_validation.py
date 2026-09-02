@@ -84,6 +84,7 @@ def checkpoint_learner_config(
     stored_model_name = model_spec.get("model_name", "baseline") if isinstance(model_spec, dict) else None
     if "reconstruction_loss_weight" not in stored and stored_model_name != "balanced_reconstruction":
         stored["reconstruction_loss_weight"] = 0.0
+    stored.setdefault("train_value_on_truncated", True)
     expected = {field.name for field in fields(EzV2LearnerConfig)} - {"model_name"}
     actual = set(stored)
     if actual != expected:

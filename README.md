@@ -221,6 +221,37 @@ make train-lc0-warmstart \
   LC0_SELECTED_CHECKPOINT=./runs/luna-balanced-lc0-heads-pretrain-v1/lc0_step_00000500.pth.tar
 ```
 
+### Exact-state LCZero-style phase
+
+The maintained high-strength path uses the same legal-state search contract as
+LCZero and AlphaZero. Set `run.tree_state_mode=exact` to apply every selected move
+with `python-chess`, preserve the complete 119-plane observation history, and run
+the representation plus policy/value heads again at each non-terminal leaf.
+Gumbel top-8 Sequential Halving still allocates the small search budget, but learned
+dynamics and predicted rewards no longer affect the tree.
+
+Before online learning, `pretrain-lc0-exact` jointly fine-tunes the 10-block
+representation and both prediction heads for 2,000 steps on the pinned 508,417-position
+LCZero V6 corpus. It distills the soft root-WDL estimate and root visit policy; the
+source checkpoint is the measured 1,000-step LCZero milestone rather than a later
+self-play model whose exact-state benchmark regressed. Dynamics, reward, SimSiam,
+and the reconstruction decoder remain frozen. The online phase then uses exact
+terminal WDL targets (`td_steps=512`) and root-only policy/value training. Max-ply
+trajectories retain their policy and board reconstruction targets, while their
+self-bootstrapped value targets are masked.
+
+```bash
+make pretrain-lc0-exact
+make train-lc0-exact
+```
+
+The two phases have separate immutable outputs and W&B identities:
+`luna-lc0-exact-joint-root-v1` and `luna-lc0-exact-gumbel32-v1`. Self-play uses one
+128-position inference batch with 32 simulations per move, explores only through
+ply 39, and samples each newly generated position twice on average. A measured
+64- or 128-simulation budget should be used only after it wins a fixed-checkpoint
+match; search cost otherwise scales approximately linearly.
+
 ## Historical phase commands
 
 To carry the complete model, optimizer, scaler, counters, and LR horizon from the current

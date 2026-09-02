@@ -63,9 +63,34 @@ class Microbatch:
     importance_weights: torch.Tensor
     unroll_mask: torch.Tensor
     consistency_mask: torch.Tensor
+    policy_mask: torch.Tensor
     value_mask: torch.Tensor
     unroll_valid_moves: torch.Tensor
     tree_indices: list[int]
+
+
+@dataclass(frozen=True, slots=True)
+class RootState:
+    latent: torch.Tensor
+    value_prediction: torch.Tensor
+    policy_loss: torch.Tensor
+    value_loss: torch.Tensor
+    reconstruction_loss: torch.Tensor
+    reconstruction_logits: torch.Tensor | None
+    reconstruction_target: torch.Tensor | None
+    target_latents: torch.Tensor | None
+
+
+@dataclass(frozen=True, slots=True)
+class UnrollState:
+    next_latent: torch.Tensor
+    policy_loss: torch.Tensor
+    value_loss: torch.Tensor
+    reward_loss: torch.Tensor
+    consistency_loss: torch.Tensor
+    reconstruction_loss: torch.Tensor
+    reconstruction_logits: torch.Tensor | None
+    reconstruction_target: torch.Tensor | None
 
 
 @dataclass(frozen=True, slots=True)
