@@ -159,7 +159,7 @@ def _frozen_parameter_digest(
         if name.startswith(trainable_prefixes):
             continue
         digest.update(name.encode("utf-8"))
-        raw = parameter.detach().cpu().contiguous().view(torch.uint8).numpy()
+        raw = parameter.detach().cpu().reshape(-1).view(torch.uint8).numpy()
         digest.update(raw.tobytes())
     return digest.hexdigest()
 

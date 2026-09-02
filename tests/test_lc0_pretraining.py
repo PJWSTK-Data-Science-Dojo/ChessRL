@@ -234,6 +234,15 @@ def test_joint_scope_updates_representation_and_heads_only() -> None:
     )
 
 
+def test_frozen_digest_is_stable_for_channels_last_convolutions() -> None:
+    network = LunaNetwork(ChessGame(), _learner())
+    expected = _frozen_parameter_digest(network)
+
+    torch.nn.utils.convert_conv2d_weight_memory_format(network.nnet, torch.channels_last)
+
+    assert _frozen_parameter_digest(network) == expected
+
+
 def test_validation_restores_joint_training_modes() -> None:
     network = LunaNetwork(ChessGame(), _learner())
     network.nnet.eval()
